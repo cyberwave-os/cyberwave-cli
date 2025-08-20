@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name        = "cyberwave-cli"
+version     = "0.11.0"
+description = "Cyberwave command-line interface (plugins, asset pipeline, telemetry)"
+dependencies = [
+    "typer[all]>=0.12",
+    "rich>=13",
+    "importlib_metadata>=6.0; python_version < '3.10'",
+    "setuptools>=61.0",
+    "httpx>=0.24.0",
+    "tomli>=2.0.0; python_version < '3.11'",
+    "tomli-w>=1.0.0",
+]
+
+[project.optional-dependencies]
+sdk  = ["cyberwave>=0.11,<0.12"]
+test = ["pytest>=7.0", "pytest-cov", "pytest-mock"]
+
+[project.scripts]
+cyberwave = "cyberwave_cli.core:main"
+
+[project.entry-points]
+[project.entry-points."cyberwave.cli.plugins"]
+auth = "cyberwave_cli.plugins.auth.app:app"
+devices = "cyberwave_cli.plugins.devices.app:app"
+projects = "cyberwave_cli.plugins.projects.app:app"
+edge = "cyberwave_cli.plugins.edge.app:app"
+twins = "cyberwave_cli.plugins.twins.app:app"
+environments = "cyberwave_cli.plugins.environments.app:app"
+sensors = "cyberwave_cli.plugins.sensors.app:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]

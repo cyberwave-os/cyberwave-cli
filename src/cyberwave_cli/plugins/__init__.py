@@ -1,0 +1,1 @@
+# Init for cyberwave_cli.plugins package 
