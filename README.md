@@ -188,3 +188,4 @@ List analyzer events for a specific sensor from the latest session:
 ```bash
 cyberwave sensors events --environment <ENVIRONMENT_UUID> --sensor <SENSOR_UUID> -n 20
 ```
+
