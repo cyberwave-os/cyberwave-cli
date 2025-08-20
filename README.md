@@ -1,25 +1,87 @@
-## CyberWave CLI
+# Cyberwave CLI
 
-Command-line interface for CyberWave. Provides authentication, device and project management, and plugins for Edge nodes and twin control.
+Command-line interface for the Cyberwave Digital Twin Platform. Manage projects, environments, digital twins, and robot integrations from the terminal.
 
-### Install
+## Installation
 
-- Stable (recommended):
-  ```bash
-  pipx install cyberwave-cli
-  ```
-- Monorepo/dev with SDK and integrations:
-  ```bash
-  pip install -e cyberwave/cyberwave-sdk-python
-  pip install -e cyberwave/cyberwave_robotics_integrations
-  pip install -e cyberwave/cyberwave-cli[sdk]
-  ```
-
-### Authenticate
-
+### Stable Release (Recommended)
 ```bash
+pip install cyberwave-cli
+```
+
+### With Full SDK Support
+```bash
+pip install cyberwave-cli cyberwave cyberwave-robotics-integrations
+```
+
+### Development Installation
+```bash
+pipx install cyberwave-cli  # Isolated installation
+```
+
+## Quick Start
+
+### 1. Authentication
+```bash
+# Login to your Cyberwave instance
 cyberwave auth login --backend-url http://localhost:8000 --frontend-url http://localhost:3000
+
+# Check authentication status
 cyberwave auth status
+
+# Logout
+cyberwave auth logout
+```
+
+### 2. Project Management
+```bash
+# List projects
+cyberwave projects list
+
+# Create new project
+cyberwave projects create "My Robot Project" --description "Autonomous robot fleet"
+
+# Get project details
+cyberwave projects show <project-uuid>
+```
+
+### 3. Environment Management
+```bash
+# List environments
+cyberwave environments list
+
+# Create environment
+cyberwave environments create "Test Environment" --project <project-uuid>
+
+# Environment details
+cyberwave environments show <environment-uuid>
+```
+
+### 4. Digital Twin Operations
+```bash
+# List twins in environment
+cyberwave twins list --environment <environment-uuid>
+
+# Add twin from catalog
+cyberwave twins add cyberwave/so101 --environment <environment-uuid>
+
+# Control twin position
+cyberwave twins move <twin-uuid> --x 1.0 --y 0.0 --z 0.5
+
+# Control robot joints
+cyberwave twins joint <twin-uuid> --joint shoulder --angle 45
+```
+
+### 5. Device Management
+```bash
+# Register device
+cyberwave devices register --name "My Robot" --type so100
+
+# List devices
+cyberwave devices list
+
+# Device status
+cyberwave devices status <device-id>
 ```
 
 ### Plugins
