@@ -1,6 +1,38 @@
 # Cyberwave CLI
 
-Command-line interface for the Cyberwave Digital Twin Platform. Manage projects, environments, digital twins, and robot integrations from the terminal.
+[![PyPI version](https://badge.fury.io/py/cyberwave-cli.svg)](https://badge.fury.io/py/cyberwave-cli)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+Command-line interface for the **Cyberwave Digital Twin Platform**. Manage projects, environments, digital twins, and robot integrations from the terminal.
+
+**Cyberwave** is a comprehensive robotics platform that enables you to create digital twins of physical robots, run realistic simulations, and seamlessly bridge the gap between virtual development and real-world deployment.
+
+## 🚀 Features
+
+- **🤖 Robot Management**: Register, control, and monitor physical robots
+- **🌍 Environment Control**: Create and manage 3D simulation environments  
+- **🔗 Digital Twin Operations**: Seamless physical-digital synchronization
+- **⚙️ Edge Runtime**: Bridge local robots to cloud platform
+- **🔐 Secure Authentication**: Token-based authentication with device tokens
+- **📊 Telemetry Streaming**: Real-time data collection and monitoring
+- **🧩 Plugin Architecture**: Extensible command system
+
+## 🤖 Supported Robots & Hardware
+
+- **Robotic Arms**: SO-ARM100, Universal Robots, custom URDF-based arms
+- **Drones**: DJI Tello, custom UAVs with MAVLink support
+- **Mobile Robots**: Custom ground vehicles, AGVs, autonomous platforms
+- **Sensors**: Cameras, LIDAR, IMU, custom sensor integrations
+- **Custom Hardware**: Extensible driver system for any robot type
+
+## 💡 Use Cases
+
+- **Algorithm Development**: Test path planning and control algorithms safely
+- **Fleet Management**: Monitor and control multiple robots remotely  
+- **Training & Education**: Learn robotics with realistic simulations
+- **Prototyping**: Validate designs before physical implementation
+- **Industrial Automation**: Optimize factory and warehouse operations
 
 ## Installation
 
@@ -38,7 +70,23 @@ cyberwave setup
 cyberwave doctor
 ```
 
-## Quick Start
+## 🎯 Quick Start
+
+Get up and running with Cyberwave in 3 simple steps:
+
+```bash
+# 1. Install (includes SDK automatically)
+pip install cyberwave-cli
+
+# 2. Authenticate 
+cyberwave auth login --backend-url https://api.cyberwave.com --frontend-url https://app.cyberwave.com
+
+# 3. Start using
+cyberwave projects list
+cyberwave devices register --project PROJECT_ID --name "My Robot" --type robot/so-arm100
+```
+
+## 📖 Detailed Usage
 
 ### 1. Authentication
 ```bash

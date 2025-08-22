@@ -4,8 +4,34 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name        = "cyberwave-cli"
-version     = "0.11.3"
-description = "Cyberwave command-line interface (plugins, asset pipeline, telemetry)"
+version     = "0.11.4"
+description = "Command-line interface for the Cyberwave Digital Twin Platform - manage robots, environments, and simulations"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Cyberwave", email = "support@cyberwave.com"}
+]
+maintainers = [
+    {name = "Cyberwave", email = "support@cyberwave.com"}
+]
+keywords = ["robotics", "digital-twin", "simulation", "cli", "automation", "robot-control"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Hardware",
+]
+requires-python = ">=3.8"
 dependencies = [
     "typer[all]>=0.12",
     "rich>=13",
@@ -16,6 +42,13 @@ dependencies = [
     "tomli>=2.0.0; python_version < '3.11'",
     "tomli-w>=1.0.0",
 ]
+
+[project.urls]
+Homepage = "https://cyberwave.com"
+Documentation = "https://docs.cyberwave.com"
+Repository = "https://github.com/cyberwave-os/cyberwave-cli"
+"Bug Reports" = "https://github.com/cyberwave-os/cyberwave-cli/issues"
+Changelog = "https://github.com/cyberwave-os/cyberwave-cli/releases"
 
 [project.optional-dependencies]
 robotics = ["cyberwave-robotics-integrations>=0.1,<0.2"]
