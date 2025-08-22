@@ -4,19 +4,35 @@ Command-line interface for the Cyberwave Digital Twin Platform. Manage projects,
 
 ## Installation
 
-### Stable Release (Recommended)
+### One-Liner (Recommended)
 ```bash
-pip install cyberwave-cli
+curl -sSL https://raw.githubusercontent.com/cyberwave-os/cyberwave-cli/main/install.py | python3
 ```
+*Automatically installs packages and configures PATH*
 
-### With Full SDK Support
+### Manual Installation
 ```bash
+# With full SDK support (recommended)
 pip install cyberwave-cli cyberwave cyberwave-robotics-integrations
+
+# CLI only
+pip install cyberwave-cli
+
+# Development installation (isolated)
+pipx install cyberwave-cli
 ```
 
-### Development Installation
+### PATH Configuration (if needed)
+If you get "command not found: cyberwave" after manual installation:
 ```bash
-pipx install cyberwave-cli  # Isolated installation
+# Auto-configure PATH
+python3 -m cyberwave_cli.setup_utils
+
+# Or use built-in setup command
+cyberwave setup
+
+# Verify installation
+cyberwave doctor
 ```
 
 ## Quick Start
@@ -25,6 +41,9 @@ pipx install cyberwave-cli  # Isolated installation
 ```bash
 # Login to your Cyberwave instance
 cyberwave auth login --backend-url http://localhost:8000 --frontend-url http://localhost:3000
+
+# For production (replace with your actual domain)
+# cyberwave auth login --backend-url https://api.cyberwave.com --frontend-url https://app.cyberwave.com
 
 # Check authentication status
 cyberwave auth status
@@ -188,3 +207,4 @@ List analyzer events for a specific sensor from the latest session:
 ```bash
 cyberwave sensors events --environment <ENVIRONMENT_UUID> --sensor <SENSOR_UUID> -n 20
 ```
+
