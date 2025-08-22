@@ -12,11 +12,14 @@ curl -sSL https://raw.githubusercontent.com/cyberwave-os/cyberwave-cli/main/inst
 
 ### Manual Installation
 ```bash
-# With full SDK support (recommended)
-pip install cyberwave-cli cyberwave cyberwave-robotics-integrations
-
-# CLI only
+# CLI with SDK (automatically includes cyberwave SDK)
 pip install cyberwave-cli
+
+# CLI with robotics integrations (recommended for hardware)
+pip install cyberwave-cli[robotics]
+
+# Or install everything separately
+pip install cyberwave-cli cyberwave-robotics-integrations
 
 # Development installation (isolated)
 pipx install cyberwave-cli

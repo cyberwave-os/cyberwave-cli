@@ -28,8 +28,8 @@ def main():
     
     # Step 1: Install packages
     if not run_command(
-        "pip install cyberwave-cli cyberwave cyberwave-robotics-integrations",
-        "Installing Cyberwave packages"
+        "pip install cyberwave-cli[robotics]",
+        "Installing Cyberwave CLI with robotics support"
     ):
         sys.exit(1)
     
