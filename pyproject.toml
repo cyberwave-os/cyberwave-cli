@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name        = "cyberwave-cli"
-version     = "0.11.4"
+version     = "0.11.5"
 description = "Command-line interface for the Cyberwave Digital Twin Platform - manage robots, environments, and simulations"
 readme = "README.md"
 license = {text = "MIT"}
