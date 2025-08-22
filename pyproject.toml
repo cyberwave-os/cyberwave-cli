@@ -45,7 +45,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://cyberwave.com"
-Documentation = "https://docs.cyberwave.com"
+Documentation = "https://cyberwave.com/docs"
 Repository = "https://github.com/cyberwave-os/cyberwave-cli"
 "Bug Reports" = "https://github.com/cyberwave-os/cyberwave-cli/issues"
 Changelog = "https://github.com/cyberwave-os/cyberwave-cli/releases"
