@@ -172,7 +172,7 @@ def main():
             print("1. Restart your terminal (or run: source ~/.zshrc)")
             print("2. Test with: cyberwave version")
             print("3. Authenticate: cyberwave auth login --backend-url YOUR_URL --frontend-url YOUR_URL")
-            print("\n🔗 Documentation: https://docs.cyberwave.com")
+            print("\n🔗 Documentation: https://cyberwave.com/docs")
         else:
             print("\n⚠️  Installation completed but PATH configuration may need manual setup.")
             print("🔧 Try running: python3 -c 'import cyberwave_cli.setup_utils; cyberwave_cli.setup_utils.setup_cyberwave_cli()'")

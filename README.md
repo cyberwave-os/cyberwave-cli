@@ -90,11 +90,14 @@ cyberwave devices register --project PROJECT_ID --name "My Robot" --type robot/s
 
 ### 1. Authentication
 ```bash
-# Login to your Cyberwave instance
-cyberwave auth login --backend-url http://localhost:8000 --frontend-url http://localhost:3000
+# Login to your Cyberwave instance (will prompt for email/password)
+cyberwave auth login --backend-url http://localhost:8000
+
+# Or provide credentials directly
+cyberwave auth login --email your@email.com --password yourpassword
 
 # For production (replace with your actual domain)
-# cyberwave auth login --backend-url https://api.cyberwave.com --frontend-url https://app.cyberwave.com
+# cyberwave auth login --backend-url https://api.cyberwave.com
 
 # Check authentication status
 cyberwave auth status

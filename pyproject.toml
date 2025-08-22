@@ -35,7 +35,7 @@ requires-python = ">=3.8"
 dependencies = [
     "typer[all]>=0.12",
     "rich>=13",
-    "cyberwave>=0.11,<0.12",
+    "cyberwave>=0.1,<0.2",
     "importlib_metadata>=6.0; python_version < '3.10'",
     "setuptools>=61.0",
     "httpx>=0.24.0",

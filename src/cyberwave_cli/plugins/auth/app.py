@@ -1,14 +1,9 @@
 import asyncio
-import webbrowser
-import time
-import json
 from pathlib import Path
 from typing import Optional, Dict, Any
-import os
 
 import typer
 from rich import print
-from rich.prompt import Confirm
 from rich.console import Console
 from rich.table import Table
 import httpx
@@ -23,49 +18,54 @@ DEFAULT_FRONTEND_URL = "http://localhost:3000"
 DEFAULT_BACKEND_URL = "http://localhost:8000"
 
 
-class DeviceAuthFlow:
-    """Handles device flow authentication with the CyberWave platform."""
+class SimpleAuthFlow:
+    """Simple email/password authentication for CLI."""
     
-    def __init__(self, backend_url: str, frontend_url: str):
+    def __init__(self, backend_url: str):
         self.backend_url = backend_url.rstrip('/')
-        self.frontend_url = frontend_url.rstrip('/')
         self.client = httpx.AsyncClient(timeout=30.0)
     
-    async def initiate_device_flow(self) -> Dict[str, Any]:
+    async def login(self, email: str, password: str) -> Dict[str, Any]:
         """
-        Initiate device flow authentication.
-        Returns device code, user code, and verification URLs.
+        Login with email and password.
+        Returns token and user information.
         """
         try:
             response = await self.client.post(
-                f"{self.backend_url}/api/v1/auth/device/initiate",
-                json={"client_type": "cli"}
+                f"{self.backend_url}/api/v1/users/auth/cli/login",
+                json={"email": email, "password": password}
             )
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as e:
-            raise typer.Exit(f"Failed to initiate device flow: {e}")
+            if e.response.status_code == 401:
+                raise typer.Exit("Invalid email or password")
+            else:
+                raise typer.Exit(f"Authentication failed: {e}")
     
-    async def poll_for_token(self, device_code: str, interval: int = 5) -> Optional[Dict[str, Any]]:
-        """
-        Poll the backend for token completion.
-        Returns tokens when user completes authentication, None if still pending.
-        """
+    async def check_status(self, token: str) -> Dict[str, Any]:
+        """Check authentication status with token."""
+        try:
+            response = await self.client.get(
+                f"{self.backend_url}/api/v1/users/auth/cli/status",
+                headers={"Authorization": f"Token {token}"}
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPError as e:
+            raise typer.Exit(f"Status check failed: {e}")
+    
+    async def logout(self, token: str) -> None:
+        """Logout and revoke token."""
         try:
             response = await self.client.post(
-                f"{self.backend_url}/api/v1/auth/device/token",
-                json={"device_code": device_code}
+                f"{self.backend_url}/api/v1/users/auth/cli/logout",
+                headers={"Authorization": f"Token {token}"}
             )
-            
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 202:
-                # Still pending
-                return None
-            else:
-                response.raise_for_status()
+            response.raise_for_status()
         except httpx.HTTPError:
-            return None
+            # Ignore errors on logout - token might already be invalid
+            pass
     
     async def close(self):
         """Close the HTTP client."""
@@ -117,103 +117,62 @@ def save_config(config: Dict[str, Any]) -> None:
 def login(
     backend_url: Optional[str] = typer.Option(None, "--backend-url", help="Backend URL"),
     frontend_url: Optional[str] = typer.Option(None, "--frontend-url", help="Frontend URL"),
-    no_browser: bool = typer.Option(False, "--no-browser", help="Don't open browser automatically")
+    email: Optional[str] = typer.Option(None, "--email", help="Email address"),
+    password: Optional[str] = typer.Option(None, "--password", help="Password (will be prompted if not provided)")
 ) -> None:
     """
-    Authenticate with CyberWave using web-based device flow.
+    Authenticate with CyberWave using email and password.
     
-    This will open your web browser to complete authentication on the CyberWave platform.
+    This is a simple, secure authentication method for CLI users.
     """
-    asyncio.run(_login_flow(backend_url, frontend_url, no_browser))
+    asyncio.run(_login_flow(backend_url, frontend_url, email, password))
 
 
-async def _login_flow(backend_url: Optional[str], frontend_url: Optional[str], no_browser: bool) -> None:
-    """Async implementation of login flow."""
+async def _login_flow(backend_url: Optional[str], frontend_url: Optional[str], email: Optional[str], password: Optional[str]) -> None:
+    """Async implementation of simple login flow."""
     config = load_config()
     
     # Use provided URLs or fall back to config or defaults
     backend_url = backend_url or config.get("backend_url", DEFAULT_BACKEND_URL)
     frontend_url = frontend_url or config.get("frontend_url", DEFAULT_FRONTEND_URL)
     
-    print(f"[cyan]Initiating authentication with CyberWave...[/cyan]")
+    print(f"[cyan]Authenticating with CyberWave...[/cyan]")
     print(f"Backend: {backend_url}")
-    print(f"Frontend: {frontend_url}")
     
-    auth_flow = DeviceAuthFlow(backend_url, frontend_url)
+    # Get credentials from user if not provided
+    if not email:
+        email = typer.prompt("Email")
+    
+    if not password:
+        password = typer.prompt("Password", hide_input=True)
+    
+    auth_flow = SimpleAuthFlow(backend_url)
     
     try:
-        # Step 1: Initiate device flow
-        device_data = await auth_flow.initiate_device_flow()
+        # Login with credentials
+        login_data = await auth_flow.login(email, password)
         
-        device_code = device_data["device_code"]
-        user_code = device_data["user_code"]
-        verification_url = device_data["verification_url"]
-        expires_in = device_data.get("expires_in", 300)  # 5 minutes default
-        interval = device_data.get("interval", 5)  # 5 seconds default
+        # Save token using the SDK's token storage
+        from cyberwave import Client
+        client = Client(base_url=backend_url)
+        client._access_token = login_data["token"]
         
-        # Step 2: Display instructions to user
-        print(f"\n[bold yellow]Authentication Required[/bold yellow]")
-        print(f"Please visit: [bold blue]{verification_url}[/bold blue]")
-        print(f"And enter the code: [bold green]{user_code}[/bold green]")
-        print(f"\nCode expires in {expires_in} seconds")
+        if client._use_token_cache:
+            client._save_token_to_cache()
         
-        # Step 3: Open browser (unless disabled)
-        if not no_browser:
-            try:
-                # Construct the full URL with the user code
-                full_url = f"{frontend_url}/auth/device?user_code={user_code}"
-                webbrowser.open(full_url)
-                print(f"[dim]Opened browser to: {full_url}[/dim]")
-            except Exception as e:
-                print(f"[yellow]Could not open browser automatically: {e}[/yellow]")
+        # Update config with URLs and user info
+        config.update({
+            "backend_url": backend_url,
+            "frontend_url": frontend_url,
+        })
+        save_config(config)
         
-        # Step 4: Poll for completion
-        print(f"\n[dim]Waiting for authentication completion...[/dim]")
-        start_time = time.time()
+        # Display success message
+        user_info = login_data.get("user", {})
+        print(f"[green]✓ Authentication successful![/green]")
+        print(f"Logged in as: [bold]{user_info.get('email', email)}[/bold]")
         
-        with console.status("[bold green]Waiting for authentication...") as status:
-            while time.time() - start_time < expires_in:
-                token_data = await auth_flow.poll_for_token(device_code, interval)
-                
-                if token_data:
-                    # Success! Store tokens
-                    print(f"\n[green]✓ Authentication successful![/green]")
-                    
-                    # Save tokens using the SDK's token storage
-                    from cyberwave import Client
-                    client = Client(base_url=backend_url)
-                    client._access_token = token_data["access_token"]
-                    client._refresh_token = token_data.get("refresh_token")
-                    client._session_info = {k: v for k, v in token_data.items() 
-                                          if k not in ["access_token", "refresh_token"]}
-                    
-                    if client._use_token_cache:
-                        client._save_token_to_cache()
-                    
-                    # Update config with URLs
-                    config.update({
-                        "backend_url": backend_url,
-                        "frontend_url": frontend_url,
-                        "default_workspace": token_data.get("default_workspace"),
-                        "default_project": token_data.get("default_project")
-                    })
-                    save_config(config)
-                    
-                    # Display user info
-                    try:
-                        user_info = await client.get_current_user_info()
-                        print(f"Logged in as: [bold]{user_info.get('email', 'Unknown')}[/bold]")
-                    except Exception:
-                        print("Logged in successfully!")
-                    
-                    await client.aclose()
-                    return
-                
-                # Wait before next poll
-                await asyncio.sleep(interval)
-                status.update(f"[bold green]Waiting for authentication... ({int(expires_in - (time.time() - start_time))}s remaining)")
-        
-        print(f"\n[red]✗ Authentication timed out. Please try again.[/red]")
+        await client.aclose()
         
     except Exception as e:
         print(f"[red]✗ Authentication failed: {e}[/red]")
@@ -222,15 +181,27 @@ async def _login_flow(backend_url: Optional[str], frontend_url: Optional[str], n
         await auth_flow.close()
 
 
-@app.command()
-def logout() -> None:
-    """Log out and clear stored authentication."""
+async def _logout_flow() -> None:
+    """Async logout implementation."""
     try:
         from cyberwave import Client
+        config = load_config()
+        backend_url = config.get("backend_url", DEFAULT_BACKEND_URL)
         
-        # Clear tokens from cache
-        client = Client()
-        asyncio.run(client.logout())
+        client = Client(base_url=backend_url)
+        
+        if client._access_token:
+            # Try to revoke token on server
+            auth_flow = SimpleAuthFlow(backend_url)
+            try:
+                await auth_flow.logout(client._access_token)
+            except Exception:
+                pass  # Ignore server errors during logout
+            finally:
+                await auth_flow.close()
+        
+        # Clear local token cache
+        await client.logout()
         
         print("[green]✓ Successfully logged out[/green]")
     except Exception as e:
@@ -239,13 +210,25 @@ def logout() -> None:
 
 
 @app.command()
+def logout() -> None:
+    """Log out and clear stored authentication."""
+    asyncio.run(_logout_flow())
+
+
+@app.command()
 def status() -> None:
     """Show current authentication and configuration status."""
+    asyncio.run(_status_flow())
+
+
+async def _status_flow() -> None:
+    """Async status check implementation."""
     config = load_config()
+    backend_url = config.get("backend_url", DEFAULT_BACKEND_URL)
     
     # Check if user is authenticated
     from cyberwave import Client
-    client = Client()
+    client = Client(base_url=backend_url)
     
     table = Table(title="CyberWave CLI Status", show_header=True, header_style="bold magenta")
     table.add_column("Setting", style="cyan", width=20)
@@ -253,25 +236,31 @@ def status() -> None:
     
     # Authentication status
     if client._access_token:
-        table.add_row("Authentication", "[green]✓ Authenticated[/green]")
-        
-        # Try to get user info
+        # Check if token is still valid
+        auth_flow = SimpleAuthFlow(backend_url)
         try:
-            user_info = asyncio.run(client.get_current_user_info())
-            table.add_row("User", user_info.get('email', 'Unknown'))
+            status_data = await auth_flow.check_status(client._access_token)
+            if status_data.get("authenticated"):
+                table.add_row("Authentication", "[green]✓ Authenticated[/green]")
+                user_info = status_data.get("user", {})
+                table.add_row("User", user_info.get('email', 'Unknown'))
+            else:
+                table.add_row("Authentication", "[yellow]Token expired[/yellow]")
         except Exception:
-            table.add_row("User", "[yellow]Token may be expired[/yellow]")
+            table.add_row("Authentication", "[yellow]Token may be invalid[/yellow]")
+        finally:
+            await auth_flow.close()
     else:
         table.add_row("Authentication", "[red]✗ Not authenticated[/red]")
     
     # Configuration
     table.add_row("Backend URL", config.get("backend_url", DEFAULT_BACKEND_URL))
     table.add_row("Frontend URL", config.get("frontend_url", DEFAULT_FRONTEND_URL))
-    table.add_row("Default Workspace", str(config.get("default_workspace", "Not set")))
-    table.add_row("Default Project", str(config.get("default_project", "Not set")))
     table.add_row("Config File", str(CONFIG_FILE))
     
     console.print(table)
+    
+    await client.aclose()
 
 
 @app.command()
