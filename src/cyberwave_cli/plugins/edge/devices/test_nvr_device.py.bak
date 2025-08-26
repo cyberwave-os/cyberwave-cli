@@ -1,0 +1,51 @@
+"""
+Simple NVR Test Device CLI - Minimal version for testing
+"""
+
+import typer
+from typing import List, Dict, Any
+
+from cyberwave_cli.plugins.edge.devices import BaseDeviceCLI
+
+class TestNVRDeviceCLI(BaseDeviceCLI):
+    """Simple test CLI for NVR."""
+    
+    @property
+    def device_type(self) -> str:
+        return "camera/test-nvr"
+    
+    @property
+    def device_name(self) -> str:
+        return "test-nvr"
+    
+    @property
+    def supported_capabilities(self) -> List[str]:
+        return ["discovery", "testing"]
+    
+    def get_default_config(self) -> Dict[str, Any]:
+        return {"host": "localhost", "port": 554}
+    
+    def validate_config(self, config: Dict[str, Any]) -> List[str]:
+        return []
+    
+    def create_typer_app(self) -> typer.Typer:
+        """Create simple test app."""
+        app = typer.Typer(
+            name="test-nvr",
+            help="🧪 Test NVR commands",
+            rich_markup_mode="rich"
+        )
+        
+        @app.command("hello")
+        def hello():
+            """Test command"""
+            print("Hello from test NVR!")
+        
+        @app.command("discover")
+        def discover(host: str = "192.168.1.8"):
+            """Test discovery"""
+            print(f"Discovering NVR at {host}")
+        
+        return app
+
+__all__ = ["TestNVRDeviceCLI"]

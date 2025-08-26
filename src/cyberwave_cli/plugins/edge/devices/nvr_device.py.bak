@@ -1,0 +1,542 @@
+"""
+NVR (Network Video Recorder) Device CLI
+
+Handles NVR systems like Uniview, Hikvision, Dahua for multi-camera management.
+"""
+
+import asyncio
+import json
+import os
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.prompt import Confirm, Prompt
+
+from cyberwave_cli.plugins.edge.devices import BaseDeviceCLI
+from cyberwave_cli.plugins.edge.devices.nvr_camera_system import (
+    nvr_manager,
+    CameraCredentials,
+    NVRConfiguration
+)
+from cyberwave_cli.plugins.edge.utils.dependencies import (
+    check_device_readiness,
+    requires_dependency
+)
+from cyberwave_cli.plugins.edge.utils.connectivity import (
+    check_connectivity,
+    ConnectivityMode
+)
+
+console = Console()
+
+class NVRDeviceCLI(BaseDeviceCLI):
+    """CLI implementation for NVR systems."""
+    
+    @property
+    def device_type(self) -> str:
+        return "nvr"
+    
+    @property
+    def device_name(self) -> str:
+        return "nvr"
+    
+    @property
+    def description(self) -> str:
+        return "🎥 Network Video Recorder (NVR) management for multi-camera systems"
+    
+    def supported_capabilities(self) -> List[str]:
+        """Return list of supported capabilities."""
+        return [
+            "multi_camera_discovery",
+            "rtsp_streaming", 
+            "stream_validation",
+            "manufacturer_detection",
+            "credential_management",
+            "offline_registration"
+        ]
+    
+    def get_default_config(self) -> Dict[str, Any]:
+        """Return default configuration for NVR devices."""
+        return {
+            "rtsp_port": 554,
+            "web_port": 80,
+            "timeout": 10,
+            "stream_validation": True,
+            "max_discovery_channels": 32,
+            "supported_manufacturers": ["uniview", "hikvision", "dahua"],
+            "default_stream_paths": {
+                "uniview": {
+                    "main": "unicast/c{channel}/s1/live",
+                    "sub": "unicast/c{channel}/s2/live"
+                },
+                "hikvision": {
+                    "main": "Streaming/Channels/{channel}01",
+                    "sub": "Streaming/Channels/{channel}02"
+                },
+                "dahua": {
+                    "main": "cam/realmonitor?channel={channel}&subtype=0",
+                    "sub": "cam/realmonitor?channel={channel}&subtype=1"
+                }
+            }
+        }
+    
+    def validate_config(self, config: Dict[str, Any]) -> bool:
+        """Validate NVR configuration."""
+        required_fields = ["host", "manufacturer"]
+        
+        for field in required_fields:
+            if field not in config:
+                return False
+        
+        # Validate manufacturer
+        supported = self.get_default_config()["supported_manufacturers"]
+        if config.get("manufacturer") not in supported:
+            return False
+        
+        # Validate ports
+        rtsp_port = config.get("rtsp_port", 554)
+        if not isinstance(rtsp_port, int) or rtsp_port < 1 or rtsp_port > 65535:
+            return False
+        
+        return True
+    
+    def create_typer_app(self) -> typer.Typer:
+        """Create the typer app for NVR commands."""
+        app = typer.Typer(
+            name=self.device_name,
+            help=self.description,
+            rich_markup_mode="rich"
+        )
+        
+        @app.command("discover")
+        def discover_nvr(
+            host: str = typer.Option(..., "--host", help="NVR IP address or hostname"),
+            username: Optional[str] = typer.Option(None, "--username", help="NVR username (or set CAMERA_USERNAME)"),
+            password: Optional[str] = typer.Option(None, "--password", help="NVR password (or set CAMERA_PASSWORD)"),
+            manufacturer: Optional[str] = typer.Option(None, "--manufacturer", help="NVR manufacturer (uniview, hikvision, dahua)"),
+            auto_install_deps: bool = typer.Option(False, "--auto-install-deps", help="Auto-install missing dependencies"),
+            validate_streams: bool = typer.Option(True, "--validate/--no-validate", help="Validate camera streams"),
+            save_config: bool = typer.Option(True, "--save/--no-save", help="Save NVR configuration")
+        ) -> None:
+            """🔍 Discover cameras on an NVR system."""
+            
+            # Check dependencies
+            if not check_device_readiness("camera/nvr", auto_install=auto_install_deps):
+                console.print("[red]❌ Missing dependencies for NVR operations[/red]")
+                raise typer.Exit(1)
+            
+            # Set manufacturer environment variable if provided
+            if manufacturer:
+                os.environ["CAMERA_MANUFACTURER"] = manufacturer
+            
+            # Get credentials
+            credentials = None
+            if username and password:
+                credentials = CameraCredentials(username=username, password=password)
+            else:
+                # Try environment variables
+                env_username = os.getenv("CAMERA_USERNAME")
+                env_password = os.getenv("CAMERA_PASSWORD")
+                
+                if env_username and env_password:
+                    credentials = CameraCredentials(
+                        username=env_username,
+                        password=env_password,
+                        port=int(os.getenv("CAMERA_PORT", "554"))
+                    )
+                else:
+                    console.print("[yellow]⚠️ No credentials provided[/yellow]")
+                    console.print("Set CAMERA_USERNAME and CAMERA_PASSWORD environment variables")
+                    console.print("Or use --username and --password options")
+                    
+                    if not Confirm.ask("Continue without credentials?"):
+                        raise typer.Exit(1)
+            
+            try:
+                asyncio.run(self._discover_nvr_async(
+                    host=host,
+                    credentials=credentials,
+                    validate_streams=validate_streams,
+                    save_config=save_config
+                ))
+            except Exception as e:
+                console.print(f"[red]❌ NVR discovery failed: {e}[/red]")
+                raise typer.Exit(1)
+        
+        @app.command("list")
+        def list_nvrs(
+            format: str = typer.Option("table", "--format", help="Output format (table, json)")
+        ) -> None:
+            """📋 List discovered NVR systems."""
+            
+            if not nvr_manager.nvr_configurations:
+                console.print("[yellow]⚠️ No NVR systems configured[/yellow]")
+                console.print("Run 'cyberwave edge nvr discover --host <nvr-ip>' to discover NVR systems")
+                return
+            
+            if format == "json":
+                data = {}
+                for host, config in nvr_manager.nvr_configurations.items():
+                    data[host] = nvr_manager.export_camera_list(host)
+                console.print(json.dumps(data, indent=2))
+            else:
+                # Table format
+                table = Table(title="📹 Discovered NVR Systems")
+                table.add_column("Host", style="cyan")
+                table.add_column("Manufacturer", style="white")
+                table.add_column("Model", style="white")
+                table.add_column("Channels", style="yellow")
+                table.add_column("Cameras", style="green")
+                table.add_column("Status", style="white")
+                
+                for host, config in nvr_manager.nvr_configurations.items():
+                    camera_count = len(config.cameras) if config.cameras else 0
+                    status = "✅ Configured" if config.credentials else "⚠️ No credentials"
+                    
+                    table.add_row(
+                        host,
+                        config.manufacturer.title(),
+                        config.model,
+                        str(config.max_channels),
+                        str(camera_count),
+                        status
+                    )
+                
+                console.print(table)
+        
+        @app.command("show")
+        def show_nvr(
+            host: str = typer.Option(..., "--host", help="NVR IP address or hostname")
+        ) -> None:
+            """📊 Show detailed NVR configuration."""
+            
+            if host not in nvr_manager.nvr_configurations:
+                console.print(f"[red]❌ No configuration found for NVR {host}[/red]")
+                console.print("Run 'cyberwave edge nvr list' to see available NVR systems")
+                raise typer.Exit(1)
+            
+            nvr_manager.display_nvr_configuration(host)
+        
+        @app.command("validate")
+        def validate_nvr(
+            host: str = typer.Option(..., "--host", help="NVR IP address or hostname"),
+            stream_limit: int = typer.Option(5, "--limit", help="Number of streams to test"),
+            auto_install_deps: bool = typer.Option(False, "--auto-install-deps", help="Auto-install missing dependencies")
+        ) -> None:
+            """✅ Validate NVR camera streams."""
+            
+            # Check dependencies
+            if not check_device_readiness("camera/nvr", auto_install=auto_install_deps):
+                console.print("[red]❌ Missing dependencies for stream validation[/red]")
+                raise typer.Exit(1)
+            
+            if host not in nvr_manager.nvr_configurations:
+                console.print(f"[red]❌ No configuration found for NVR {host}[/red]")
+                raise typer.Exit(1)
+            
+            try:
+                asyncio.run(self._validate_nvr_async(host, stream_limit))
+            except Exception as e:
+                console.print(f"[red]❌ Validation failed: {e}[/red]")
+                raise typer.Exit(1)
+        
+        @app.command("register")
+        def register_nvr(
+            host: str = typer.Option(..., "--host", help="NVR IP address or hostname"),
+            environment: str = typer.Option(..., "--environment", help="Environment UUID or name"),
+            project: Optional[str] = typer.Option(None, "--project", help="Project UUID"),
+            location: str = typer.Option("Security Office", "--location", help="NVR location description"),
+            register_all_cameras: bool = typer.Option(False, "--all-cameras", help="Register all discovered cameras"),
+            main_streams_only: bool = typer.Option(True, "--main-only", help="Register only main quality streams"),
+            offline_mode: bool = typer.Option(False, "--offline", help="Skip connectivity check")
+        ) -> None:
+            """📝 Register NVR and cameras with the backend."""
+            
+            if host not in nvr_manager.nvr_configurations:
+                console.print(f"[red]❌ No configuration found for NVR {host}[/red]")
+                console.print("Run 'cyberwave edge nvr discover' first")
+                raise typer.Exit(1)
+            
+            try:
+                asyncio.run(self._register_nvr_async(
+                    host=host,
+                    environment=environment,
+                    project=project,
+                    location=location,
+                    register_all_cameras=register_all_cameras,
+                    main_streams_only=main_streams_only,
+                    offline_mode=offline_mode
+                ))
+            except Exception as e:
+                console.print(f"[red]❌ Registration failed: {e}[/red]")
+                raise typer.Exit(1)
+        
+        @app.command("export")
+        def export_nvr(
+            host: str = typer.Option(..., "--host", help="NVR IP address or hostname"),
+            output_file: Optional[str] = typer.Option(None, "--output", help="Output file path"),
+            format: str = typer.Option("json", "--format", help="Export format (json)")
+        ) -> None:
+            """📤 Export NVR camera configuration."""
+            
+            if host not in nvr_manager.nvr_configurations:
+                console.print(f"[red]❌ No configuration found for NVR {host}[/red]")
+                raise typer.Exit(1)
+            
+            export_data = nvr_manager.export_camera_list(host, format)
+            
+            if output_file:
+                output_path = Path(output_file)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                with open(output_path, 'w') as f:
+                    json.dump(export_data, f, indent=2)
+                
+                console.print(f"[green]✅ Exported to {output_path}[/green]")
+            else:
+                console.print(json.dumps(export_data, indent=2))
+        
+        @app.command("setup-credentials")
+        def setup_credentials() -> None:
+            """🔑 Interactive setup for NVR credentials."""
+            
+            console.print("[bold blue]🔑 NVR Credentials Setup[/bold blue]")
+            console.print("\nThis will help you configure credentials for your NVR system.")
+            
+            # Get current environment variables
+            current_username = os.getenv("CAMERA_USERNAME", "")
+            current_host = os.getenv("CAMERA_HOST", "")
+            
+            console.print(f"\nCurrent settings:")
+            console.print(f"  Username: [cyan]{current_username or 'Not set'}[/cyan]")
+            console.print(f"  Host: [cyan]{current_host or 'Not set'}[/cyan]")
+            
+            if current_username and Confirm.ask(f"\nUse existing username '{current_username}'?"):
+                username = current_username
+            else:
+                username = Prompt.ask("Enter NVR username", default="admin")
+            
+            password = Prompt.ask("Enter NVR password", password=True)
+            
+            if current_host and Confirm.ask(f"\nUse existing host '{current_host}'?"):
+                host = current_host
+            else:
+                host = Prompt.ask("Enter NVR IP address")
+            
+            port = Prompt.ask("Enter RTSP port", default="554")
+            manufacturer = Prompt.ask("Enter manufacturer", 
+                                    default="uniview", 
+                                    choices=["uniview", "hikvision", "dahua"])
+            
+            # Create export script
+            env_script = f"""#!/bin/bash
+# NVR Environment Configuration
+export CAMERA_USERNAME="{username}"
+export CAMERA_PASSWORD="{password}"
+export CAMERA_HOST="{host}"
+export CAMERA_PORT="{port}"
+export CAMERA_MANUFACTURER="{manufacturer}"
+
+# Uniview-specific paths (adjust for your system)
+export CAMERA_PATH_1="unicast/c1/s1/live"
+export CAMERA_PATH_2="unicast/c2/s1/live"
+
+echo "NVR credentials configured for {manufacturer.title()} at {host}"
+echo "Run: source ~/.cyberwave/nvr_env.sh"
+echo "Then: cyberwave edge nvr discover --host {host}"
+"""
+            
+            env_path = Path.home() / ".cyberwave" / "nvr_env.sh"
+            env_path.parent.mkdir(exist_ok=True)
+            
+            with open(env_path, 'w') as f:
+                f.write(env_script)
+            
+            env_path.chmod(0o755)
+            
+            console.print(f"\n[green]✅ Credentials configuration saved to {env_path}[/green]")
+            console.print("\nTo use these credentials:")
+            console.print(f"1. Run: [cyan]source {env_path}[/cyan]")
+            console.print(f"2. Run: [cyan]cyberwave edge nvr discover --host {host}[/cyan]")
+            console.print(f"3. Run: [cyan]cyberwave edge nvr validate --host {host}[/cyan]")
+    
+    async def _discover_nvr_async(
+        self,
+        host: str,
+        credentials: Optional[CameraCredentials],
+        validate_streams: bool,
+        save_config: bool
+    ) -> None:
+        """Async NVR discovery implementation."""
+        
+        # Check connectivity
+        try:
+            mode, config = await check_connectivity("NVR discovery")
+            console.print(f"[blue]🌐 Connectivity mode: {mode.value}[/blue]")
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Connectivity check failed: {e}[/yellow]")
+        
+        # Discover NVR system
+        nvr_config = await nvr_manager.discover_nvr_system(host, credentials)
+        
+        # Display results
+        nvr_manager.display_nvr_configuration(host)
+        
+        # Validate streams if requested
+        if validate_streams and nvr_config.cameras:
+            console.print("\n[blue]🔍 Validating camera streams...[/blue]")
+            results = await nvr_manager.validate_cameras(host, stream_limit=3)
+            
+            # Show validation summary
+            valid_count = sum(1 for v in results.values() if v)
+            total_count = len(results)
+            
+            if valid_count > 0:
+                console.print(f"[green]✅ {valid_count}/{total_count} streams validated successfully[/green]")
+            else:
+                console.print(f"[red]❌ No streams could be validated[/red]")
+                console.print("This might be due to:")
+                console.print("  • Incorrect credentials")
+                console.print("  • Network connectivity issues")
+                console.print("  • Missing OpenCV for stream testing")
+        
+        # Save configuration
+        if save_config:
+            nvr_manager.save_configurations()
+            console.print(f"\n[green]💾 Configuration saved[/green]")
+        
+        # Show next steps
+        console.print(f"\n[bold blue]📋 Next Steps:[/bold blue]")
+        console.print(f"1. Validate streams: [cyan]cyberwave edge nvr validate --host {host}[/cyan]")
+        console.print(f"2. Register with backend: [cyan]cyberwave edge nvr register --host {host} --environment <env-id>[/cyan]")
+        console.print(f"3. View configuration: [cyan]cyberwave edge nvr show --host {host}[/cyan]")
+    
+    async def _validate_nvr_async(self, host: str, stream_limit: int) -> None:
+        """Async NVR validation implementation."""
+        
+        results = await nvr_manager.validate_cameras(host, stream_limit)
+        
+        # Display detailed results
+        nvr_config = nvr_manager.nvr_configurations[host]
+        
+        if results:
+            table = Table(title="🔍 Stream Validation Results")
+            table.add_column("Camera", style="cyan")
+            table.add_column("Quality", style="yellow")
+            table.add_column("Status", style="white")
+            table.add_column("RTSP URL", style="dim")
+            
+            for camera in nvr_config.cameras[:stream_limit]:
+                status = "✅ Valid" if results.get(camera.camera_id, False) else "❌ Invalid"
+                rtsp_url = camera.get_rtsp_url(host, nvr_config.credentials)
+                # Mask password
+                display_url = rtsp_url.replace(nvr_config.credentials.password, "***") if nvr_config.credentials else rtsp_url
+                
+                table.add_row(
+                    camera.name,
+                    camera.quality,
+                    status,
+                    display_url
+                )
+            
+            console.print(table)
+    
+    async def _register_nvr_async(
+        self,
+        host: str,
+        environment: str,
+        project: Optional[str],
+        location: str,
+        register_all_cameras: bool,
+        main_streams_only: bool,
+        offline_mode: bool
+    ) -> None:
+        """Async NVR registration implementation."""
+        
+        nvr_config = nvr_manager.nvr_configurations[host]
+        
+        # Check connectivity unless offline mode
+        if not offline_mode:
+            try:
+                mode, config = await check_connectivity("NVR registration")
+                
+                if mode == ConnectivityMode.OFFLINE:
+                    console.print("[yellow]⚠️ Backend unavailable - would you like to register offline?[/yellow]")
+                    if not Confirm.ask("Continue with offline registration?"):
+                        return
+                    offline_mode = True
+                    
+            except Exception as e:
+                console.print(f"[yellow]⚠️ Connectivity check failed: {e}[/yellow]")
+                offline_mode = True
+        
+        # Prepare cameras for registration
+        cameras_to_register = []
+        
+        if register_all_cameras:
+            cameras_to_register = nvr_config.cameras
+        else:
+            # Register only main streams or interactive selection
+            if main_streams_only:
+                cameras_to_register = [cam for cam in nvr_config.cameras if cam.quality == "main"]
+            else:
+                # Interactive selection (simplified for now)
+                cameras_to_register = nvr_config.cameras[:5]  # First 5 cameras
+        
+        console.print(f"\n[blue]📝 Registering {len(cameras_to_register)} cameras...[/blue]")
+        
+        if offline_mode:
+            # Save registration data locally
+            registration_data = {
+                "nvr_host": host,
+                "environment": environment,
+                "project": project,
+                "location": location,
+                "cameras": [
+                    {
+                        "name": f"NVR_{host}_{cam.camera_id}",
+                        "type": "ip_camera_nvr",
+                        "nvr_host": host,
+                        "camera_id": cam.camera_id,
+                        "rtsp_path": cam.rtsp_path,
+                        "quality": cam.quality,
+                        "resolution": cam.resolution,
+                        "registered_at": f"{asyncio.get_event_loop().time()}"
+                    }
+                    for cam in cameras_to_register
+                ]
+            }
+            
+            # Save to offline registry
+            offline_path = Path.home() / ".cyberwave" / "offline_nvr_registrations.json"
+            offline_path.parent.mkdir(exist_ok=True)
+            
+            existing_data = []
+            if offline_path.exists():
+                with open(offline_path, 'r') as f:
+                    existing_data = json.load(f)
+            
+            existing_data.append(registration_data)
+            
+            with open(offline_path, 'w') as f:
+                json.dump(existing_data, f, indent=2)
+            
+            console.print(f"[green]✅ Offline registration saved to {offline_path}[/green]")
+            console.print("Data will be synced when backend connectivity is restored.")
+        
+        else:
+            # TODO: Implement actual backend registration
+            console.print("[yellow]⚠️ Backend registration not yet implemented[/yellow]")
+            console.print("Use --offline flag to save registration data locally")
+        
+        console.print(f"\n[green]🎉 NVR registration completed![/green]")
+        console.print(f"Registered {len(cameras_to_register)} cameras from NVR {host}")
+        
+        return app
+
+# Export the device CLI class
+__all__ = ["NVRDeviceCLI"]
