@@ -4,29 +4,8 @@ The official command-line interface for Cyberwave. Authenticate and bootstrap ro
 
 ## Installation
 
-### From PyPI (pip)
-
 ```bash
-pip install cyberwave-cli
-```
-
-### From APT (Debian/Ubuntu)
-
-```bash
-# Add Cyberwave repository (one-time setup)
-curl -fsSL https://apt.cyberwave.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/cyberwave-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/cyberwave-archive-keyring.gpg] https://apt.cyberwave.com stable main" | sudo tee /etc/apt/sources.list.d/cyberwave.list
-
-# Install
-sudo apt update && sudo apt install cyberwave-cli
-```
-
-### From Source
-
-```bash
-git clone https://github.com/cyberwave-os/cyberwave-cli
-cd cyberwave-cli
-pip install -e .
+sudo apt install cyberwave-cli
 ```
 
 ## Quick Start
@@ -37,15 +16,14 @@ pip install -e .
 cyberwave-cli login
 ```
 
-Enter your email and password when prompted. Your credentials are stored locally at `~/.cyberwave/credentials.json`.
+Enter your email and password when prompted. If you have multiple workspaces, you'll be asked to select one. Your credentials (including a permanent API token) are stored locally at `~/.cyberwave/credentials.json`.
 
 ### 2. Bootstrap a Project
 
 ```bash
-cyberwave-cli so101
+# Set up camera streaming
+cyberwave-cli camera
 ```
-
-This clones the SO-101 robot arm starter template and runs the setup scripts.
 
 ## Commands
 
@@ -54,6 +32,7 @@ This clones the SO-101 robot arm starter template and runs the setup scripts.
 | `login`  | Authenticate with Cyberwave                   |
 | `logout` | Remove stored credentials                     |
 | `so101`  | Clone and set up the SO-101 robot arm project |
+| `camera` | Set up camera edge software for streaming     |
 
 ### `cyberwave-cli login`
 
@@ -72,6 +51,14 @@ cyberwave-cli login --email you@example.com --password yourpassword
 - `-e, --email`: Email address
 - `-p, --password`: Password (will prompt if not provided)
 
+### `cyberwave-cli logout`
+
+Removes stored credentials from your local machine.
+
+```bash
+cyberwave-cli logout
+```
+
 ### `cyberwave-cli so101 [path]`
 
 Bootstraps a new SO-101 robot arm project.
@@ -88,13 +75,40 @@ cyberwave-cli so101 ~/projects/my-robot
 
 - `path` (optional): Target directory for the project. Defaults to `./so101-project`
 
+### `cyberwave-cli camera [path]`
+
+Sets up camera edge software for streaming to Cyberwave. Creates an environment and twin, then clones the camera edge repository with pre-configured credentials.
+
+```bash
+# Clone to default directory (./cyberwave-camera)
+cyberwave-cli camera
+
+# Clone to custom directory
+cyberwave-cli camera ~/projects/my-camera
+
+# Use an existing environment
+cyberwave-cli camera -e <environment-uuid>
+
+# Create a new environment with a specific name
+cyberwave-cli camera -n "My Camera Setup"
+```
+
+**Arguments:**
+
+- `path` (optional): Target directory for the project. Defaults to `./cyberwave-camera`
+
+**Options:**
+
+- `-e, --environment-uuid`: UUID of an existing environment to use
+- `-n, --environment-name`: Name for a new environment (creates one if `--environment-uuid` not provided)
+
 ## Configuration
 
-Credentials are stored in `~/.cyberwave/credentials.json` with restricted permissions (600).
+Credentials are stored in `~/.cyberwave/credentials.json` and include:
 
-Environment variables:
-
-- `CYBERWAVE_API_URL`: Override the API URL (default: `https://api.cyberwave.com`)
+- API token
+- Email
+- Workspace UUID and name
 
 ## Building for Distribution
 
@@ -104,10 +118,6 @@ Environment variables:
 pip install -e ".[build]"
 pyinstaller --onefile --name cyberwave-cli cyberwave_cli/main.py
 ```
-
-### Debian Package
-
-See `debian/` directory for packaging scripts.
 
 ## Support
 
