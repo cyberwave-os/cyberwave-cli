@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*"
+    paths:
+      - ".github/workflows/release-apt-get.yml"
   workflow_dispatch:
     inputs:
       version:
@@ -186,6 +188,7 @@ jobs:
 
           # Install build dependencies
           apk add --no-cache \
+            bash \
             python3 \
             py3-pip \
             python3-dev \
