@@ -143,135 +143,135 @@ jobs:
           path: "*.deb"
           retention-days: 7
 
-  build-apk:
-    name: Build Alpine Package (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-latest
-            platform: linux/amd64
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-            platform: linux/arm64
+  # build-apk:
+  #   name: Build Alpine Package (${{ matrix.arch }})
+  #   runs-on: ${{ matrix.runner }}
+  #   strategy:
+  #     matrix:
+  #       include:
+  #         - arch: x86_64
+  #           runner: ubuntu-latest
+  #           platform: linux/amd64
+  #         - arch: aarch64
+  #           runner: ubuntu-24.04-arm
+  #           platform: linux/arm64
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
 
-      - name: Set version from tag or input
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            VERSION="${GITHUB_REF#refs/tags/v}"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "📦 Building version: $VERSION"
+  #     - name: Set version from tag or input
+  #       id: version
+  #       run: |
+  #         if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+  #           VERSION="${{ github.event.inputs.version }}"
+  #         else
+  #           VERSION="${GITHUB_REF#refs/tags/v}"
+  #         fi
+  #         echo "version=$VERSION" >> $GITHUB_OUTPUT
+  #         echo "📦 Building version: $VERSION"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+  #     - name: Set up Docker Buildx
+  #       uses: docker/setup-buildx-action@v3
 
-      - name: Build Alpine package in Docker
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          ARCH="${{ matrix.arch }}"
+  #     - name: Build Alpine package in Docker
+  #       run: |
+  #         VERSION="${{ steps.version.outputs.version }}"
+  #         ARCH="${{ matrix.arch }}"
 
-          # Create build script for Alpine container
-          cat > build-apk.sh << 'SCRIPT'
-          #!/bin/sh
-          set -e
+  #         # Create build script for Alpine container
+  #         cat > build-apk.sh << 'SCRIPT'
+  #         #!/bin/sh
+  #         set -e
 
-          # Install build dependencies
-          apk add --no-cache \
-            bash \
-            python3 \
-            py3-pip \
-            python3-dev \
-            gcc \
-            musl-dev \
-            libffi-dev \
-            openssl-dev \
-            zlib-dev \
-            alpine-sdk \
-            sudo
+  #         # Install build dependencies
+  #         apk add --no-cache \
+  #           bash \
+  #           python3 \
+  #           py3-pip \
+  #           python3-dev \
+  #           gcc \
+  #           musl-dev \
+  #           libffi-dev \
+  #           openssl-dev \
+  #           zlib-dev \
+  #           alpine-sdk \
+  #           sudo
 
-          # Create packager user (required by abuild)
-          adduser -D packager
-          addgroup packager abuild
-          echo "packager ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+  #         # Create packager user (required by abuild)
+  #         adduser -D packager
+  #         addgroup packager abuild
+  #         echo "packager ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
-          # Install Python dependencies
-          pip3 install --break-system-packages pyinstaller
-          pip3 install --break-system-packages -e ".[build]"
+  #         # Install Python dependencies
+  #         pip3 install --break-system-packages pyinstaller
+  #         pip3 install --break-system-packages -e ".[build]"
 
-          # Build binary
-          chmod +x build.sh
-          ./build.sh
+  #         # Build binary
+  #         chmod +x build.sh
+  #         ./build.sh
 
-          # Verify binary
-          ./dist/cyberwave-cli --help || true
+  #         # Verify binary
+  #         ./dist/cyberwave-cli --help || true
 
-          # Create APKBUILD
-          mkdir -p /home/packager/apk-build
-          cd /home/packager/apk-build
+  #         # Create APKBUILD
+  #         mkdir -p /home/packager/apk-build
+  #         cd /home/packager/apk-build
 
-          cat > APKBUILD << EOF
-          # Maintainer: Cyberwave <support@cyberwave.com>
-          pkgname=cyberwave-cli
-          pkgver=${VERSION}
-          pkgrel=0
-          pkgdesc="The official command-line interface for Cyberwave"
-          url="https://cyberwave.com"
-          arch="${ARCH}"
-          license="MIT"
-          options="!check"
+  #         cat > APKBUILD << EOF
+  #         # Maintainer: Cyberwave <support@cyberwave.com>
+  #         pkgname=cyberwave-cli
+  #         pkgver=${VERSION}
+  #         pkgrel=0
+  #         pkgdesc="The official command-line interface for Cyberwave"
+  #         url="https://cyberwave.com"
+  #         arch="${ARCH}"
+  #         license="MIT"
+  #         options="!check"
 
-          package() {
-            install -Dm755 /workspace/dist/cyberwave-cli "\$pkgdir/usr/bin/cyberwave-cli"
-          }
-          EOF
+  #         package() {
+  #           install -Dm755 /workspace/dist/cyberwave-cli "\$pkgdir/usr/bin/cyberwave-cli"
+  #         }
+  #         EOF
 
-          chown -R packager:packager /home/packager/apk-build
-          chown -R packager:packager /workspace
+  #         chown -R packager:packager /home/packager/apk-build
+  #         chown -R packager:packager /workspace
 
-          # Generate keys and build package
-          cd /home/packager/apk-build
-          sudo -u packager abuild-keygen -a -n
-          sudo -u packager abuild -F
+  #         # Generate keys and build package
+  #         cd /home/packager/apk-build
+  #         sudo -u packager abuild-keygen -a -n
+  #         sudo -u packager abuild -F
 
-          # Copy package to workspace
-          cp /home/packager/packages/apk-build/${ARCH}/*.apk /workspace/
-          SCRIPT
+  #         # Copy package to workspace
+  #         cp /home/packager/packages/apk-build/${ARCH}/*.apk /workspace/
+  #         SCRIPT
 
-          chmod +x build-apk.sh
+  #         chmod +x build-apk.sh
 
-          # Run build in Alpine container
-          docker run --rm \
-            --platform ${{ matrix.platform }} \
-            -v "$PWD:/workspace" \
-            -w /workspace \
-            -e VERSION="${VERSION}" \
-            -e ARCH="${ARCH}" \
-            alpine:3.20 \
-            /workspace/build-apk.sh
+  #         # Run build in Alpine container
+  #         docker run --rm \
+  #           --platform ${{ matrix.platform }} \
+  #           -v "$PWD:/workspace" \
+  #           -w /workspace \
+  #           -e VERSION="${VERSION}" \
+  #           -e ARCH="${ARCH}" \
+  #           alpine:3.20 \
+  #           /workspace/build-apk.sh
 
-          echo "✅ Alpine package built"
-          ls -la *.apk
+  #         echo "✅ Alpine package built"
+  #         ls -la *.apk
 
-      - name: Upload .apk artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: apk-${{ matrix.arch }}
-          path: "*.apk"
-          retention-days: 7
+  #     - name: Upload .apk artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: apk-${{ matrix.arch }}
+  #         path: "*.apk"
+  #         retention-days: 7
 
   publish-to-buildkite:
     name: Publish to Buildkite Package Registries
     runs-on: ubuntu-latest
-    needs: [build-deb, build-apk]
+    needs: [build-deb]
     steps:
       - name: Download all .deb artifacts
         uses: actions/download-artifact@v4
@@ -280,19 +280,17 @@ jobs:
           merge-multiple: true
           path: deb-packages
 
-      - name: Download all .apk artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: apk-*
-          merge-multiple: true
-          path: apk-packages
+      # - name: Download all .apk artifacts
+      #   uses: actions/download-artifact@v4
+      #   with:
+      #     pattern: apk-*
+      #     merge-multiple: true
+      #     path: apk-packages
 
       - name: List downloaded packages
         run: |
           echo "=== Debian packages ==="
           ls -la deb-packages/
-          echo "=== Alpine packages ==="
-          ls -la apk-packages/
 
       - name: Push Debian packages to Buildkite
         env:
@@ -321,32 +319,32 @@ jobs:
 
           echo "✅ All Debian packages uploaded"
 
-      - name: Push Alpine packages to Buildkite
-        env:
-          BUILDKITE_API_TOKEN: ${{ secrets.BUILDKITE_API_TOKEN }}
-        run: |
-          API_URL="https://api.buildkite.com/v2/packages/organizations/${BUILDKITE_ORG_SLUG}/registries/${BUILDKITE_APK_REGISTRY_SLUG}/packages"
+      # - name: Push Alpine packages to Buildkite
+      #   env:
+      #     BUILDKITE_API_TOKEN: ${{ secrets.BUILDKITE_API_TOKEN }}
+      #   run: |
+      #     API_URL="https://api.buildkite.com/v2/packages/organizations/${BUILDKITE_ORG_SLUG}/registries/${BUILDKITE_APK_REGISTRY_SLUG}/packages"
 
-          for APK_FILE in apk-packages/*.apk; do
-            echo "📦 Uploading ${APK_FILE}..."
-            
-            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${API_URL}" \
-              -H "Authorization: Bearer ${BUILDKITE_API_TOKEN}" \
-              -F "file=@${APK_FILE}")
-            
-            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-            BODY=$(echo "$RESPONSE" | sed '$d')
-            
-            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-              echo "✅ Successfully uploaded ${APK_FILE}"
-            else
-              echo "❌ Failed to upload ${APK_FILE} (HTTP ${HTTP_CODE})"
-              echo "Response: ${BODY}"
-              exit 1
-            fi
-          done
+      #     for APK_FILE in apk-packages/*.apk; do
+      #       echo "📦 Uploading ${APK_FILE}..."
 
-          echo "✅ All Alpine packages uploaded"
+      #       RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${API_URL}" \
+      #         -H "Authorization: Bearer ${BUILDKITE_API_TOKEN}" \
+      #         -F "file=@${APK_FILE}")
+
+      #       HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+      #       BODY=$(echo "$RESPONSE" | sed '$d')
+
+      #       if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+      #         echo "✅ Successfully uploaded ${APK_FILE}"
+      #       else
+      #         echo "❌ Failed to upload ${APK_FILE} (HTTP ${HTTP_CODE})"
+      #         echo "Response: ${BODY}"
+      #         exit 1
+      #       fi
+      #     done
+
+      #     echo "✅ All Alpine packages uploaded"
 
   create-github-release:
     name: Create GitHub Release
