@@ -1,12 +1,12 @@
 [project]
 name = "cyberwave-cli"
-version = "0.1.5"
+version = "0.1.6"
 description = "The official command-line interface for Cyberwave"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Cyberwave", email = "support@cyberwave.com"},
+    {name = "Cyberwave", email = "info@cyberwave.com"},
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
