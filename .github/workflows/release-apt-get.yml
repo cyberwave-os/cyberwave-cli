@@ -15,8 +15,8 @@ env:
   PACKAGE_NAME: cyberwave-cli
   # Buildkite Package Registries configuration
   BUILDKITE_ORG_SLUG: cyberwave
-  BUILDKITE_DEB_REGISTRY_SLUG: cli
-  BUILDKITE_APK_REGISTRY_SLUG: cli-alpine
+  BUILDKITE_DEB_REGISTRY_SLUG: cyberwave-cli
+  BUILDKITE_APK_REGISTRY_SLUG: cyberwave-cli-alpine
 
 jobs:
   build-deb:
@@ -296,6 +296,15 @@ jobs:
         env:
           BUILDKITE_API_TOKEN: ${{ secrets.BUILDKITE_API_TOKEN }}
         run: |
+          # Debug: Check if env vars are set (without exposing values)
+          if [ -z "${BUILDKITE_API_TOKEN}" ]; then
+            echo "❌ ERROR: BUILDKITE_API_TOKEN is not set!"
+            echo "Please add BUILDKITE_API_TOKEN to your repository secrets."
+            exit 1
+          fi
+          echo "✅ BUILDKITE_API_TOKEN is set"
+          echo "📍 Org: ${BUILDKITE_ORG_SLUG}, Registry: ${BUILDKITE_DEB_REGISTRY_SLUG}"
+
           API_URL="https://api.buildkite.com/v2/packages/organizations/${BUILDKITE_ORG_SLUG}/registries/${BUILDKITE_DEB_REGISTRY_SLUG}/packages"
 
           for DEB_FILE in deb-packages/*.deb; do
