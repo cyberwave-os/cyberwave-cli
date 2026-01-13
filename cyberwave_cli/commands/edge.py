@@ -13,15 +13,27 @@ Example usage:
     
     # Install edge dependencies (ultralytics, opencv, etc.)
     cyberwave edge install-deps
+    
+    # Show device fingerprint
+    cyberwave edge whoami
+    
+    # Pull config from twin
+    cyberwave edge pull --twin-uuid UUID
+    cyberwave edge pull --environment-uuid UUID
 """
 
+import json
 import os
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import click
 from rich.console import Console
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 console = Console()
@@ -283,5 +295,475 @@ def list_models(twin_uuid):
         else:
             console.print("[yellow]No response from edge node (is it running?)[/yellow]")
             
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+
+
+# =============================================================================
+# Device Fingerprint Commands
+# =============================================================================
+
+
+@edge.command("whoami")
+def whoami():
+    """
+    Show device fingerprint and info.
+    
+    Displays the unique fingerprint for this device, which is used to identify
+    this edge device when connecting to twins. The fingerprint is stable across
+    sessions and derived from hardware characteristics.
+    
+    \b
+    Example:
+        cyberwave edge whoami
+        
+        Fingerprint: macbook-pro-a1b2c3d4e5f6
+        Hostname:    macbook-pro.local
+        Platform:    Darwin-arm64
+        Python:      3.11.0
+        MAC:         a4:83:e7:xx:xx:xx
+    """
+    from ..fingerprint import format_device_info_table, generate_fingerprint
+    
+    console.print("\n[bold]Device Information[/bold]\n")
+    console.print(format_device_info_table())
+    console.print()
+
+
+# =============================================================================
+# Config Sync Commands
+# =============================================================================
+
+
+@edge.command("pull")
+@click.option("--twin-uuid", "-t", help="Twin UUID to pull config from")
+@click.option("--environment-uuid", "-e", help="Environment UUID to pull all twins from")
+@click.option("--target-dir", "-d", default=".", help="Directory to write .env file")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
+def pull_config(twin_uuid: str | None, environment_uuid: str | None, target_dir: str, yes: bool):
+    """
+    Pull edge configuration from twin or environment.
+    
+    Downloads the edge configuration stored in twin metadata and writes it to
+    a local .env file. Supports pulling from a single twin or all twins in
+    an environment.
+    
+    \b
+    Examples:
+        # Pull config for a specific twin
+        cyberwave edge pull --twin-uuid abc-123
+        
+        # Pull configs for all twins in an environment
+        cyberwave edge pull --environment-uuid env-456
+        
+        # Specify output directory
+        cyberwave edge pull -t abc-123 -d ./my-edge
+    """
+    from ..fingerprint import generate_fingerprint, get_device_info
+    from ..utils import get_sdk_client
+    
+    if not twin_uuid and not environment_uuid:
+        console.print("[red]Error: Provide --twin-uuid or --environment-uuid[/red]")
+        console.print("[dim]Example: cyberwave edge pull --twin-uuid abc-123[/dim]")
+        return
+    
+    client = get_sdk_client()
+    if not client:
+        console.print("[red]Not authenticated. Run 'cyberwave login' first.[/red]")
+        return
+    
+    fingerprint = generate_fingerprint()
+    console.print(f"\n[dim]Fingerprint: {fingerprint}[/dim]\n")
+    
+    try:
+        if environment_uuid:
+            _pull_environment_configs(client, environment_uuid, fingerprint, target_dir, yes)
+        else:
+            _pull_single_twin_config(client, twin_uuid, fingerprint, target_dir, yes)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+
+
+def _pull_single_twin_config(client: Any, twin_uuid: str, fingerprint: str, target_dir: str, yes: bool):
+    """Pull config from a single twin."""
+    twin = client.twins.get(twin_uuid)
+    twin_name = getattr(twin, 'name', 'Unknown')
+    metadata = getattr(twin, 'metadata', {}) or {}
+    edge_configs = metadata.get('edge_configs', {})
+    
+    console.print(f"[cyan]Twin:[/cyan] {twin_name}")
+    
+    my_config = edge_configs.get(fingerprint)
+    
+    if my_config:
+        console.print(f"[green]✓[/green] Found config for this device")
+        console.print(f"[dim]  Registered: {my_config.get('registered_at', 'unknown')}[/dim]")
+        
+        cameras = my_config.get('cameras', [])
+        if cameras:
+            console.print(f"[dim]  Cameras: {len(cameras)} configured[/dim]")
+    else:
+        # No config for this fingerprint - check for other configs or default
+        if edge_configs:
+            console.print(f"[yellow]No config for this device fingerprint[/yellow]")
+            console.print(f"\n[dim]Available configs from other devices:[/dim]")
+            
+            for i, (fp, cfg) in enumerate(edge_configs.items(), 1):
+                device_info = cfg.get('device_info', {})
+                hostname = device_info.get('hostname', 'unknown')
+                registered = cfg.get('registered_at', 'unknown')[:10] if cfg.get('registered_at') else 'unknown'
+                console.print(f"  {i}. {fp[:30]}... ({hostname}, {registered})")
+            
+            if not yes:
+                choice = Prompt.ask(
+                    "\n[bold]Copy config from which device? (number or 'n' to skip)[/bold]",
+                    default="1"
+                )
+                
+                if choice.lower() != 'n':
+                    try:
+                        idx = int(choice) - 1
+                        source_fp = list(edge_configs.keys())[idx]
+                        my_config = edge_configs[source_fp].copy()
+                        console.print(f"[green]✓[/green] Copying config from {source_fp[:20]}...")
+                    except (ValueError, IndexError):
+                        console.print("[yellow]Invalid choice, skipping[/yellow]")
+                        return
+        else:
+            # Check for default config
+            default_config = metadata.get('default_edge_config')
+            if default_config:
+                console.print("[yellow]No config for this device, using default template[/yellow]")
+                my_config = default_config.copy()
+            else:
+                console.print("[red]No configuration found for this twin[/red]")
+                console.print("[dim]Use 'cyberwave connect' to set up this twin[/dim]")
+                return
+    
+    if not my_config:
+        return
+    
+    # Prompt for credentials (not stored in cloud)
+    cameras = my_config.get('cameras', [])
+    has_rtsp = any('rtsp://' in str(c.get('source', '')) for c in cameras)
+    
+    username = None
+    password = None
+    
+    if has_rtsp and not yes:
+        console.print("\n[bold]Enter credentials (stored locally only):[/bold]")
+        username = Prompt.ask("  RTSP Username", default="admin")
+        password = Prompt.ask("  RTSP Password", password=True)
+    
+    # Write .env file
+    _write_env_file(
+        target_dir=target_dir,
+        twin_uuid=twin_uuid,
+        cameras=cameras,
+        username=username,
+        password=password,
+        fingerprint=fingerprint,
+    )
+    
+    console.print(f"\n[green]✓[/green] Config pulled to {target_dir}/.env")
+    console.print("[dim]Run: python -m cyberwave_edge.service[/dim]")
+
+
+def _pull_environment_configs(client: Any, env_uuid: str, fingerprint: str, target_dir: str, yes: bool):
+    """Pull configs for all twins in an environment."""
+    # Get environment info
+    env = client.environments.get(env_uuid)
+    env_name = getattr(env, 'name', 'Unknown')
+    
+    # Get twins in environment
+    twins = client.twins.list(environment_uuid=env_uuid)
+    
+    if not twins:
+        console.print(f"[yellow]No twins found in environment '{env_name}'[/yellow]")
+        return
+    
+    console.print(f"[cyan]Environment:[/cyan] {env_name}")
+    console.print(f"[cyan]Found {len(twins)} twin(s):[/cyan]\n")
+    
+    all_cameras = []
+    twins_with_config = []
+    twins_without_config = []
+    
+    for twin in twins:
+        twin_name = getattr(twin, 'name', 'Unknown')
+        twin_uuid = str(getattr(twin, 'uuid', ''))
+        metadata = getattr(twin, 'metadata', {}) or {}
+        edge_configs = metadata.get('edge_configs', {})
+        
+        my_config = edge_configs.get(fingerprint)
+        
+        if my_config:
+            twins_with_config.append((twin, my_config))
+            cameras = my_config.get('cameras', [])
+            for cam in cameras:
+                cam_copy = cam.copy()
+                cam_copy['twin_uuid'] = twin_uuid
+                cam_copy['twin_name'] = twin_name
+                all_cameras.append(cam_copy)
+            console.print(f"  [green]✓[/green] {twin_name} - {len(cameras)} camera(s)")
+        else:
+            twins_without_config.append(twin)
+            console.print(f"  [yellow]○[/yellow] {twin_name} - no config for this device")
+    
+    if not all_cameras and not twins_without_config:
+        console.print("\n[yellow]No configurations to pull[/yellow]")
+        return
+    
+    if twins_without_config:
+        console.print(f"\n[yellow]{len(twins_without_config)} twin(s) need configuration[/yellow]")
+    
+    if not yes and not Confirm.ask("\nPull available configs?", default=True):
+        return
+    
+    # Prompt for shared credentials
+    has_rtsp = any('rtsp://' in str(c.get('source', '')) for c in all_cameras)
+    
+    username = None
+    password = None
+    
+    if has_rtsp and not yes:
+        console.print("\n[bold]Enter shared credentials (stored locally only):[/bold]")
+        username = Prompt.ask("  RTSP Username", default="admin")
+        password = Prompt.ask("  RTSP Password", password=True)
+    
+    # Write .env file with all cameras
+    if all_cameras:
+        _write_multi_camera_env(
+            target_dir=target_dir,
+            cameras=all_cameras,
+            username=username,
+            password=password,
+            fingerprint=fingerprint,
+        )
+        
+        console.print(f"\n[green]✓[/green] Config pulled to {target_dir}/.env")
+        console.print(f"[dim]  {len(all_cameras)} camera(s) from {len(twins_with_config)} twin(s)[/dim]")
+        console.print("[dim]Run: python -m cyberwave_edge.service[/dim]")
+    else:
+        console.print("\n[yellow]No cameras configured. Use 'cyberwave connect' to set up twins.[/yellow]")
+
+
+def _write_env_file(
+    target_dir: str,
+    twin_uuid: str,
+    cameras: list[dict],
+    username: str | None,
+    password: str | None,
+    fingerprint: str,
+):
+    """Write .env file for single twin config."""
+    from ..config import get_api_url
+    from ..credentials import load_credentials
+    
+    creds = load_credentials()
+    token = creds.token if creds else ""
+    
+    # Build cameras JSON
+    cameras_json = []
+    for cam in cameras:
+        cam_entry = {
+            "camera_id": cam.get("camera_id", "default"),
+            "source": cam.get("source", "0"),
+            "fps": cam.get("fps", 10),
+        }
+        if username:
+            cam_entry["username"] = username
+        if password:
+            cam_entry["password"] = password
+        cameras_json.append(cam_entry)
+    
+    env_content = f"""# Cyberwave Edge Configuration
+# Generated by: cyberwave edge pull
+# Fingerprint: {fingerprint}
+
+# Required
+CYBERWAVE_TOKEN={token}
+CYBERWAVE_TWIN_UUID={twin_uuid}
+
+# API Settings
+CYBERWAVE_BASE_URL={get_api_url()}
+
+# Device Identification
+CYBERWAVE_EDGE_UUID={fingerprint}
+
+# Camera Configuration
+CAMERAS='{json.dumps(cameras_json)}'
+
+# Logging
+LOG_LEVEL=INFO
+"""
+    
+    target_path = Path(target_dir).expanduser().resolve()
+    target_path.mkdir(parents=True, exist_ok=True)
+    env_file = target_path / ".env"
+    env_file.write_text(env_content)
+
+
+def _write_multi_camera_env(
+    target_dir: str,
+    cameras: list[dict],
+    username: str | None,
+    password: str | None,
+    fingerprint: str,
+):
+    """Write .env file for multi-twin/multi-camera config."""
+    from ..config import get_api_url
+    from ..credentials import load_credentials
+    
+    creds = load_credentials()
+    token = creds.token if creds else ""
+    
+    # Build cameras JSON with twin info
+    cameras_json = []
+    twin_uuids = set()
+    
+    for cam in cameras:
+        twin_uuid = cam.get("twin_uuid", "")
+        twin_uuids.add(twin_uuid)
+        
+        cam_entry = {
+            "camera_id": cam.get("camera_id", "default"),
+            "source": cam.get("source", "0"),
+            "fps": cam.get("fps", 10),
+            "twin_uuid": twin_uuid,
+        }
+        if username:
+            cam_entry["username"] = username
+        if password:
+            cam_entry["password"] = password
+        cameras_json.append(cam_entry)
+    
+    # Use first twin as primary (for MQTT commands)
+    primary_twin = list(twin_uuids)[0] if twin_uuids else ""
+    
+    env_content = f"""# Cyberwave Edge Configuration (Multi-Camera)
+# Generated by: cyberwave edge pull
+# Fingerprint: {fingerprint}
+# Twins: {len(twin_uuids)}
+
+# Required
+CYBERWAVE_TOKEN={token}
+CYBERWAVE_TWIN_UUID={primary_twin}
+
+# API Settings
+CYBERWAVE_BASE_URL={get_api_url()}
+
+# Device Identification
+CYBERWAVE_EDGE_UUID={fingerprint}
+
+# Camera Configuration ({len(cameras_json)} cameras)
+CAMERAS='{json.dumps(cameras_json, indent=2)}'
+
+# Logging
+LOG_LEVEL=INFO
+"""
+    
+    target_path = Path(target_dir).expanduser().resolve()
+    target_path.mkdir(parents=True, exist_ok=True)
+    env_file = target_path / ".env"
+    env_file.write_text(env_content)
+
+
+@edge.command("remote-status")
+@click.option("--twin-uuid", "-t", required=True, help="Twin UUID to check status for")
+def remote_status(twin_uuid: str):
+    """
+    Check edge status from twin metadata (heartbeat).
+    
+    Queries the twin's metadata for the last heartbeat from this device's
+    fingerprint. Shows online/offline status, uptime, and stream info.
+    
+    \b
+    Example:
+        cyberwave edge remote-status --twin-uuid abc-123
+    """
+    from ..fingerprint import generate_fingerprint
+    from ..utils import get_sdk_client
+    
+    client = get_sdk_client()
+    if not client:
+        console.print("[red]Not authenticated. Run 'cyberwave login' first.[/red]")
+        return
+    
+    fingerprint = generate_fingerprint()
+    
+    try:
+        twin = client.twins.get(twin_uuid)
+        twin_name = getattr(twin, 'name', 'Unknown')
+        metadata = getattr(twin, 'metadata', {}) or {}
+        edge_configs = metadata.get('edge_configs', {})
+        
+        my_config = edge_configs.get(fingerprint)
+        
+        console.print(f"\n[bold]Edge Status for \"{twin_name}\"[/bold]")
+        console.print("━" * 40)
+        console.print(f"Fingerprint:    {fingerprint}")
+        
+        if not my_config:
+            console.print(f"Status:         [yellow]Not registered[/yellow]")
+            console.print("\n[dim]This device hasn't connected to this twin yet.[/dim]")
+            console.print("[dim]Use 'cyberwave connect' or 'cyberwave edge pull' first.[/dim]")
+            return
+        
+        # Check last heartbeat
+        last_heartbeat = my_config.get('last_heartbeat')
+        last_status = my_config.get('last_status', {})
+        
+        if last_heartbeat:
+            try:
+                hb_time = datetime.fromisoformat(last_heartbeat.replace('Z', '+00:00'))
+                now = datetime.now(timezone.utc)
+                delta = now - hb_time
+                
+                if delta.total_seconds() < 60:
+                    status = "[green]Online[/green]"
+                    last_seen = f"{int(delta.total_seconds())} seconds ago"
+                elif delta.total_seconds() < 300:
+                    status = "[yellow]Stale[/yellow]"
+                    last_seen = f"{int(delta.total_seconds() / 60)} minutes ago"
+                else:
+                    status = "[red]Offline[/red]"
+                    last_seen = f"{int(delta.total_seconds() / 3600)} hours ago" if delta.total_seconds() > 3600 else f"{int(delta.total_seconds() / 60)} minutes ago"
+                
+                console.print(f"Status:         {status}")
+                console.print(f"Last heartbeat: {last_seen}")
+                
+                # Show uptime if available
+                uptime = last_status.get('uptime_seconds')
+                if uptime:
+                    days = uptime // 86400
+                    hours = (uptime % 86400) // 3600
+                    if days > 0:
+                        console.print(f"Uptime:         {days} days, {hours} hours")
+                    else:
+                        console.print(f"Uptime:         {hours} hours")
+                
+                # Show streams if available
+                streams = last_status.get('streams', {})
+                if streams:
+                    console.print(f"\nStreams:")
+                    for stream_id, stream_info in streams.items():
+                        stream_status = stream_info.get('status', 'unknown')
+                        fps = stream_info.get('fps', '?')
+                        res = stream_info.get('resolution', '?')
+                        if stream_status == 'streaming':
+                            console.print(f"  • {stream_id}: [green]{stream_status}[/green] ({fps} fps, {res})")
+                        else:
+                            console.print(f"  • {stream_id}: [yellow]{stream_status}[/yellow]")
+                
+            except Exception:
+                console.print(f"Last heartbeat: {last_heartbeat}")
+        else:
+            registered = my_config.get('registered_at', 'unknown')
+            console.print(f"Status:         [yellow]Never connected[/yellow]")
+            console.print(f"Registered:     {registered}")
+        
+        console.print()
+        
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")

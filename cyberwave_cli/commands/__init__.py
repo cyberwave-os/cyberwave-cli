@@ -2,6 +2,7 @@
 
 from .camera import camera
 from .configure import configure
+from .connect import connect
 from .edge import edge
 from .environment import environment
 from .login import login
@@ -16,6 +17,7 @@ from .workflow import workflow
 __all__ = [
     "camera",
     "configure",
+    "connect",
     "edge",
     "environment",
     "login",
