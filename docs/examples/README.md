@@ -5,6 +5,7 @@ Practical guides for common use cases.
 ## Getting Started
 
 - **[Quick Start](./quick_start.md)** - Get running in 5 minutes
+- **[Local Testing Best Practices](../local_testing_best_practices.md)** - macOS Docker setup for video streaming
 
 ## Use Cases
 
