@@ -7,7 +7,8 @@ Deploy multiple cameras with a single edge service.
 The Cyberwave edge service supports multiple concurrent video streams. This guide covers:
 
 - Discovering multiple cameras
-- Configuring multi-camera environments
+- Using the `connect` command for quick setup
+- Cloud configuration sync with device fingerprinting
 - Running a single edge for multiple cameras
 - Per-camera ML model configuration
 
@@ -16,106 +17,173 @@ The Cyberwave edge service supports multiple concurrent video streams. This guid
 ### Scan Network for Cameras
 
 ```bash
-# Scan local network
+# Scan local network (port scan only, fastest)
+cyberwave-cli scan -t 0.5 --no-onvif --no-upnp
+
+# Full discovery with ONVIF/UPnP (slower but more info)
 cyberwave-cli scan
 
 # Scan specific subnet
-cyberwave-cli scan --network 192.168.1.0/24
-
-# Scan with credentials for RTSP
-cyberwave-cli scan --rtsp-user admin --rtsp-password secret
+cyberwave-cli scan -s 192.168.1
 ```
 
 ### Example Output
 
 ```
-Discovered devices:
-  ├── 192.168.1.100 (Hikvision DS-2CD2143)
-  │   └── rtsp://192.168.1.100:554/Streaming/Channels/101
-  ├── 192.168.1.101 (Dahua IPC-HDW4433C-A)
-  │   └── rtsp://192.168.1.101:554/cam/realmonitor?channel=1
-  └── 192.168.1.102 (Generic ONVIF)
-      └── rtsp://192.168.1.102:554/stream1
+Found 5 device(s)
+┏━━━━┳━━━━━━━━━━━━━━┳━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃    ┃ IP Address   ┃ Port ┃ Protocol ┃ Manufacturer ┃ URL                     ┃
+┡━━━━╇━━━━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ 📷 │ 192.168.1.3  │ 554  │ RTSP     │ -            │ rtsp://192.168.1.3:554  │
+│ 📷 │ 192.168.1.5  │ 554  │ RTSP     │ -            │ rtsp://192.168.1.5:554  │
+│ 📷 │ 192.168.1.10 │ 554  │ RTSP     │ -            │ rtsp://192.168.1.10:554 │
+└────┴──────────────┴──────┴──────────┴──────────────┴─────────────────────────┘
 ```
 
-## Setup
+## Setup Methods
 
-### Option 1: CLI Setup (Recommended)
+### Method 1: Smart Connect (Recommended)
 
-Register each camera:
+The `connect` command creates a twin and configures the edge in one step. Configuration is saved to the cloud and can be restored on any device.
 
 ```bash
-# Front door camera
-cyberwave-cli camera setup \
-  --source "rtsp://admin:pass@192.168.1.100:554/stream" \
-  --name "Front Door" \
-  --environment "Home Security"
+# Check your device fingerprint first
+cyberwave-cli edge whoami
 
-# Backyard camera  
-cyberwave-cli camera setup \
-  --source "rtsp://admin:pass@192.168.1.101:554/stream" \
-  --name "Backyard" \
-  --environment "Home Security"
+# Connect first camera (creates twin + configures edge)
+cyberwave-cli connect camera --name "Front Door"
 
-# Garage camera
-cyberwave-cli camera setup \
-  --source "rtsp://admin:pass@192.168.1.102:554/stream" \
-  --name "Garage" \
-  --environment "Home Security"
+# Connect additional cameras to the same environment
+cyberwave-cli connect camera --name "Backyard" -e ENV_UUID
+cyberwave-cli connect camera --name "Garage" -e ENV_UUID
 ```
 
-### Option 2: Environment Variable
+The connect command will:
+1. Resolve the asset (by registry ID or alias like "camera")
+2. Create a new twin in your environment
+3. Prompt for camera configuration (RTSP URL, FPS, etc.)
+4. Save config to cloud (twin metadata) with your device fingerprint
+5. Write local `.env` file
 
-Configure all cameras in `.env`:
+### Method 2: Pull Environment Configs
+
+If cameras are already configured in the cloud (e.g., from another device), pull all configs at once:
 
 ```bash
-CAMERAS='{
-  "front_door": {
-    "source": "rtsp://admin:pass@192.168.1.100:554/stream",
-    "fps": 10,
-    "enabled": true
-  },
-  "backyard": {
-    "source": "rtsp://admin:pass@192.168.1.101:554/stream",
-    "fps": 10,
-    "enabled": true
-  },
-  "garage": {
-    "source": "rtsp://admin:pass@192.168.1.102:554/stream",
-    "fps": 5,
-    "enabled": true
+# Pull configs for all twins in environment
+cyberwave-cli edge pull -e ENV_UUID
+
+# Example output:
+Environment: Home Security
+Found 3 twin(s):
+
+  ✓ Front Door - 1 camera(s)
+  ✓ Backyard - 1 camera(s)
+  ✓ Garage - 1 camera(s)
+
+✓ Config pulled to ./.env
+  3 camera(s) from 3 twin(s)
+```
+
+### Method 3: Manual .env Configuration
+
+For advanced setups, configure all cameras directly in `.env`:
+
+```bash
+CAMERAS='[
+  {"camera_id": "front_door", "source": "rtsp://admin:pass@192.168.1.3:554/stream", "fps": 10},
+  {"camera_id": "backyard", "source": "rtsp://admin:pass@192.168.1.5:554/stream", "fps": 10},
+  {"camera_id": "garage", "source": "rtsp://admin:pass@192.168.1.10:554/stream", "fps": 5}
+]'
+```
+
+## Device Fingerprinting
+
+Each edge device has a unique fingerprint based on hardware characteristics:
+
+```bash
+$ cyberwave-cli edge whoami
+
+Device Information
+
+Fingerprint: macbook-pro-a1b2c3d4e5f6
+Hostname:    macbook-pro.local
+Platform:    Darwin-arm64
+Python:      3.11.0
+MAC:         a4:83:e7:xx:xx:xx
+```
+
+This fingerprint is used to:
+- Track which device connected to which twin
+- Store per-device configurations in twin metadata
+- Enable cloud config sync across devices
+
+Override the fingerprint if needed:
+```bash
+export CYBERWAVE_EDGE_UUID=my-custom-device-id
+```
+
+## Cloud Configuration Sync
+
+Configurations are stored in twin metadata and synced to the cloud:
+
+```python
+# twin.metadata.edge_configs
+{
+  "macbook-pro-a1b2c3d4e5f6": {
+    "cameras": [{"camera_id": "default", "source": "rtsp://...", "fps": 10}],
+    "device_info": {"hostname": "macbook-pro.local", "platform": "Darwin-arm64"},
+    "registered_at": "2026-01-13T10:00:00Z",
+    "last_sync": "2026-01-13T12:00:00Z"
   }
-}'
+}
+```
+
+### Sync Workflows
+
+**New device, existing twins:**
+```bash
+cyberwave-cli edge pull -e ENV_UUID
+```
+
+**Push config to new device:**
+```bash
+# On the new device
+cyberwave-cli edge pull -t TWIN_UUID
+# Will prompt to copy config from existing device
 ```
 
 ## Edge Configuration
 
-### Single Edge for Multiple Cameras
-
-Create `.env` for the edge service:
+### Complete .env Example
 
 ```bash
-# API Configuration
+# Cyberwave Edge Configuration
+# Generated by: cyberwave connect / edge pull
+
+# Required
 CYBERWAVE_TOKEN=your-api-token
+CYBERWAVE_TWIN_UUID=primary-twin-uuid
 CYBERWAVE_BASE_URL=http://localhost:8000
 
-# Primary twin (for commands)
-CYBERWAVE_TWIN_UUID=front-door-twin-uuid
+# Device Identification (auto-generated)
+CYBERWAVE_EDGE_UUID=macbook-pro-a1b2c3d4e5f6
 
-# All cameras
-CAMERAS='{
-  "front_door": {"source": "rtsp://...", "fps": 10},
-  "backyard": {"source": "rtsp://...", "fps": 10},
-  "garage": {"source": "rtsp://...", "fps": 5}
-}'
+# Camera Configuration
+CAMERAS='[
+  {"camera_id": "front_door", "source": "rtsp://admin:pass@192.168.1.3:554/stream", "fps": 10, "twin_uuid": "twin-1"},
+  {"camera_id": "backyard", "source": "rtsp://admin:pass@192.168.1.5:554/stream", "fps": 10, "twin_uuid": "twin-2"},
+  {"camera_id": "garage", "source": "rtsp://admin:pass@192.168.1.10:554/stream", "fps": 5, "twin_uuid": "twin-3"}
+]'
 
 # Local development
 CYBERWAVE_LOCAL_ICE=true
+
+# Logging
+LOG_LEVEL=INFO
 ```
 
 ### Per-Camera ML Models
-
-Configure different models per camera via workflow nodes or `MODELS` env:
 
 ```bash
 MODELS='{
@@ -136,87 +204,45 @@ MODELS='{
 }'
 ```
 
-## Workflow Setup
-
-### Shared Workflow for All Cameras
-
-Create a workflow with a Data Source node that targets the environment (not a specific twin):
-
-```
-[Trigger: Event] → [Condition: Check Camera] → [Action: Alert]
-     ↓
-Event filters:
-  - source: "edge_node"
-  - event_type: "person_detected"
-```
-
-### Per-Camera Workflows
-
-Create separate workflows for different cameras with different rules:
-
-**Front Door (High Security):**
-```json
-{
-  "classes": ["person"],
-  "emit_mode": "on_enter",
-  "cooldown_seconds": 5
-}
-```
-
-**Backyard (Activity Monitoring):**
-```json
-{
-  "classes": ["person", "dog", "cat"],
-  "emit_mode": "on_change",
-  "cooldown_seconds": 30
-}
-```
-
-**Garage (Low Frequency):**
-```json
-{
-  "classes": ["person", "car"],
-  "emit_mode": "on_enter",
-  "cooldown_seconds": 60
-}
-```
-
 ## Running
 
 ### Start Edge Service
 
 ```bash
-cd cyberwave-edges/cyberwave-edge-python
+# From project root
 python -m cyberwave_edge.service
+
+# Or with explicit env file
+cyberwave-cli edge start --env-file /path/to/.env
+
+# Check status
+cyberwave-cli edge status
+cyberwave-cli edge remote-status -t TWIN_UUID
 ```
 
-### Monitor All Cameras
+### Monitor Cameras
 
 ```bash
 # Watch edge logs
 tail -f /tmp/edge.log | grep -E "camera|frame|event"
 
 # List active models
-cyberwave-cli edge list-models --twin-uuid FRONT_DOOR_UUID
+cyberwave-cli edge list-models --twin-uuid TWIN_UUID
 ```
 
-### Start/Stop Individual Cameras
-
-Via MQTT commands:
+### MQTT Commands
 
 ```bash
-# Stop backyard camera
-mosquitto_pub -t "localcyberwave/twin/BACKYARD_UUID/command" \
+# Stop a camera
+mosquitto_pub -t "localcyberwave/twin/TWIN_UUID/command" \
   -m '{"command": "stop_video", "camera": "backyard"}'
 
-# Start garage camera
-mosquitto_pub -t "localcyberwave/twin/GARAGE_UUID/command" \
+# Start a camera
+mosquitto_pub -t "localcyberwave/twin/TWIN_UUID/command" \
   -m '{"command": "start_video", "camera": "garage"}'
 ```
 
 ## Resource Management
-
-### CPU/GPU Considerations
 
 | Cameras | Model | Recommended Setup |
 |---------|-------|-------------------|
@@ -226,50 +252,43 @@ mosquitto_pub -t "localcyberwave/twin/GARAGE_UUID/command" \
 
 ### Reducing Load
 
-1. **Lower FPS:**
-   ```json
-   {"fps": 5}  // Instead of 10
-   ```
+1. **Lower FPS:** `{"fps": 5}`
+2. **Reduce inference:** `{"inference_fps": 1.0}`
+3. **Lighter models:** `{"model_path": "yolov8n.pt"}`
+4. **Selective detection:** `{"classes": ["person"]}`
 
-2. **Reduce inference frequency:**
-   ```json
-   {"inference_fps": 1.0}  // Once per second
-   ```
+## Quick Reference
 
-3. **Use lighter models:**
-   ```json
-   {"model_path": "yolov8n.pt"}  // Nano instead of Small
-   ```
-
-4. **Selective detection:**
-   ```json
-   {"classes": ["person"]}  // Only detect people
-   ```
-
-## Viewing Streams
-
-### In UI
-
-Navigate to the environment and select any twin to view its stream.
-
-### API
-
-```bash
-# List all twins in environment
-curl -H "Authorization: Token $TOKEN" \
-  "http://localhost:8000/api/v1/environments/ENV_UUID/twins"
-```
+| Command | Description |
+|---------|-------------|
+| `cyberwave-cli scan` | Discover cameras on network |
+| `cyberwave-cli edge whoami` | Show device fingerprint |
+| `cyberwave-cli connect camera` | Create twin + configure edge |
+| `cyberwave-cli edge pull -e UUID` | Pull all configs from environment |
+| `cyberwave-cli edge pull -t UUID` | Pull config from single twin |
+| `cyberwave-cli edge remote-status -t UUID` | Check edge heartbeat |
+| `cyberwave-cli edge start` | Start edge service |
 
 ## Troubleshooting
 
-### Camera Not Streaming
+### Camera Not Found
 
 ```bash
-# Check camera connectivity
-ffprobe "rtsp://admin:pass@192.168.1.100:554/stream"
+# Test RTSP connectivity
+ffprobe "rtsp://admin:pass@192.168.1.3:554/stream"
 
-# Verify twin exists
-cyberwave-cli twin show CAMERA_TWIN_UUID
+# Check twin exists
+cyberwave-cli twin show TWIN_UUID
+```
+
+### Config Not Syncing
+
+```bash
+# Check fingerprint matches
+cyberwave-cli edge whoami
+
+# Re-pull config
+cyberwave-cli edge pull -t TWIN_UUID -y
 ```
 
 ### High CPU Usage
@@ -277,9 +296,3 @@ cyberwave-cli twin show CAMERA_TWIN_UUID
 - Reduce inference FPS
 - Use YOLOv8n instead of larger models
 - Enable GPU if available
-
-### Events Not Appearing
-
-- Check each camera's workflow is active
-- Verify model bindings per camera
-- Check edge logs for errors

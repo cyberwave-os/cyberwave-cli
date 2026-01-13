@@ -475,8 +475,8 @@ def _pull_environment_configs(client: Any, env_uuid: str, fingerprint: str, targ
     env = client.environments.get(env_uuid)
     env_name = getattr(env, 'name', 'Unknown')
     
-    # Get twins in environment
-    twins = client.twins.list(environment_uuid=env_uuid)
+    # Get twins in environment using SDK
+    twins = client.twins.list(environment_id=env_uuid)
     
     if not twins:
         console.print(f"[yellow]No twins found in environment '{env_name}'[/yellow]")

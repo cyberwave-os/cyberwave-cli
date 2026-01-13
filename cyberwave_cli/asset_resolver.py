@@ -150,17 +150,8 @@ def _load_url_asset(url: str) -> dict:
 def _get_by_registry_id(registry_id: str, client: Any) -> Any | None:
     """Get asset by registry ID."""
     try:
-        # Try direct lookup if SDK supports it
-        if hasattr(client.assets, 'get_by_registry_id'):
-            return client.assets.get_by_registry_id(registry_id)
-        
-        # Fall back to list and filter
-        assets = client.assets.list()
-        for asset in assets:
-            if getattr(asset, 'registry_id', None) == registry_id:
-                return asset
-        
-        return None
+        # Use SDK method
+        return client.assets.get_by_registry_id(registry_id)
     except Exception:
         return None
 
@@ -168,23 +159,8 @@ def _get_by_registry_id(registry_id: str, client: Any) -> Any | None:
 def _get_by_alias(alias: str, client: Any) -> Any | None:
     """Get asset by alias defined in metadata."""
     try:
-        assets = client.assets.list()
-        alias_lower = alias.lower()
-        
-        for asset in assets:
-            metadata = getattr(asset, 'metadata', {}) or {}
-            aliases = metadata.get('aliases', [])
-            
-            # Case-insensitive alias matching
-            if any(a.lower() == alias_lower for a in aliases):
-                return asset
-            
-            # Also check if name matches (as implicit alias)
-            name = getattr(asset, 'name', '').lower()
-            if name == alias_lower:
-                return asset
-        
-        return None
+        # Use SDK method
+        return client.assets.get_by_alias(alias)
     except Exception:
         return None
 
