@@ -197,6 +197,39 @@ aioice.stun.TransactionFailed: STUN transaction failed (403 - Forbidden IP)
 CYBERWAVE_LOCAL_ICE=true
 ```
 
+> **Note:** A bug was fixed in `cyberwave-python` SDK where `turn_servers=[]` was 
+> incorrectly treated as falsy, causing it to use default TURN servers. If you see 
+> this error even with `CYBERWAVE_LOCAL_ICE=true`, ensure you have the latest SDK.
+
+### Issue: ICE connection stuck IN_PROGRESS on same machine
+
+**Symptoms:**
+```
+CandidatePair(('192.168.1.x', port) -> ('127.0.0.1', port)) State.IN_PROGRESS
+No frames in last 10s
+```
+
+**Cause:** macOS firewall blocks UDP between different network interfaces. Traffic from 
+LAN IP (`192.168.1.x`) cannot reach loopback (`127.0.0.1`).
+
+**Fix:** The edge service now patches `aioice` to use **only** `127.0.0.1` when 
+`CYBERWAVE_LOCAL_ICE=1` is set. This ensures both edge and mediasoup communicate 
+exclusively via loopback, bypassing the firewall.
+
+**Working configuration:**
+```
+Edge (native): CYBERWAVE_LOCAL_ICE=1, uses 127.0.0.1
+Mediasoup: ANNOUNCED_IP=127.0.0.1, ports 10000-10100
+```
+
+Expected log output:
+```
+[EdgeService] Local ICE mode: using loopback-only addresses (127.0.0.1) for WebRTC
+CandidatePair(('127.0.0.1', xxx) -> ('127.0.0.1', yyy)) State.IN_PROGRESS -> State.SUCCEEDED
+ICE completed
+WebRTC connection state changed: connected
+```
+
 ### Issue: Edge can't connect to MQTT
 
 **Symptoms:**
@@ -285,6 +318,37 @@ json.dumps({'command':'stop_video','camera':'default'}), hostname='localhost')"
 
 ## Environment Variables Reference
 
+### Recommended Local Dev Settings
+
+Create a `.env` file in your edge directory with these settings:
+
+```bash
+# Backend connection
+CYBERWAVE_BASE_URL=http://localhost:8000
+CYBERWAVE_API_URL=http://localhost:8000
+
+# MQTT connection
+CYBERWAVE_MQTT_HOST=localhost
+CYBERWAVE_MQTT_PORT=1883
+
+# Environment prefix (topics become localcyberwave/...)
+CYBERWAVE_ENVIRONMENT=local
+
+# Disable cloud TURN servers for local testing
+CYBERWAVE_LOCAL_ICE=1
+
+# Use FFmpeg backend for better RTSP compatibility
+CYBERWAVE_CV2_BACKEND=ffmpeg
+
+# Your twin UUID
+CYBERWAVE_TWIN_UUID=your-twin-uuid-here
+
+# Camera configuration
+CAMERAS=[{"camera_id":"default","source":"rtsp://user:pass@192.168.1.x:554/stream","fps":10}]
+```
+
+> **Note:** When running edge in Docker, replace `localhost` with `host.docker.internal`.
+
 ### Mediasoup (video-streaming)
 
 | Variable | Required | Description | Example |
@@ -295,16 +359,59 @@ json.dumps({'command':'stop_video','camera':'default'}), hostname='localhost')"
 | `MQTT_HOST` | Yes | MQTT broker host | `localhost` |
 | `MQTT_PORT` | Yes | MQTT broker port | `1883` |
 | `ENVIRONMENT` | Yes | Topic prefix | `local` |
+| `RTC_MIN_PORT` | No | WebRTC port range start | `50000` |
+| `RTC_MAX_PORT` | No | WebRTC port range end | `50100` |
+
+### Edge (Native)
+
+| Variable | Required | Description | Example |
+|----------|----------|-------------|---------|
+| `CYBERWAVE_BASE_URL` | Yes | Backend API URL | `http://localhost:8000` |
+| `CYBERWAVE_MQTT_HOST` | Yes | MQTT broker host | `localhost` |
+| `CYBERWAVE_MQTT_PORT` | No | MQTT broker port | `1883` |
+| `CYBERWAVE_ENVIRONMENT` | Yes | Topic prefix | `local` |
+| `CYBERWAVE_TWIN_UUID` | Yes | Digital twin ID | `uuid-here` |
+| `CYBERWAVE_LOCAL_ICE` | Yes | Disable cloud TURN | `1` |
+| `CYBERWAVE_CV2_BACKEND` | No | OpenCV backend | `ffmpeg` |
+| `CAMERAS` | Yes | Camera config JSON | `[{"camera_id":"default",...}]` |
 
 ### Edge (Docker)
 
 | Variable | Required | Description | Example |
 |----------|----------|-------------|---------|
-| `CYBERWAVE_TWIN_UUID` | Yes | Digital twin ID | `uuid-here` |
+| `CYBERWAVE_API_URL` | Yes | Backend URL | `http://host.docker.internal:8000` |
 | `CYBERWAVE_MQTT_HOST` | Yes | MQTT host | `host.docker.internal` |
+| `CYBERWAVE_MQTT_PORT` | No | MQTT port | `1883` |
+| `CYBERWAVE_ENVIRONMENT` | Yes | Topic prefix | `local` |
+| `CYBERWAVE_TWIN_UUID` | Yes | Digital twin ID | `uuid-here` |
 | `CYBERWAVE_LOCAL_ICE` | Yes | Disable TURN | `true` |
+| `CYBERWAVE_CV2_BACKEND` | No | OpenCV backend | `ffmpeg` |
 | `CAMERAS` | Yes | Camera config JSON | `[{"camera_id":"default",...}]` |
-| `CYBERWAVE_API_URL` | No | Backend URL | `http://host.docker.internal:8000` |
+
+## macOS Firewall Considerations
+
+On managed macOS machines with strict firewall policies, UDP traffic may be blocked 
+even for loopback connections. The Docker Desktop approach bypasses this by using 
+Docker's virtual network.
+
+### Verifying Network Connectivity
+
+```bash
+# Test if host can reach Docker gateway (for frontend)
+nc -u -z -w 1 192.168.65.254 50000 && echo "✓ UDP OK" || echo "✗ UDP blocked"
+
+# Test inside Docker container
+docker exec cyberwave_local_edge nc -u -z -w 1 host.docker.internal 50000
+```
+
+### If Frontend Video Still Fails
+
+If edge-to-mediasoup works but frontend-to-mediasoup fails, the macOS firewall may 
+be blocking UDP from the browser. Options:
+
+1. **Use cloud deployment** for testing (bypasses local firewall entirely)
+2. **Request IT to allow UDP** on ports 50000-50100
+3. **Use SSH tunnel** to a remote server running mediasoup
 
 ## See Also
 
