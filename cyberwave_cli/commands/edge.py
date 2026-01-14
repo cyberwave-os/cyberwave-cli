@@ -669,6 +669,178 @@ LOG_LEVEL=INFO
     env_file.write_text(env_content)
 
 
+@edge.command("health")
+@click.option("--twin-uuid", "-t", required=True, help="Twin UUID to check health for")
+@click.option("--timeout", default=5, help="Timeout in seconds to wait for response")
+@click.option("--watch", "-w", is_flag=True, help="Continuously watch health status")
+def health(twin_uuid: str, timeout: int, watch: bool):
+    """
+    Check edge health status via MQTT.
+    
+    Queries the edge service for real-time health status including:
+    - Stream states (connected/failed/stale)
+    - Frame rates and counts
+    - WebRTC connection states
+    - Automatic recovery status
+    
+    \b
+    Examples:
+        # One-time health check
+        cyberwave edge health --twin-uuid abc-123
+        
+        # Watch health status continuously
+        cyberwave edge health --twin-uuid abc-123 --watch
+    """
+    import json
+    import time as time_module
+    
+    from cyberwave_cli.auth import get_authenticated_client
+    
+    client = get_authenticated_client()
+    if not client:
+        console.print("[red]Not authenticated. Run 'cyberwave login' first.[/red]")
+        return
+    
+    health_data: dict[str, Any] = {"received": False, "data": {}}
+    
+    def on_health_message(data):
+        if isinstance(data, dict) and data.get("type") == "edge_health":
+            health_data["received"] = True
+            health_data["data"] = data
+    
+    try:
+        # Subscribe to health topic
+        prefix = client.mqtt.topic_prefix
+        health_topic = f"{prefix}cyberwave/twin/{twin_uuid}/edge_health"
+        
+        client.mqtt._client.subscribe(health_topic)
+        client.mqtt._client.on_message = lambda c, u, msg: on_health_message(
+            json.loads(msg.payload.decode()) if msg.payload else {}
+        )
+        
+        if watch:
+            console.print(f"[cyan]Watching health for twin {twin_uuid}... (Ctrl+C to stop)[/cyan]\n")
+            try:
+                while True:
+                    health_data["received"] = False
+                    
+                    # Wait for health message
+                    start = time_module.time()
+                    while not health_data["received"] and (time_module.time() - start) < timeout:
+                        time_module.sleep(0.1)
+                    
+                    if health_data["received"]:
+                        _display_health_status(health_data["data"])
+                    else:
+                        console.print("[yellow]No health data received (edge offline?)[/yellow]")
+                    
+                    time_module.sleep(max(1, timeout - 1))
+                    
+            except KeyboardInterrupt:
+                console.print("\n[dim]Stopped watching.[/dim]")
+        else:
+            console.print(f"[cyan]Checking health for twin {twin_uuid}...[/cyan]\n")
+            
+            # Wait for health message with timeout
+            start = time_module.time()
+            while not health_data["received"] and (time_module.time() - start) < timeout:
+                time_module.sleep(0.1)
+            
+            if health_data["received"]:
+                _display_health_status(health_data["data"])
+            else:
+                console.print("[yellow]No health data received within timeout.[/yellow]")
+                console.print("[dim]The edge service may be offline or not publishing health status.[/dim]")
+                console.print("[dim]Ensure the edge service is running with health publishing enabled.[/dim]")
+                
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+
+
+def _display_health_status(data: dict):
+    """Display health status in a formatted table."""
+    from datetime import datetime
+    
+    edge_id = data.get("edge_id", "unknown")
+    uptime = data.get("uptime_seconds", 0)
+    streams = data.get("streams", {})
+    stream_count = data.get("stream_count", 0)
+    healthy_count = data.get("healthy_streams", 0)
+    timestamp = data.get("timestamp", 0)
+    
+    # Format uptime
+    hours = int(uptime // 3600)
+    minutes = int((uptime % 3600) // 60)
+    uptime_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+    
+    # Overall status
+    if stream_count == 0:
+        status = "[yellow]No streams[/yellow]"
+    elif healthy_count == stream_count:
+        status = "[green]Healthy[/green]"
+    elif healthy_count > 0:
+        status = "[yellow]Degraded[/yellow]"
+    else:
+        status = "[red]Unhealthy[/red]"
+    
+    console.print(f"Edge ID:     {edge_id}")
+    console.print(f"Status:      {status}")
+    console.print(f"Uptime:      {uptime_str}")
+    console.print(f"Streams:     {healthy_count}/{stream_count} healthy")
+    console.print(f"Last update: {datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')}")
+    
+    if streams:
+        console.print()
+        table = Table(title="Stream Status")
+        table.add_column("Camera", style="cyan")
+        table.add_column("State", style="green")
+        table.add_column("ICE", style="blue")
+        table.add_column("FPS", style="yellow")
+        table.add_column("Frames", style="magenta")
+        table.add_column("Restarts", style="red")
+        table.add_column("Stale", style="dim")
+        
+        for camera_id, stream_info in streams.items():
+            conn_state = stream_info.get("connection_state", "unknown")
+            ice_state = stream_info.get("ice_connection_state", "unknown")
+            fps = stream_info.get("fps", 0)
+            frames = stream_info.get("frames_sent", 0)
+            restarts = stream_info.get("restart_count", 0)
+            is_stale = stream_info.get("is_stale", False)
+            
+            # Color code connection state
+            if conn_state == "connected":
+                conn_display = f"[green]{conn_state}[/green]"
+            elif conn_state == "failed":
+                conn_display = f"[red]{conn_state}[/red]"
+            else:
+                conn_display = f"[yellow]{conn_state}[/yellow]"
+            
+            # Color code ICE state
+            if ice_state in ("connected", "completed"):
+                ice_display = f"[green]{ice_state}[/green]"
+            elif ice_state == "failed":
+                ice_display = f"[red]{ice_state}[/red]"
+            else:
+                ice_display = f"[yellow]{ice_state}[/yellow]"
+            
+            stale_display = "[red]Yes[/red]" if is_stale else "[green]No[/green]"
+            
+            table.add_row(
+                camera_id,
+                conn_display,
+                ice_display,
+                f"{fps:.1f}",
+                str(frames),
+                str(restarts),
+                stale_display,
+            )
+        
+        console.print(table)
+    
+    console.print()
+
+
 @edge.command("remote-status")
 @click.option("--twin-uuid", "-t", required=True, help="Twin UUID to check status for")
 def remote_status(twin_uuid: str):
