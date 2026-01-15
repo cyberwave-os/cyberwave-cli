@@ -4,7 +4,7 @@ import click
 from rich.console import Console
 
 from . import __version__
-from .commands import camera, configure, connect, edge, environment, login, logout, model, plugin, scan, so101, twin, workflow
+from .commands import camera, configure, connect, edge, environment, login, logout, model, pair, plugin, scan, so101, twin, workflow
 
 console = Console()
 
@@ -23,15 +23,15 @@ def cli(ctx: click.Context) -> None:
 
     \b
     Quick Start:
-      1. cyberwave configure --token YOUR_TOKEN
-      2. cyberwave connect camera                    # Create twin + configure edge
-      3. python -m cyberwave_edge.service            # Start streaming
+      1. cyberwave login                             # Login to your account
+      2. cyberwave pair <twin-uuid>                  # Pair device with existing twin
+      3. cyberwave edge start                        # Start streaming
 
     \b
-    Connect & Setup:
-      connect     Smart connect - create twin and configure edge in one command
+    Connect & Pair:
+      pair        Pair this device with an existing twin
+      connect     Smart connect - create new twin + configure edge in one command
       scan        Discover IP cameras on the network
-      camera      Set up camera streaming (legacy, use 'connect')
 
     \b
     Resource Management:
@@ -57,6 +57,7 @@ cli.add_command(environment)
 cli.add_command(login)
 cli.add_command(logout)
 cli.add_command(model)
+cli.add_command(pair)
 cli.add_command(plugin)
 cli.add_command(scan)
 cli.add_command(so101)
