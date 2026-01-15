@@ -207,11 +207,11 @@ def sync_workflows(twin_uuid):
     This command sends an MQTT message to the edge node to re-sync
     model bindings from active workflows in the backend.
     """
-    from cyberwave_cli.auth import get_authenticated_client
+    from ..utils import get_sdk_client, print_error
     
-    client = get_authenticated_client()
+    client = get_sdk_client()
     if not client:
-        console.print("[red]Not authenticated. Run 'cyberwave login' first.[/red]")
+        print_error("Not authenticated.", "Run 'cyberwave login' first.")
         return
     
     console.print(f"[cyan]Sending sync_workflows command to twin {twin_uuid}...[/cyan]")
@@ -219,10 +219,11 @@ def sync_workflows(twin_uuid):
     try:
         # Publish command via MQTT
         client.mqtt.publish_command_message(twin_uuid, {"command": "sync_workflows"})
-        console.print("[green]✓ Command sent. Check edge logs for results.[/green]")
+        from ..utils import print_success
+        print_success("Command sent. Check edge logs for results.")
         console.print("[dim]Use 'cyberwave edge list-models --twin-uuid ...' to see loaded models[/dim]")
     except Exception as e:
-        console.print(f"[red]Error sending command: {e}[/red]")
+        print_error(f"Error sending command: {e}")
 
 
 @edge.command("list-models")
@@ -237,11 +238,11 @@ def list_models(twin_uuid):
     import json
     import time
     
-    from cyberwave_cli.auth import get_authenticated_client
+    from ..utils import get_sdk_client, print_error
     
-    client = get_authenticated_client()
+    client = get_sdk_client()
     if not client:
-        console.print("[red]Not authenticated. Run 'cyberwave login' first.[/red]")
+        print_error("Not authenticated.", "Run 'cyberwave login' first.")
         return
     
     console.print(f"[cyan]Querying model bindings for twin {twin_uuid}...[/cyan]")
@@ -269,7 +270,8 @@ def list_models(twin_uuid):
             bindings = response_received["data"].get("model_bindings", [])
             
             if not bindings:
-                console.print("[yellow]No model bindings loaded on edge[/yellow]")
+                from ..utils import print_warning
+                print_warning("No model bindings loaded on edge")
                 console.print("[dim]Use 'cyberwave edge sync-workflows' to load from workflows[/dim]")
                 return
             
@@ -293,10 +295,11 @@ def list_models(twin_uuid):
             
             console.print(table)
         else:
-            console.print("[yellow]No response from edge node (is it running?)[/yellow]")
+            from ..utils import print_warning
+            print_warning("No response from edge node (is it running?)")
             
     except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
+        print_error(f"Error: {e}")
 
 
 # =============================================================================
@@ -360,16 +363,15 @@ def pull_config(twin_uuid: str | None, environment_uuid: str | None, target_dir:
         cyberwave edge pull -t abc-123 -d ./my-edge
     """
     from ..fingerprint import generate_fingerprint, get_device_info
-    from ..utils import get_sdk_client
+    from ..utils import get_sdk_client, print_error
     
     if not twin_uuid and not environment_uuid:
-        console.print("[red]Error: Provide --twin-uuid or --environment-uuid[/red]")
-        console.print("[dim]Example: cyberwave edge pull --twin-uuid abc-123[/dim]")
+        print_error("Provide --twin-uuid or --environment-uuid", "Example: cyberwave edge pull --twin-uuid abc-123")
         return
     
     client = get_sdk_client()
     if not client:
-        console.print("[red]Not authenticated. Run 'cyberwave login' first.[/red]")
+        print_error("Not authenticated.", "Run 'cyberwave login' first.")
         return
     
     fingerprint = generate_fingerprint()
@@ -381,7 +383,7 @@ def pull_config(twin_uuid: str | None, environment_uuid: str | None, target_dir:
         else:
             _pull_single_twin_config(client, twin_uuid, fingerprint, target_dir, yes)
     except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
+        print_error(str(e))
 
 
 def _pull_single_twin_config(client: Any, twin_uuid: str, fingerprint: str, target_dir: str, yes: bool):
@@ -396,7 +398,8 @@ def _pull_single_twin_config(client: Any, twin_uuid: str, fingerprint: str, targ
     my_config = edge_configs.get(fingerprint)
     
     if my_config:
-        console.print(f"[green]✓[/green] Found config for this device")
+        from ..utils import print_success
+        print_success("Found config for this device")
         console.print(f"[dim]  Registered: {my_config.get('registered_at', 'unknown')}[/dim]")
         
         cameras = my_config.get('cameras', [])
@@ -405,7 +408,8 @@ def _pull_single_twin_config(client: Any, twin_uuid: str, fingerprint: str, targ
     else:
         # No config for this fingerprint - check for other configs or default
         if edge_configs:
-            console.print(f"[yellow]No config for this device fingerprint[/yellow]")
+            from ..utils import print_warning
+            print_warning("No config for this device fingerprint")
             console.print(f"\n[dim]Available configs from other devices:[/dim]")
             
             for i, (fp, cfg) in enumerate(edge_configs.items(), 1):
@@ -425,19 +429,22 @@ def _pull_single_twin_config(client: Any, twin_uuid: str, fingerprint: str, targ
                         idx = int(choice) - 1
                         source_fp = list(edge_configs.keys())[idx]
                         my_config = edge_configs[source_fp].copy()
-                        console.print(f"[green]✓[/green] Copying config from {source_fp[:20]}...")
+                        from ..utils import print_success
+                        print_success(f"Copying config from {source_fp[:20]}...")
                     except (ValueError, IndexError):
-                        console.print("[yellow]Invalid choice, skipping[/yellow]")
+                        from ..utils import print_warning
+                        print_warning("Invalid choice, skipping")
                         return
         else:
             # Check for default config
             default_config = metadata.get('default_edge_config')
             if default_config:
-                console.print("[yellow]No config for this device, using default template[/yellow]")
+                from ..utils import print_warning
+                print_warning("No config for this device, using default template")
                 my_config = default_config.copy()
             else:
-                console.print("[red]No configuration found for this twin[/red]")
-                console.print("[dim]Use 'cyberwave connect' to set up this twin[/dim]")
+                from ..utils import print_error
+                print_error("No configuration found for this twin", "Use 'cyberwave connect' to set up this twin")
                 return
     
     if not my_config:
@@ -455,17 +462,19 @@ def _pull_single_twin_config(client: Any, twin_uuid: str, fingerprint: str, targ
         username = Prompt.ask("  RTSP Username", default="admin")
         password = Prompt.ask("  RTSP Password", password=True)
     
-    # Write .env file
-    _write_env_file(
+    # Write .env file directly using shared utility
+    from ..utils import write_edge_env, print_success
+    write_edge_env(
         target_dir=target_dir,
         twin_uuid=twin_uuid,
         cameras=cameras,
+        fingerprint=fingerprint,
         username=username,
         password=password,
-        fingerprint=fingerprint,
+        generator="cyberwave edge pull",
     )
     
-    console.print(f"\n[green]✓[/green] Config pulled to {target_dir}/.env")
+    print_success(f"Config pulled to {target_dir}/.env")
     console.print("[dim]Run: python -m cyberwave_edge.service[/dim]")
 
 
@@ -479,7 +488,8 @@ def _pull_environment_configs(client: Any, env_uuid: str, fingerprint: str, targ
     twins = client.twins.list(environment_id=env_uuid)
     
     if not twins:
-        console.print(f"[yellow]No twins found in environment '{env_name}'[/yellow]")
+        from ..utils import print_warning
+        print_warning(f"No twins found in environment '{env_name}'")
         return
     
     console.print(f"[cyan]Environment:[/cyan] {env_name}")
@@ -511,11 +521,13 @@ def _pull_environment_configs(client: Any, env_uuid: str, fingerprint: str, targ
             console.print(f"  [yellow]○[/yellow] {twin_name} - no config for this device")
     
     if not all_cameras and not twins_without_config:
-        console.print("\n[yellow]No configurations to pull[/yellow]")
+        from ..utils import print_warning
+        print_warning("No configurations to pull")
         return
     
     if twins_without_config:
-        console.print(f"\n[yellow]{len(twins_without_config)} twin(s) need configuration[/yellow]")
+        from ..utils import print_warning
+        print_warning(f"{len(twins_without_config)} twin(s) need configuration")
     
     if not yes and not Confirm.ask("\nPull available configs?", default=True):
         return
@@ -531,68 +543,29 @@ def _pull_environment_configs(client: Any, env_uuid: str, fingerprint: str, targ
         username = Prompt.ask("  RTSP Username", default="admin")
         password = Prompt.ask("  RTSP Password", password=True)
     
-    # Write .env file with all cameras
+    # Write .env file with all cameras directly using shared utility
     if all_cameras:
-        _write_multi_camera_env(
+        from ..utils import write_edge_env, print_success
+        # Extract primary twin from cameras
+        twin_uuids = set(cam.get("twin_uuid", "") for cam in all_cameras if cam.get("twin_uuid"))
+        primary_twin = list(twin_uuids)[0] if twin_uuids else ""
+        
+        write_edge_env(
             target_dir=target_dir,
+            twin_uuid=primary_twin,
             cameras=all_cameras,
+            fingerprint=fingerprint,
             username=username,
             password=password,
-            fingerprint=fingerprint,
+            generator="cyberwave edge pull",
         )
         
-        console.print(f"\n[green]✓[/green] Config pulled to {target_dir}/.env")
+        print_success(f"Config pulled to {target_dir}/.env")
         console.print(f"[dim]  {len(all_cameras)} camera(s) from {len(twins_with_config)} twin(s)[/dim]")
         console.print("[dim]Run: python -m cyberwave_edge.service[/dim]")
     else:
-        console.print("\n[yellow]No cameras configured. Use 'cyberwave connect' to set up twins.[/yellow]")
-
-
-def _write_env_file(
-    target_dir: str,
-    twin_uuid: str,
-    cameras: list[dict],
-    username: str | None,
-    password: str | None,
-    fingerprint: str,
-):
-    """Write .env file for single twin config using shared utility."""
-    from ..utils import write_edge_env
-    
-    write_edge_env(
-        target_dir=target_dir,
-        twin_uuid=twin_uuid,
-        cameras=cameras,
-        fingerprint=fingerprint,
-        username=username,
-        password=password,
-        generator="cyberwave edge pull",
-    )
-
-
-def _write_multi_camera_env(
-    target_dir: str,
-    cameras: list[dict],
-    username: str | None,
-    password: str | None,
-    fingerprint: str,
-):
-    """Write .env file for multi-twin/multi-camera config using shared utility."""
-    from ..utils import write_edge_env
-    
-    # Extract primary twin from cameras
-    twin_uuids = set(cam.get("twin_uuid", "") for cam in cameras if cam.get("twin_uuid"))
-    primary_twin = list(twin_uuids)[0] if twin_uuids else ""
-    
-    write_edge_env(
-        target_dir=target_dir,
-        twin_uuid=primary_twin,
-        cameras=cameras,
-        fingerprint=fingerprint,
-        username=username,
-        password=password,
-        generator="cyberwave edge pull",
-    )
+        from ..utils import print_warning
+        print_warning("No cameras configured. Use 'cyberwave connect' to set up twins.")
 
 
 @edge.command("health")
@@ -620,11 +593,11 @@ def health(twin_uuid: str, timeout: int, watch: bool):
     import json
     import time as time_module
     
-    from cyberwave_cli.auth import get_authenticated_client
+    from ..utils import get_sdk_client, print_error, print_warning
     
-    client = get_authenticated_client()
+    client = get_sdk_client()
     if not client:
-        console.print("[red]Not authenticated. Run 'cyberwave login' first.[/red]")
+        print_error("Not authenticated.", "Run 'cyberwave login' first.")
         return
     
     health_data: dict[str, Any] = {"received": False, "data": {}}
@@ -675,12 +648,12 @@ def health(twin_uuid: str, timeout: int, watch: bool):
             if health_data["received"]:
                 _display_health_status(health_data["data"])
             else:
-                console.print("[yellow]No health data received within timeout.[/yellow]")
+                print_warning("No health data received within timeout.")
                 console.print("[dim]The edge service may be offline or not publishing health status.[/dim]")
                 console.print("[dim]Ensure the edge service is running with health publishing enabled.[/dim]")
                 
     except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
+        print_error(str(e))
 
 
 def _display_health_status(data: dict):
@@ -781,11 +754,11 @@ def remote_status(twin_uuid: str):
         cyberwave edge remote-status --twin-uuid abc-123
     """
     from ..fingerprint import generate_fingerprint
-    from ..utils import get_sdk_client
+    from ..utils import get_sdk_client, print_error
     
     client = get_sdk_client()
     if not client:
-        console.print("[red]Not authenticated. Run 'cyberwave login' first.[/red]")
+        print_error("Not authenticated.", "Run 'cyberwave login' first.")
         return
     
     fingerprint = generate_fingerprint()
@@ -864,4 +837,4 @@ def remote_status(twin_uuid: str):
         console.print()
         
     except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
+        print_error(str(e))

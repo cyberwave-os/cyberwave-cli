@@ -62,12 +62,12 @@ def connect(
     """
     from ..asset_resolver import AssetResolutionError, get_asset_display_name, resolve_asset
     from ..fingerprint import generate_fingerprint, get_device_info
-    from ..utils import get_sdk_client
+    from ..utils import get_sdk_client, print_error, print_success
     
     # Get SDK client
     client = get_sdk_client()
     if not client:
-        console.print("[red]Not authenticated. Run 'cyberwave login' first.[/red]")
+        print_error("Not authenticated.", "Run 'cyberwave login' first.")
         return
     
     # Generate fingerprint
@@ -84,7 +84,7 @@ def connect(
         console.print(f"[green]✓[/green] {asset_name}")
     except AssetResolutionError as e:
         console.print(f"[red]✗[/red]")
-        console.print(f"\n[red]{e}[/red]")
+        print_error(str(e))
         return
     
     # 2. Find or create twin
@@ -96,7 +96,7 @@ def connect(
             console.print(f"\n[cyan]Using twin:[/cyan] {twin_name}")
         except Exception as e:
             logger.debug("Failed to get twin %s: %s", twin_uuid, e)
-            console.print(f"\n[red]Twin not found: {twin_uuid}[/red]")
+            print_error(f"Twin not found: {twin_uuid}")
             return
     else:
         # Find existing twin for this fingerprint or create new one
@@ -116,7 +116,7 @@ def connect(
     twin_name = getattr(twin, 'name', 'Unknown')
     
     if cloud_only:
-        console.print(f"\n[green]✓[/green] Twin created: {twin_name} ({twin_uuid})")
+        print_success(f"Twin created: {twin_name} ({twin_uuid})")
         console.print(f"\n[dim]To connect an edge device later:[/dim]")
         console.print(f"  cyberwave connect {asset} --twin-uuid {twin_uuid}")
         return
@@ -138,7 +138,7 @@ def connect(
     _save_config_to_twin(client, twin_uuid, fingerprint, config)
     _write_local_env(twin_uuid, config, fingerprint)
     
-    console.print(f"\n[green]✓[/green] Connected!")
+    print_success("Connected!")
     console.print(f"\n[bold]Saved to:[/bold]")
     console.print(f"  • Cloud: twin/{twin_uuid}/edge_configs/{fingerprint[:20]}...")
     console.print(f"  • Local: ./.env")
@@ -211,10 +211,12 @@ def _find_or_create_twin(
             environment_id=environment_uuid,
             asset_id=asset_uuid,
         )
-        console.print(f"[green]✓[/green] Created twin: {twin_name}")
+        from ..utils import print_success, print_error
+        print_success(f"Created twin: {twin_name}")
         return twin
     except Exception as e:
-        console.print(f"[red]Failed to create twin: {e}[/red]")
+        from ..utils import print_error
+        print_error(f"Failed to create twin: {e}")
         return None
 
 
@@ -270,17 +272,20 @@ def _select_environment(client: Any, yes: bool) -> str | None:
                 project_id = projects[0].uuid if projects else None
                 
                 if not project_id:
-                    console.print("[red]No project found to create environment[/red]")
+                    from ..utils import print_error
+                    print_error("No project found to create environment")
                     return None
                 
                 env = client.environments.create(name=env_name, project_id=str(project_id))
                 return str(env.uuid)
         except (ValueError, IndexError):
-            console.print("[red]Invalid choice[/red]")
+            from ..utils import print_error
+            print_error("Invalid choice")
             return None
             
     except Exception as e:
-        console.print(f"[red]Error listing environments: {e}[/red]")
+        from ..utils import print_error
+        print_error(f"Error listing environments: {e}")
         return None
 
 
@@ -314,16 +319,17 @@ def _configure_edge(
     # Interactive configuration
     console.print("\n[bold]Configure camera:[/bold]")
     
-    # Source type
-    source_types = ["RTSP", "USB", "RealSense"]
+    # Source type - use centralized constants
+    from shared_constants import CAMERA_SOURCE_TYPES, CAMERA_SOURCE_TYPE_RTSP
+    
     if not yes:
         console.print("\n  Source type:")
-        for i, st in enumerate(source_types, 1):
+        for i, st in enumerate(CAMERA_SOURCE_TYPES, 1):
             console.print(f"    {i}. {st}")
         source_choice = Prompt.ask("  Select", default="1")
-        source_type = source_types[int(source_choice) - 1] if source_choice.isdigit() else "RTSP"
+        source_type = CAMERA_SOURCE_TYPES[int(source_choice) - 1] if source_choice.isdigit() else CAMERA_SOURCE_TYPE_RTSP
     else:
-        source_type = "RTSP"
+        source_type = CAMERA_SOURCE_TYPE_RTSP
     
     cameras = []
     
@@ -394,7 +400,8 @@ def _save_config_to_twin(client: Any, twin_uuid: str, fingerprint: str, config: 
         
         client.twins.update(twin_uuid, metadata=metadata)
     except Exception as e:
-        console.print(f"[yellow]Warning: Could not save to cloud: {e}[/yellow]")
+        from ..utils import print_warning
+        print_warning(f"Could not save to cloud: {e}")
 
 
 def _write_local_env(twin_uuid: str, config: dict, fingerprint: str):

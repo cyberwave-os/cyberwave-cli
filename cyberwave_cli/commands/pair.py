@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.prompt import Confirm
 
 from ..fingerprint import generate_fingerprint, get_device_info
-from ..utils import get_sdk_client, write_edge_env
+from ..utils import get_sdk_client, write_edge_env, print_error, print_success, print_warning
 
 console = Console()
 
@@ -60,14 +60,14 @@ def pair(twin_uuid: str, target_dir: str, yes: bool):
     # Get SDK client
     client = get_sdk_client()
     if not client:
-        console.print("[red]Not authenticated. Run 'cyberwave login' first.[/red]")
+        print_error("Not authenticated.", "Run 'cyberwave login' first.")
         return
 
     # Generate fingerprint
     fingerprint = generate_fingerprint()
     device_info = get_device_info()
 
-    console.print(f"\n[bold]Device Pairing[/bold]")
+    console.print("\n[bold]Device Pairing[/bold]")
     console.print(f"Fingerprint: [cyan]{fingerprint}[/cyan]")
     console.print(f"Hostname:    {device_info.get('hostname', 'unknown')}")
     console.print(f"Platform:    {device_info.get('platform', 'unknown')}")
@@ -78,37 +78,29 @@ def pair(twin_uuid: str, target_dir: str, yes: bool):
         twin_name = getattr(twin, 'name', 'Unknown')
         console.print(f"\n[bold]Target Twin:[/bold] {twin_name}")
     except Exception as e:
-        console.print(f"\n[red]Twin not found: {twin_uuid}[/red]")
-        console.print(f"[dim]Error: {e}[/dim]")
+        print_error(f"Twin not found: {twin_uuid}", f"Error: {e}")
         return
 
     # Confirm pairing
     if not yes and not Confirm.ask(f"\nPair this device to '{twin_name}'?", default=True):
-        console.print("[yellow]Pairing cancelled.[/yellow]")
+        print_warning("Pairing cancelled.")
         return
 
     # Register device with backend via pairing API
     console.print("\n[dim]Registering device with backend...[/dim]")
 
     try:
-        # Call the pairing API
-        # The SDK should have a method like: client.twins.pair_device(twin_uuid, {...})
-        # For now, we'll use a direct API call via the REST client
-        pair_response = _call_pair_api(
-            client,
+        # Call the pairing API via SDK
+        client.twins.pair_device(
             twin_uuid,
             fingerprint=fingerprint,
             hostname=device_info.get('hostname', ''),
             platform=device_info.get('platform', ''),
         )
-
-        if pair_response:
-            console.print("[green]✓[/green] Device registered with backend")
-        else:
-            console.print("[yellow]![/yellow] Backend registration skipped (API not available)")
+        print_success("Device registered with backend")
     except Exception as e:
         # Log warning but continue - pairing API might not be deployed yet
-        console.print(f"[yellow]![/yellow] Backend registration failed: {e}")
+        print_warning(f"Backend registration failed: {e}")
         console.print("[dim]Continuing with local configuration...[/dim]")
 
     # Get edge config from twin metadata (backward compatible)
@@ -130,57 +122,11 @@ def pair(twin_uuid: str, target_dir: str, yes: bool):
         generator="cyberwave pair",
     )
 
-    console.print(f"[green]✓[/green] Configuration saved to {target_dir}/.env")
+    print_success(f"Configuration saved to {target_dir}/.env")
 
-    console.print(f"\n[bold green]Pairing complete![/bold green]")
-    console.print(f"\n[dim]To start streaming:[/dim]")
+    print_success("Pairing complete!")
+    console.print("\n[dim]To start streaming:[/dim]")
     console.print(f"  cd {target_dir}")
-    console.print(f"  cyberwave edge start")
+    console.print("  cyberwave edge start")
 
 
-def _call_pair_api(
-    client,
-    twin_uuid: str,
-    fingerprint: str,
-    hostname: str,
-    platform: str,
-) -> dict | None:
-    """
-    Call the backend pairing API.
-
-    Returns the response dict if successful, None if API not available.
-    """
-    try:
-        # Try to use SDK method if available
-        if hasattr(client.twins, 'pair_device'):
-            return client.twins.pair_device(
-                twin_uuid,
-                fingerprint=fingerprint,
-                hostname=hostname,
-                platform=platform,
-            )
-
-        # Fallback: Direct REST call
-        from cyberwave.rest import ApiException
-
-        api = client._api
-        response = api.api_client.call_api(
-            f"/api/v1/twins/{twin_uuid}/pair-device",
-            "POST",
-            body={
-                "fingerprint": fingerprint,
-                "hostname": hostname,
-                "platform": platform,
-            },
-            response_type=object,
-            auth_settings=["TokenAuth"],
-        )
-        return response
-
-    except ImportError:
-        return None
-    except Exception as e:
-        # API might not be deployed yet
-        if "404" in str(e) or "Not Found" in str(e):
-            return None
-        raise
