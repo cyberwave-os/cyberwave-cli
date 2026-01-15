@@ -14,17 +14,16 @@ Examples:
     cyberwave connect camera --cloud-only
 """
 
-import json
+import logging
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import click
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
-from rich.table import Table
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 @click.command()
@@ -96,6 +95,7 @@ def connect(
             twin_name = getattr(twin, 'name', 'Unknown')
             console.print(f"\n[cyan]Using twin:[/cyan] {twin_name}")
         except Exception as e:
+            logger.debug("Failed to get twin %s: %s", twin_uuid, e)
             console.print(f"\n[red]Twin not found: {twin_uuid}[/red]")
             return
     else:
@@ -176,8 +176,9 @@ def _find_or_create_twin(
                     
                     if yes or Confirm.ask("\nUse this twin?", default=True):
                         return twin
-        except Exception:
-            pass  # Continue to create new twin
+        except Exception as e:
+            # Log but continue - we'll create a new twin if lookup fails
+            logger.debug("Failed to search for existing twins: %s", e)
     
     # No existing twin found - create new one
     console.print("\n[yellow]No existing twin found for this device.[/yellow]")

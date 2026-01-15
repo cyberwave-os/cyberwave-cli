@@ -9,12 +9,14 @@ Resolves asset identifiers from multiple sources:
 """
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from rich.console import Console
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 class AssetResolutionError(Exception):
@@ -148,20 +150,38 @@ def _load_url_asset(url: str) -> dict:
 
 
 def _get_by_registry_id(registry_id: str, client: Any) -> Any | None:
-    """Get asset by registry ID."""
+    """Get asset by registry ID.
+
+    Returns None if asset not found or SDK call fails.
+    Failures are logged at debug level since this is used as a fallback lookup.
+    """
     try:
-        # Use SDK method
         return client.assets.get_by_registry_id(registry_id)
-    except Exception:
+    except AttributeError:
+        # SDK client doesn't have this method - expected for older SDK versions
+        logger.debug("SDK does not support get_by_registry_id")
+        return None
+    except Exception as e:
+        # Log unexpected errors but don't fail - caller will try other methods
+        logger.debug("Failed to get asset by registry_id '%s': %s", registry_id, e)
         return None
 
 
 def _get_by_alias(alias: str, client: Any) -> Any | None:
-    """Get asset by alias defined in metadata."""
+    """Get asset by alias defined in metadata.
+
+    Returns None if asset not found or SDK call fails.
+    Failures are logged at debug level since this is used as a fallback lookup.
+    """
     try:
-        # Use SDK method
         return client.assets.get_by_alias(alias)
-    except Exception:
+    except AttributeError:
+        # SDK client doesn't have this method - expected for older SDK versions
+        logger.debug("SDK does not support get_by_alias")
+        return None
+    except Exception as e:
+        # Log unexpected errors but don't fail - caller will try other methods
+        logger.debug("Failed to get asset by alias '%s': %s", alias, e)
         return None
 
 
