@@ -134,13 +134,21 @@ def connect(
     if config is None:
         return  # User cancelled
     
-    # 4. Save config to cloud + local
-    _save_config_to_twin(client, twin_uuid, fingerprint, config)
+    # 4. Register edge and pair twin using new API
+    edge_uuid = _register_and_pair_edge(twin_uuid, fingerprint, device_info, config)
+    
+    if not edge_uuid:
+        # Fallback to legacy twin metadata storage
+        _save_config_to_twin(client, twin_uuid, fingerprint, config)
+    
     _write_local_env(twin_uuid, config, fingerprint)
     
     print_success("Connected!")
     console.print(f"\n[bold]Saved to:[/bold]")
-    console.print(f"  • Cloud: twin/{twin_uuid}/edge_configs/{fingerprint[:20]}...")
+    if edge_uuid:
+        console.print(f"  • Cloud: edge/{edge_uuid[:8]}... → twin/{twin_uuid[:8]}...")
+    else:
+        console.print(f"  • Cloud: twin/{twin_uuid}/edge_configs/{fingerprint[:20]}... (legacy)")
     console.print(f"  • Local: ./.env")
     console.print(f"\n[dim]Run: python -m cyberwave_edge.service[/dim]")
 
@@ -386,8 +394,83 @@ def _configure_edge(
     return config
 
 
+def _register_and_pair_edge(twin_uuid: str, fingerprint: str, device_info: dict, config: dict) -> str | None:
+    """Register edge device and pair it to the twin using new API.
+    
+    Returns edge_uuid on success, None on failure (fallback to legacy).
+    """
+    import platform
+    import httpx
+    
+    from ..config import get_api_url
+    from ..credentials import load_credentials
+    from ..utils import print_warning
+    
+    creds = load_credentials()
+    if not creds or not creds.token:
+        return None
+    
+    base_url = get_api_url()
+    headers = {"Authorization": f"Bearer {creds.token}"}
+    
+    try:
+        # Step 1: Register/discover edge device
+        discover_url = f"{base_url}/api/v1/edges/discover"
+        discover_payload = {
+            "fingerprint": fingerprint,
+            "hostname": device_info.get('hostname', ''),
+            "platform": f"{platform.system()}-{platform.machine()}",
+            "name": device_info.get('hostname', fingerprint[:20]),
+        }
+        
+        with httpx.Client() as http_client:
+            response = http_client.post(
+                discover_url,
+                json=discover_payload,
+                headers=headers,
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            edge_uuid = data.get("edge_uuid")
+        
+        if not edge_uuid:
+            return None
+        
+        # Step 2: Pair twin to edge with camera config
+        pair_url = f"{base_url}/api/v1/edges/{edge_uuid}/pair"
+        
+        # Extract camera config from the config dict
+        cameras = config.get('cameras', [])
+        camera_config = cameras[0] if cameras else {}
+        
+        # Remove secrets from camera config (stored locally only)
+        camera_config_clean = {k: v for k, v in camera_config.items() if k not in ('username', 'password')}
+        
+        pair_payload = {
+            "twin_uuid": twin_uuid,
+            "camera_config": camera_config_clean,
+        }
+        
+        with httpx.Client() as http_client:
+            response = http_client.post(
+                pair_url,
+                json=pair_payload,
+                headers=headers,
+                timeout=30.0,
+            )
+            response.raise_for_status()
+        
+        console.print(f"[dim]Edge registered: {edge_uuid[:8]}...[/dim]")
+        return edge_uuid
+        
+    except Exception as e:
+        print_warning(f"New API failed, using legacy: {e}")
+        return None
+
+
 def _save_config_to_twin(client: Any, twin_uuid: str, fingerprint: str, config: dict):
-    """Save edge config to twin metadata."""
+    """Save edge config to twin metadata (legacy fallback)."""
     # Remove secrets before saving to cloud
     config_for_cloud = {k: v for k, v in config.items() if not k.startswith('_')}
     

@@ -339,35 +339,30 @@ def whoami():
 
 
 @edge.command("pull")
-@click.option("--twin-uuid", "-t", help="Twin UUID to pull config from")
-@click.option("--environment-uuid", "-e", help="Environment UUID to pull all twins from")
+@click.option("--twin-uuid", "-t", help="Twin UUID to pull config from (legacy)")
+@click.option("--environment-uuid", "-e", help="Environment UUID to pull all twins from (legacy)")
 @click.option("--target-dir", "-d", default=".", help="Directory to write .env file")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
 def pull_config(twin_uuid: str | None, environment_uuid: str | None, target_dir: str, yes: bool):
     """
-    Pull edge configuration from twin or environment.
+    Pull edge configuration from backend.
     
-    Downloads the edge configuration stored in twin metadata and writes it to
-    a local .env file. Supports pulling from a single twin or all twins in
-    an environment.
+    Uses the discovery API to fetch all twins bound to this edge device
+    along with their camera configurations.
     
     \b
     Examples:
-        # Pull config for a specific twin
+        # Pull all configs for this edge device
+        cyberwave edge pull
+        
+        # Pull config for a specific twin (legacy)
         cyberwave edge pull --twin-uuid abc-123
         
-        # Pull configs for all twins in an environment
-        cyberwave edge pull --environment-uuid env-456
-        
         # Specify output directory
-        cyberwave edge pull -t abc-123 -d ./my-edge
+        cyberwave edge pull -d ./my-edge
     """
     from ..fingerprint import generate_fingerprint, get_device_info
     from ..utils import get_sdk_client, print_error
-    
-    if not twin_uuid and not environment_uuid:
-        print_error("Provide --twin-uuid or --environment-uuid", "Example: cyberwave edge pull --twin-uuid abc-123")
-        return
     
     client = get_sdk_client()
     if not client:
@@ -378,6 +373,16 @@ def pull_config(twin_uuid: str | None, environment_uuid: str | None, target_dir:
     console.print(f"\n[dim]Fingerprint: {fingerprint}[/dim]\n")
     
     try:
+        # Try new discovery API first
+        if not twin_uuid and not environment_uuid:
+            success = _pull_via_discovery_api(fingerprint, target_dir, yes)
+            if success:
+                return
+            # Fall through to legacy if discovery API fails
+            console.print("[dim]Discovery API not available, use --twin-uuid for legacy mode[/dim]")
+            return
+        
+        # Legacy mode
         if environment_uuid:
             _pull_environment_configs(client, environment_uuid, fingerprint, target_dir, yes)
         else:
@@ -386,8 +391,130 @@ def pull_config(twin_uuid: str | None, environment_uuid: str | None, target_dir:
         print_error(str(e))
 
 
+def _pull_via_discovery_api(fingerprint: str, target_dir: str, yes: bool) -> bool:
+    """Pull config via the new discovery API.
+    
+    Returns True on success, False to fall back to legacy.
+    """
+    import platform
+    import httpx
+    
+    from ..config import get_api_url
+    from ..credentials import load_credentials
+    from ..fingerprint import get_device_info
+    from ..utils import print_error, print_success, print_warning, write_edge_env
+    
+    creds = load_credentials()
+    if not creds or not creds.token:
+        print_error("Not authenticated.", "Run 'cyberwave login' first.")
+        return False
+    
+    base_url = get_api_url()
+    headers = {"Authorization": f"Bearer {creds.token}"}
+    device_info = get_device_info()
+    
+    try:
+        # Call discovery API
+        discover_url = f"{base_url}/api/v1/edges/discover"
+        discover_payload = {
+            "fingerprint": fingerprint,
+            "hostname": device_info.get('hostname', ''),
+            "platform": f"{platform.system()}-{platform.machine()}",
+            "name": device_info.get('hostname', fingerprint[:20]),
+        }
+        
+        with httpx.Client() as http_client:
+            response = http_client.post(
+                discover_url,
+                json=discover_payload,
+                headers=headers,
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+        
+        edge_uuid = data.get("edge_uuid")
+        twins = data.get("twins", [])
+        
+        console.print(f"[cyan]Edge UUID:[/cyan] {edge_uuid}")
+        console.print(f"[cyan]Bound twins:[/cyan] {len(twins)}\n")
+        
+        if not twins:
+            print_warning("No twins bound to this edge device.")
+            console.print("[dim]Use 'cyberwave pair <twin_uuid>' to bind twins to this edge.[/dim]")
+            return True
+        
+        # Display twins
+        all_cameras = []
+        primary_twin = None
+        
+        for twin_info in twins:
+            twin_uuid = twin_info.get("twin_uuid")
+            twin_name = twin_info.get("twin_name", "Unknown")
+            camera_config = twin_info.get("camera_config", {})
+            
+            if not primary_twin:
+                primary_twin = twin_uuid
+            
+            has_config = bool(camera_config and camera_config.get("source"))
+            status = "[green]✓[/green]" if has_config else "[yellow]○[/yellow]"
+            
+            console.print(f"  {status} {twin_name} ({twin_uuid[:8]}...)")
+            
+            if camera_config:
+                cam_entry = {
+                    "camera_id": camera_config.get("camera_id", twin_uuid[:8]),
+                    "twin_uuid": twin_uuid,
+                    **camera_config,
+                }
+                all_cameras.append(cam_entry)
+        
+        if not all_cameras:
+            print_warning("No camera configurations found.")
+            console.print("[dim]Use 'cyberwave pair <twin_uuid> --camera-source ...' to configure cameras.[/dim]")
+            return True
+        
+        # Prompt for credentials (stored locally only)
+        has_rtsp = any('rtsp://' in str(c.get('source', '')) for c in all_cameras)
+        
+        username = None
+        password = None
+        
+        if has_rtsp and not yes:
+            console.print("\n[bold]Enter credentials (stored locally only):[/bold]")
+            username = Prompt.ask("  RTSP Username", default="admin")
+            password = Prompt.ask("  RTSP Password", password=True)
+        
+        # Write .env file
+        write_edge_env(
+            target_dir=target_dir,
+            twin_uuid=primary_twin,
+            cameras=all_cameras,
+            fingerprint=fingerprint,
+            username=username,
+            password=password,
+            generator="cyberwave edge pull",
+        )
+        
+        print_success(f"Config pulled to {target_dir}/.env")
+        console.print(f"[dim]  {len(all_cameras)} camera(s) from {len(twins)} twin(s)[/dim]")
+        console.print("[dim]Run: cyberwave edge start[/dim]")
+        
+        return True
+        
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            # API not available, fall back to legacy
+            return False
+        print_error(f"Discovery API error: {e}")
+        return False
+    except Exception as e:
+        console.print(f"[dim]Discovery API failed: {e}[/dim]")
+        return False
+
+
 def _pull_single_twin_config(client: Any, twin_uuid: str, fingerprint: str, target_dir: str, yes: bool):
-    """Pull config from a single twin."""
+    """Pull config from a single twin (legacy)."""
     twin = client.twins.get(twin_uuid)
     twin_name = getattr(twin, 'name', 'Unknown')
     metadata = getattr(twin, 'metadata', {}) or {}
