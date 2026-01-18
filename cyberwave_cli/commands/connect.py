@@ -25,6 +25,14 @@ from rich.prompt import Confirm, Prompt
 console = Console()
 logger = logging.getLogger(__name__)
 
+CAMERA_SOURCE_TYPE_RTSP = "RTSP"
+CAMERA_SOURCE_TYPE_USB = "USB"
+CAMERA_SOURCE_TYPE_REALSENSE = "RealSense"
+CAMERA_SOURCE_TYPES = [
+    CAMERA_SOURCE_TYPE_RTSP,
+    CAMERA_SOURCE_TYPE_USB,
+    CAMERA_SOURCE_TYPE_REALSENSE,
+]
 
 @click.command()
 @click.argument("asset")
@@ -326,9 +334,6 @@ def _configure_edge(
     
     # Interactive configuration
     console.print("\n[bold]Configure camera:[/bold]")
-    
-    # Source type - use centralized constants
-    from shared_constants import CAMERA_SOURCE_TYPES, CAMERA_SOURCE_TYPE_RTSP
     
     if not yes:
         console.print("\n  Source type:")
