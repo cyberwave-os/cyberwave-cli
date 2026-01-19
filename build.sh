@@ -30,7 +30,7 @@ EOF
 echo "Building standalone binary..."
 pyinstaller \
     --onefile \
-    --name cyberwave-cli \
+    --name cyberwave \
     --hidden-import cyberwave_cli \
     --hidden-import cyberwave_cli.commands \
     --hidden-import cyberwave_cli.commands.login \
@@ -49,6 +49,6 @@ rm -f __pyinstaller_entry.py
 
 echo ""
 echo "=== Build complete ==="
-echo "Binary: dist/cyberwave-cli"
+echo "Binary: dist/cyberwave"
 echo ""
-echo "Test with: ./dist/cyberwave-cli --help"
+echo "Test with: ./dist/cyberwave --help"
