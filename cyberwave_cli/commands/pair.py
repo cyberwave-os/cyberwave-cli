@@ -191,7 +191,8 @@ def pair(ctx: click.Context, twin_uuid: str, target_dir: str, yes: bool):
         console.print(f"\n[bold]Target Twin:[/bold] {twin_name}")
         
         # Get asset capabilities including edge_config_schema
-        asset_uuid = getattr(twin, 'asset_uuid', None)
+        # Twin may have asset_uuid or asset_id depending on SDK version
+        asset_uuid = getattr(twin, 'asset_uuid', None) or getattr(twin, 'asset_id', None)
         edge_config_schema: list[dict] = []
         if asset_uuid:
             try:
@@ -292,13 +293,11 @@ def pair(ctx: click.Context, twin_uuid: str, target_dir: str, yes: bool):
         return
 
     # Step 4: Write local .env file
-    cameras = [{"camera_id": "default", **edge_config}] if edge_config else []
-    
     write_edge_env(
         target_dir=target_dir,
         twin_uuid=twin_uuid,
-        cameras=cameras,
         fingerprint=fingerprint,
+        edge_config=edge_config,
         generator="cyberwave pair",
     )
 

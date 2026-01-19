@@ -541,17 +541,14 @@ def _write_local_env(twin_uuid: str, config: dict, fingerprint: str):
     """Write .env file locally using shared utility."""
     from ..utils import write_edge_env
     
-    # For backward compat, wrap config in cameras array if it has source field
-    if 'source' in config:
-        cameras = [{"camera_id": "default", **{k: v for k, v in config.items() if k not in ('device_info', 'registered_at', 'last_sync')}}]
-    else:
-        cameras = config.get('cameras', [])
+    # Clean config of internal fields
+    edge_config = {k: v for k, v in config.items() if k not in ('device_info', 'registered_at', 'last_sync')}
     
     write_edge_env(
         target_dir=".",
         twin_uuid=twin_uuid,
-        cameras=cameras,
         fingerprint=fingerprint,
+        edge_config=edge_config,
         generator="cyberwave connect",
     )
 
