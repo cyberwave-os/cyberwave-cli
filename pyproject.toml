@@ -40,7 +40,7 @@ build = [
 ]
 
 [project.scripts]
-cyberwave-cli = "cyberwave_cli.main:cli"
+cyberwave = "cyberwave_cli.main:cli"
 
 [project.urls]
 Homepage = "https://cyberwave.com"

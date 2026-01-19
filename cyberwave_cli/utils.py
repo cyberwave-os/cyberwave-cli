@@ -242,6 +242,8 @@ CYBERWAVE_BASE_URL={get_api_url()}
 CYBERWAVE_EDGE_UUID={fingerprint}
 
 {cameras_comment}
+# Each entry can have: camera_id, source, fps, twin_uuid (for multi-twin setups)
+# For robots without cameras, this can be empty: CAMERAS='[]'
 CAMERAS='{cameras_str}'
 
 # Logging
