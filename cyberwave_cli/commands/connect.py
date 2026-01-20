@@ -4,7 +4,7 @@ Smart connect command - unified entry point for twin creation + edge setup.
 The `connect` command handles everything intelligently:
 - Resolves asset from registry ID, alias, or local file
 - Finds existing twin for this device's fingerprint, or creates new one
-- Configures edge with interactive prompts
+- Configures edge based on asset's edge_config_schema
 - Saves config to cloud (twin metadata) and local (.env)
 
 Examples:
@@ -26,14 +26,99 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 
-@click.command()
+def _coerce_value(field_type: str, value: str | None) -> object | None:
+    """Coerce string value to the type specified in schema."""
+    if value is None or value == "":
+        return None
+    field_type = (field_type or "").lower()
+    if field_type == "integer":
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    if field_type == "number":
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    if field_type == "boolean":
+        if isinstance(value, str):
+            return value.lower() in {"1", "true", "yes", "y"}
+        return bool(value)
+    return value
+
+
+def _prompt_for_schema_fields(
+    schema: list[dict],
+    cli_overrides: dict[str, str],
+    yes: bool,
+) -> dict:
+    """
+    Prompt user for each field in the schema, using CLI overrides when provided.
+    Returns a config dict with all non-empty values.
+    """
+    config = {}
+    
+    if not schema:
+        return config
+    
+    if not yes:
+        console.print("\n[bold]Edge Configuration[/bold]")
+        console.print("[dim]Configure based on asset schema. Leave blank to skip optional fields.[/dim]")
+    
+    for field in schema:
+        name = field.get("name", "")
+        flag = field.get("flag", "")
+        field_type = field.get("type", "string")
+        default = field.get("default")
+        description = field.get("description", "")
+        required = field.get("required", False)
+        
+        if not name:
+            continue
+        
+        # Check if CLI override was provided (match by flag without --)
+        cli_key = flag.lstrip("-").replace("-", "_") if flag else name
+        cli_value = cli_overrides.get(cli_key)
+        
+        if cli_value is not None:
+            # Use CLI-provided value
+            config[name] = _coerce_value(field_type, cli_value)
+        elif yes:
+            # Non-interactive: use default if available
+            if default not in (None, ""):
+                config[name] = _coerce_value(field_type, str(default))
+            elif required:
+                from ..utils import print_warning
+                print_warning(f"Required field '{name}' has no default and --yes was used")
+        else:
+            # Interactive prompt
+            prompt_text = f"  {name}"
+            if description:
+                console.print(f"[dim]  {description}[/dim]")
+            
+            default_str = str(default) if default not in (None, "") else ""
+            value = Prompt.ask(prompt_text, default=default_str)
+            
+            if value.strip():
+                config[name] = _coerce_value(field_type, value)
+            elif required:
+                from ..utils import print_warning
+                print_warning(f"Required field '{name}' was left empty")
+    
+    return config
+
+
+@click.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("asset")
 @click.option("--twin-uuid", "-t", help="Use specific twin (skip discovery)")
 @click.option("--environment-uuid", "-e", help="Create twin in this environment")
 @click.option("--cloud-only", is_flag=True, help="Create twin without local edge setup")
 @click.option("--name", "-n", help="Twin name (for new twins)")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
+@click.pass_context
 def connect(
+    ctx: click.Context,
     asset: str,
     twin_uuid: str | None,
     environment_uuid: str | None,
@@ -52,14 +137,34 @@ def connect(
       - Local file: ./my-robot.json
       - URL: https://example.com/asset.json
     
+    Configuration options are determined by the asset's edge_config_schema.
+    Pass any schema field as --field-name value.
+    
     \b
     Examples:
         cyberwave connect camera
         cyberwave connect go2 --name "My Robot"
         cyberwave connect camera --twin-uuid abc123
         cyberwave connect camera --cloud-only
-        cyberwave connect ./my-camera.json -e env-123
+        cyberwave connect camera --source "rtsp://..." --fps 15
     """
+    # Parse extra args as --key value pairs for schema fields
+    cli_overrides: dict[str, str] = {}
+    args = ctx.args
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--"):
+            key = arg[2:].replace("-", "_")
+            if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                cli_overrides[key] = args[i + 1]
+                i += 2
+            else:
+                cli_overrides[key] = "true"  # Flag without value
+                i += 1
+        else:
+            i += 1
+
     from ..asset_resolver import AssetResolutionError, get_asset_display_name, resolve_asset
     from ..fingerprint import generate_fingerprint, get_device_info
     from ..utils import get_sdk_client, print_error, print_success
@@ -87,13 +192,20 @@ def connect(
         print_error(str(e))
         return
     
+    # Get edge_config_schema from asset capabilities
+    capabilities = resolved_asset.get('capabilities', {}) or {}
+    edge_config_schema: list[dict] = capabilities.get("edge_config_schema", []) or []
+    
+    if edge_config_schema:
+        console.print(f"[dim]  Config schema: {len(edge_config_schema)} field(s)[/dim]")
+    
     # 2. Find or create twin
     if twin_uuid:
         # Use specified twin
         try:
             twin = client.twins.get(twin_uuid)
-            twin_name = getattr(twin, 'name', 'Unknown')
-            console.print(f"\n[cyan]Using twin:[/cyan] {twin_name}")
+            twin_name_display = getattr(twin, 'name', 'Unknown')
+            console.print(f"\n[cyan]Using twin:[/cyan] {twin_name_display}")
         except Exception as e:
             logger.debug("Failed to get twin %s: %s", twin_uuid, e)
             print_error(f"Twin not found: {twin_uuid}")
@@ -113,21 +225,22 @@ def connect(
             return  # User cancelled
     
     twin_uuid = str(getattr(twin, 'uuid', ''))
-    twin_name = getattr(twin, 'name', 'Unknown')
+    twin_name_display = getattr(twin, 'name', 'Unknown')
     
     if cloud_only:
-        print_success(f"Twin created: {twin_name} ({twin_uuid})")
+        print_success(f"Twin created: {twin_name_display} ({twin_uuid})")
         console.print(f"\n[dim]To connect an edge device later:[/dim]")
         console.print(f"  cyberwave connect {asset} --twin-uuid {twin_uuid}")
         return
     
-    # 3. Configure edge (interactive or from existing config)
+    # 3. Configure edge from schema
     config = _configure_edge(
         client=client,
         twin=twin,
-        asset=resolved_asset,
         fingerprint=fingerprint,
         device_info=device_info,
+        edge_config_schema=edge_config_schema,
+        cli_overrides=cli_overrides,
         yes=yes,
     )
     
@@ -175,11 +288,11 @@ def _find_or_create_twin(
                 
                 if fingerprint in edge_configs:
                     # Found existing twin for this device
-                    twin_name = getattr(twin, 'name', 'Unknown')
+                    found_name = getattr(twin, 'name', 'Unknown')
                     config = edge_configs[fingerprint]
                     last_sync = config.get('last_sync', 'unknown')
                     
-                    console.print(f"\n[cyan]Found existing twin:[/cyan] {twin_name}")
+                    console.print(f"\n[cyan]Found existing twin:[/cyan] {found_name}")
                     console.print(f"[dim]  Last connected: {last_sync}[/dim]")
                     
                     if yes or Confirm.ask("\nUse this twin?", default=True):
@@ -203,7 +316,8 @@ def _find_or_create_twin(
     # Get twin name
     if not twin_name:
         device_info = get_device_info()
-        default_name = f"Camera-{device_info.get('hostname', 'edge')[:15]}"
+        asset_name = asset.get('name', 'Edge')
+        default_name = f"{asset_name[:20]}-{device_info.get('hostname', 'edge')[:10]}"
         
         if yes:
             twin_name = default_name
@@ -219,7 +333,7 @@ def _find_or_create_twin(
             environment_id=environment_uuid,
             asset_id=asset_uuid,
         )
-        from ..utils import print_success, print_error
+        from ..utils import print_success
         print_success(f"Created twin: {twin_name}")
         return twin
     except Exception as e:
@@ -236,7 +350,7 @@ def _select_environment(client: Any, yes: bool) -> str | None:
         if not environments:
             console.print("[yellow]No environments found. Creating one...[/yellow]")
             
-            env_name = "Camera Environment" if yes else Prompt.ask("Environment name", default="Camera Environment")
+            env_name = "Default Environment" if yes else Prompt.ask("Environment name", default="Default Environment")
             
             # Need to create workspace/project first
             projects = client.projects.list()
@@ -275,7 +389,7 @@ def _select_environment(client: Any, yes: bool) -> str | None:
                 return str(environments[idx].uuid)
             else:
                 # Create new
-                env_name = Prompt.ask("Environment name", default="Camera Environment")
+                env_name = Prompt.ask("Environment name", default="Default Environment")
                 projects = client.projects.list()
                 project_id = projects[0].uuid if projects else None
                 
@@ -300,95 +414,35 @@ def _select_environment(client: Any, yes: bool) -> str | None:
 def _configure_edge(
     client: Any,
     twin: Any,
-    asset: dict,
     fingerprint: str,
     device_info: dict,
-    yes: bool,
+    edge_config_schema: list[dict],
+    cli_overrides: dict[str, str],
+    yes: bool = False,
 ) -> dict | None:
-    """Configure edge settings interactively or from existing config."""
+    """Configure edge settings from schema, interactively or from CLI/defaults."""
     twin_uuid = str(getattr(twin, 'uuid', ''))
     metadata = getattr(twin, 'metadata', {}) or {}
     edge_configs = metadata.get('edge_configs', {})
     
-    # Check for existing config
+    # Check for existing config (skip if CLI overrides provided)
     existing_config = edge_configs.get(fingerprint)
     
-    if existing_config:
+    if existing_config and not cli_overrides:
         console.print("\n[cyan]Found existing config for this device.[/cyan]")
-        cameras = existing_config.get('cameras', [])
-        if cameras:
-            console.print(f"[dim]  Cameras: {len(cameras)}[/dim]")
         
         if yes or Confirm.ask("Use existing config?", default=True):
-            # Just update last_sync and return
             existing_config['last_sync'] = datetime.now(timezone.utc).isoformat()
             return existing_config
     
-    # Interactive configuration
-    console.print("\n[bold]Configure camera:[/bold]")
-    
-    # Source type - use centralized constants
-    from shared_constants import CAMERA_SOURCE_TYPES, CAMERA_SOURCE_TYPE_RTSP
-    
-    if not yes:
-        console.print("\n  Source type:")
-        for i, st in enumerate(CAMERA_SOURCE_TYPES, 1):
-            console.print(f"    {i}. {st}")
-        source_choice = Prompt.ask("  Select", default="1")
-        source_type = CAMERA_SOURCE_TYPES[int(source_choice) - 1] if source_choice.isdigit() else CAMERA_SOURCE_TYPE_RTSP
-    else:
-        source_type = CAMERA_SOURCE_TYPE_RTSP
-    
-    cameras = []
-    
-    if source_type == "RTSP":
-        source = Prompt.ask("  RTSP URL", default="rtsp://") if not yes else "rtsp://"
-        username = Prompt.ask("  Username", default="admin") if not yes else "admin"
-        password = Prompt.ask("  Password", password=True) if not yes else ""
-        fps = int(Prompt.ask("  FPS", default="10")) if not yes else 10
-        
-        cameras.append({
-            "camera_id": "default",
-            "source": source,
-            "fps": fps,
-            # Note: username/password stored in local .env only
-        })
-        
-        # Store credentials for local .env
-        config_secrets = {
-            "username": username,
-            "password": password,
-        }
-    elif source_type == "USB":
-        device_id = Prompt.ask("  Device ID", default="0") if not yes else "0"
-        fps = int(Prompt.ask("  FPS", default="30")) if not yes else 30
-        
-        cameras.append({
-            "camera_id": "default",
-            "source": int(device_id),
-            "fps": fps,
-        })
-        config_secrets = {}
-    else:  # RealSense
-        fps = int(Prompt.ask("  FPS", default="30")) if not yes else 30
-        enable_depth = Confirm.ask("  Enable depth?", default=True) if not yes else True
-        
-        cameras.append({
-            "camera_id": "default",
-            "source": "realsense",
-            "camera_type": "realsense",
-            "fps": fps,
-            "enable_depth": enable_depth,
-        })
-        config_secrets = {}
+    # Build config from schema
+    edge_config = _prompt_for_schema_fields(edge_config_schema, cli_overrides, yes)
     
     config = {
-        "cameras": cameras,
-        "models": [],
+        **edge_config,
         "device_info": device_info,
         "registered_at": datetime.now(timezone.utc).isoformat(),
         "last_sync": datetime.now(timezone.utc).isoformat(),
-        "_secrets": config_secrets,  # Not saved to cloud
     }
     
     return config
@@ -437,19 +491,15 @@ def _register_and_pair_edge(twin_uuid: str, fingerprint: str, device_info: dict,
         if not edge_uuid:
             return None
         
-        # Step 2: Pair twin to edge with camera config
+        # Step 2: Pair twin to edge with config
         pair_url = f"{base_url}/api/v1/edges/{edge_uuid}/pair"
         
-        # Extract camera config from the config dict
-        cameras = config.get('cameras', [])
-        camera_config = cameras[0] if cameras else {}
-        
-        # Remove secrets from camera config (stored locally only)
-        camera_config_clean = {k: v for k, v in camera_config.items() if k not in ('username', 'password')}
+        # Remove internal fields from config
+        config_clean = {k: v for k, v in config.items() if not k.startswith('_') and k not in ('device_info', 'registered_at', 'last_sync')}
         
         pair_payload = {
             "twin_uuid": twin_uuid,
-            "camera_config": camera_config_clean,
+            "camera_config": config_clean,  # Backend expects camera_config for now
         }
         
         with httpx.Client() as http_client:
@@ -491,16 +541,14 @@ def _write_local_env(twin_uuid: str, config: dict, fingerprint: str):
     """Write .env file locally using shared utility."""
     from ..utils import write_edge_env
     
-    secrets = config.get('_secrets', {})
-    cameras = config.get('cameras', [])
+    # Clean config of internal fields
+    edge_config = {k: v for k, v in config.items() if k not in ('device_info', 'registered_at', 'last_sync')}
     
     write_edge_env(
         target_dir=".",
         twin_uuid=twin_uuid,
-        cameras=cameras,
         fingerprint=fingerprint,
-        username=secrets.get('username'),
-        password=secrets.get('password'),
+        edge_config=edge_config,
         generator="cyberwave connect",
     )
 

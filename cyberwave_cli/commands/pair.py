@@ -11,7 +11,6 @@ Terminology:
 
 Examples:
     cyberwave pair abc-123-def-456
-    cyberwave pair abc-123-def-456 --camera-source "rtsp://..."
     cyberwave pair abc-123-def-456 --target-dir ./my-edge
 """
 
@@ -30,7 +29,88 @@ from ..utils import get_sdk_client, write_edge_env, print_error, print_success, 
 console = Console()
 
 
-@click.command()
+def _coerce_value(field_type: str, value: str | None) -> object | None:
+    """Coerce string value to the type specified in schema."""
+    if value is None or value == "":
+        return None
+    field_type = (field_type or "").lower()
+    if field_type == "integer":
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    if field_type == "number":
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    if field_type == "boolean":
+        if isinstance(value, str):
+            return value.lower() in {"1", "true", "yes", "y"}
+        return bool(value)
+    return value
+
+
+def _prompt_for_schema_fields(
+    schema: list[dict],
+    cli_overrides: dict[str, str],
+    yes: bool,
+) -> dict:
+    """
+    Prompt user for each field in the schema, using CLI overrides when provided.
+    Returns a config dict with all non-empty values.
+    """
+    config = {}
+    
+    if not schema:
+        return config
+    
+    if not yes:
+        console.print("\n[bold]Edge Configuration[/bold]")
+        console.print("[dim]Configure based on asset schema. Leave blank to skip optional fields.[/dim]")
+    
+    for field in schema:
+        name = field.get("name", "")
+        flag = field.get("flag", "")
+        field_type = field.get("type", "string")
+        default = field.get("default")
+        description = field.get("description", "")
+        required = field.get("required", False)
+        
+        if not name:
+            continue
+        
+        # Check if CLI override was provided (match by flag without --)
+        cli_key = flag.lstrip("-").replace("-", "_") if flag else name
+        cli_value = cli_overrides.get(cli_key)
+        
+        if cli_value is not None:
+            # Use CLI-provided value
+            config[name] = _coerce_value(field_type, cli_value)
+        elif yes:
+            # Non-interactive: use default if available
+            if default not in (None, ""):
+                config[name] = _coerce_value(field_type, str(default))
+            elif required:
+                print_warning(f"Required field '{name}' has no default and --yes was used")
+        else:
+            # Interactive prompt
+            prompt_text = f"  {name}"
+            if description:
+                console.print(f"[dim]  {description}[/dim]")
+            
+            default_str = str(default) if default not in (None, "") else ""
+            value = Prompt.ask(prompt_text, default=default_str)
+            
+            if value.strip():
+                config[name] = _coerce_value(field_type, value)
+            elif required:
+                print_warning(f"Required field '{name}' was left empty")
+    
+    return config
+
+
+@click.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("twin_uuid")
 @click.option(
     "--target-dir",
@@ -38,37 +118,29 @@ console = Console()
     default=".",
     help="Directory to save edge configuration (default: current directory)",
 )
-@click.option(
-    "--camera-source",
-    "-c",
-    default=None,
-    help="Camera source (e.g., rtsp://..., 0 for webcam)",
-)
-@click.option(
-    "--fps",
-    default=30,
-    help="Camera FPS (default: 30)",
-)
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
-def pair(twin_uuid: str, target_dir: str, camera_source: str | None, fps: int, yes: bool):
+@click.pass_context
+def pair(ctx: click.Context, twin_uuid: str, target_dir: str, yes: bool):
     """
     Pair this device with a digital twin.
 
     Registers this device with the backend and binds it to the specified twin.
     After pairing, run `cyberwave edge start` to begin streaming.
 
+    Configuration options are determined by the asset's edge_config_schema.
+    Pass any schema field as --field-name value.
+
     \b
     What this does:
         1. Generates a unique fingerprint for this device
         2. Registers the edge device with the backend (auto-creates if new)
-        3. Binds the twin to this edge with camera configuration
+        3. Binds the twin to this edge with configuration from schema
         4. Saves local .env file for edge service
 
     \b
     Examples:
         cyberwave pair abc-123-def-456
-        cyberwave pair abc-123-def-456 --camera-source "rtsp://user:pass@192.168.1.100/stream"
-        cyberwave pair abc-123-def-456 --camera-source 0 --fps 15
+        cyberwave pair abc-123-def-456 --camera-source "rtsp://..." --fps 15
 
     \b
     Quick Start:
@@ -76,6 +148,23 @@ def pair(twin_uuid: str, target_dir: str, camera_source: str | None, fps: int, y
         2. cyberwave pair <uuid>     # Pair device with twin
         3. cyberwave edge start      # Start streaming
     """
+    # Parse extra args as --key value pairs for schema fields
+    cli_overrides: dict[str, str] = {}
+    args = ctx.args
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--"):
+            key = arg[2:].replace("-", "_")
+            if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                cli_overrides[key] = args[i + 1]
+                i += 2
+            else:
+                cli_overrides[key] = "true"  # Flag without value
+                i += 1
+        else:
+            i += 1
+
     # Get SDK client and auth
     client = get_sdk_client()
     creds = load_credentials()
@@ -95,11 +184,37 @@ def pair(twin_uuid: str, target_dir: str, camera_source: str | None, fps: int, y
     console.print(f"Hostname:    {device_info.get('hostname', 'unknown')}")
     console.print(f"Platform:    {device_info.get('platform', 'unknown')}")
 
-    # Get twin info
+    # Get twin info and asset capabilities
     try:
         twin = client.twins.get(twin_uuid)
         twin_name = getattr(twin, 'name', 'Unknown')
         console.print(f"\n[bold]Target Twin:[/bold] {twin_name}")
+        
+        # Get asset capabilities including edge_config_schema
+        # Twin may have asset_uuid or asset_id depending on SDK version
+        asset_uuid = getattr(twin, 'asset_uuid', None) or getattr(twin, 'asset_id', None)
+        edge_config_schema: list[dict] = []
+        if asset_uuid:
+            try:
+                asset = client.assets.get(asset_uuid)
+                capabilities = getattr(asset, 'capabilities', {}) or {}
+                edge_config_schema = capabilities.get("edge_config_schema", []) or []
+                
+                # Show capabilities summary
+                sensors = capabilities.get('sensors', [])
+                caps_summary = []
+                if sensors:
+                    caps_summary.append(f"{len(sensors)} sensor(s)")
+                if capabilities.get('has_joints'):
+                    caps_summary.append("joints")
+                if capabilities.get('can_locomote'):
+                    caps_summary.append("locomotion")
+                if caps_summary:
+                    console.print(f"[dim]  Capabilities: {', '.join(caps_summary)}[/dim]")
+                if edge_config_schema:
+                    console.print(f"[dim]  Config schema: {len(edge_config_schema)} field(s)[/dim]")
+            except Exception as e:
+                console.print(f"[dim]  Could not fetch asset details: {e}[/dim]")
     except Exception as e:
         print_error(f"Twin not found: {twin_uuid}", f"Error: {e}")
         return
@@ -141,33 +256,8 @@ def pair(twin_uuid: str, target_dir: str, camera_source: str | None, fps: int, y
         print_error(f"Failed to register edge device: {e}")
         return
 
-    # Step 2: Get or prompt for camera config
-    camera_config = {}
-    
-    if camera_source is not None:
-        # Use provided camera source
-        try:
-            source = int(camera_source)  # Webcam index
-        except ValueError:
-            source = camera_source  # URL string
-        camera_config = {"source": source, "fps": fps}
-    else:
-        # Prompt for camera source
-        if not yes:
-            console.print("\n[bold]Camera Configuration[/bold]")
-            console.print("[dim]Enter camera source (RTSP URL, webcam index, or skip)[/dim]")
-            source_input = Prompt.ask("Camera source", default="0")
-            
-            try:
-                source = int(source_input)
-            except ValueError:
-                source = source_input
-            
-            if source:
-                camera_config = {"source": source, "fps": fps}
-        else:
-            # Default to webcam 0
-            camera_config = {"source": 0, "fps": fps}
+    # Step 2: Build config from schema (fully dynamic)
+    edge_config = _prompt_for_schema_fields(edge_config_schema, cli_overrides, yes)
 
     # Step 3: Pair twin to edge
     console.print("\n[dim]Binding twin to edge device...[/dim]")
@@ -178,7 +268,7 @@ def pair(twin_uuid: str, target_dir: str, camera_source: str | None, fps: int, y
         
         pair_payload = {
             "twin_uuid": twin_uuid,
-            "camera_config": camera_config,
+            "camera_config": edge_config,  # Backend expects camera_config for now
         }
         
         with httpx.Client() as http_client:
@@ -203,13 +293,11 @@ def pair(twin_uuid: str, target_dir: str, camera_source: str | None, fps: int, y
         return
 
     # Step 4: Write local .env file
-    cameras = [{"camera_id": "default", **camera_config}] if camera_config else []
-    
     write_edge_env(
         target_dir=target_dir,
         twin_uuid=twin_uuid,
-        cameras=cameras,
         fingerprint=fingerprint,
+        edge_config=edge_config,
         generator="cyberwave pair",
     )
 
@@ -223,5 +311,3 @@ def pair(twin_uuid: str, target_dir: str, camera_source: str | None, fps: int, y
     # Show current bindings
     console.print("\n[dim]This edge device is now paired to:[/dim]")
     console.print(f"  - {twin_name} ({twin_uuid[:8]}...)")
-
-

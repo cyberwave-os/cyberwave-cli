@@ -444,60 +444,46 @@ def _pull_via_discovery_api(fingerprint: str, target_dir: str, yes: bool) -> boo
             console.print("[dim]Use 'cyberwave pair <twin_uuid>' to bind twins to this edge.[/dim]")
             return True
         
-        # Display twins
-        all_cameras = []
+        # Display twins and collect configs
+        all_configs = []
         primary_twin = None
         
         for twin_info in twins:
             twin_uuid = twin_info.get("twin_uuid")
             twin_name = twin_info.get("twin_name", "Unknown")
-            camera_config = twin_info.get("camera_config", {})
+            edge_config = twin_info.get("camera_config", {})  # Backend still uses camera_config key
             
             if not primary_twin:
                 primary_twin = twin_uuid
             
-            has_config = bool(camera_config and camera_config.get("source"))
+            has_config = bool(edge_config)
             status = "[green]✓[/green]" if has_config else "[yellow]○[/yellow]"
             
             console.print(f"  {status} {twin_name} ({twin_uuid[:8]}...)")
             
-            if camera_config:
-                cam_entry = {
-                    "camera_id": camera_config.get("camera_id", twin_uuid[:8]),
+            if edge_config:
+                config_entry = {
                     "twin_uuid": twin_uuid,
-                    **camera_config,
+                    **edge_config,
                 }
-                all_cameras.append(cam_entry)
+                all_configs.append(config_entry)
         
-        if not all_cameras:
-            print_warning("No camera configurations found.")
-            console.print("[dim]Use 'cyberwave pair <twin_uuid> --camera-source ...' to configure cameras.[/dim]")
+        if not all_configs:
+            print_warning("No edge configurations found.")
+            console.print("[dim]Use 'cyberwave pair <twin_uuid>' with config options to set up twins.[/dim]")
             return True
-        
-        # Prompt for credentials (stored locally only)
-        has_rtsp = any('rtsp://' in str(c.get('source', '')) for c in all_cameras)
-        
-        username = None
-        password = None
-        
-        if has_rtsp and not yes:
-            console.print("\n[bold]Enter credentials (stored locally only):[/bold]")
-            username = Prompt.ask("  RTSP Username", default="admin")
-            password = Prompt.ask("  RTSP Password", password=True)
         
         # Write .env file
         write_edge_env(
             target_dir=target_dir,
             twin_uuid=primary_twin,
-            cameras=all_cameras,
             fingerprint=fingerprint,
-            username=username,
-            password=password,
+            edge_configs=all_configs,
             generator="cyberwave edge pull",
         )
         
         print_success(f"Config pulled to {target_dir}/.env")
-        console.print(f"[dim]  {len(all_cameras)} camera(s) from {len(twins)} twin(s)[/dim]")
+        console.print(f"[dim]  {len(all_configs)} config(s) from {len(twins)} twin(s)[/dim]")
         console.print("[dim]Run: cyberwave edge start[/dim]")
         
         return True
@@ -577,27 +563,23 @@ def _pull_single_twin_config(client: Any, twin_uuid: str, fingerprint: str, targ
     if not my_config:
         return
     
-    # Prompt for credentials (not stored in cloud)
-    cameras = my_config.get('cameras', [])
-    has_rtsp = any('rtsp://' in str(c.get('source', '')) for c in cameras)
+    # Extract edge config (remove internal fields)
+    edge_config = {k: v for k, v in my_config.items() 
+                   if k not in ('device_info', 'registered_at', 'last_sync', 'cameras')}
     
-    username = None
-    password = None
-    
-    if has_rtsp and not yes:
-        console.print("\n[bold]Enter credentials (stored locally only):[/bold]")
-        username = Prompt.ask("  RTSP Username", default="admin")
-        password = Prompt.ask("  RTSP Password", password=True)
+    # For backward compat: if config has 'cameras' array, use first entry as edge_config
+    if not edge_config and my_config.get('cameras'):
+        cameras = my_config['cameras']
+        if cameras:
+            edge_config = {k: v for k, v in cameras[0].items() if k != 'camera_id'}
     
     # Write .env file directly using shared utility
     from ..utils import write_edge_env, print_success
     write_edge_env(
         target_dir=target_dir,
         twin_uuid=twin_uuid,
-        cameras=cameras,
         fingerprint=fingerprint,
-        username=username,
-        password=password,
+        edge_config=edge_config,
         generator="cyberwave edge pull",
     )
     
@@ -622,7 +604,7 @@ def _pull_environment_configs(client: Any, env_uuid: str, fingerprint: str, targ
     console.print(f"[cyan]Environment:[/cyan] {env_name}")
     console.print(f"[cyan]Found {len(twins)} twin(s):[/cyan]\n")
     
-    all_cameras = []
+    all_configs = []
     twins_with_config = []
     twins_without_config = []
     
@@ -636,18 +618,27 @@ def _pull_environment_configs(client: Any, env_uuid: str, fingerprint: str, targ
         
         if my_config:
             twins_with_config.append((twin, my_config))
-            cameras = my_config.get('cameras', [])
-            for cam in cameras:
-                cam_copy = cam.copy()
-                cam_copy['twin_uuid'] = twin_uuid
-                cam_copy['twin_name'] = twin_name
-                all_cameras.append(cam_copy)
-            console.print(f"  [green]✓[/green] {twin_name} - {len(cameras)} camera(s)")
+            # Extract edge config (remove internal fields)
+            edge_config = {k: v for k, v in my_config.items() 
+                         if k not in ('device_info', 'registered_at', 'last_sync', 'cameras')}
+            
+            # For backward compat: if config has 'cameras' array, use first entry
+            if not edge_config and my_config.get('cameras'):
+                cameras = my_config['cameras']
+                if cameras:
+                    edge_config = {k: v for k, v in cameras[0].items() if k != 'camera_id'}
+            
+            config_entry = {
+                "twin_uuid": twin_uuid,
+                **edge_config,
+            }
+            all_configs.append(config_entry)
+            console.print(f"  [green]✓[/green] {twin_name} - configured")
         else:
             twins_without_config.append(twin)
             console.print(f"  [yellow]○[/yellow] {twin_name} - no config for this device")
     
-    if not all_cameras and not twins_without_config:
+    if not all_configs and not twins_without_config:
         from ..utils import print_warning
         print_warning("No configurations to pull")
         return
@@ -659,40 +650,26 @@ def _pull_environment_configs(client: Any, env_uuid: str, fingerprint: str, targ
     if not yes and not Confirm.ask("\nPull available configs?", default=True):
         return
     
-    # Prompt for shared credentials
-    has_rtsp = any('rtsp://' in str(c.get('source', '')) for c in all_cameras)
-    
-    username = None
-    password = None
-    
-    if has_rtsp and not yes:
-        console.print("\n[bold]Enter shared credentials (stored locally only):[/bold]")
-        username = Prompt.ask("  RTSP Username", default="admin")
-        password = Prompt.ask("  RTSP Password", password=True)
-    
-    # Write .env file with all cameras directly using shared utility
-    if all_cameras:
+    # Write .env file with all configs using shared utility
+    if all_configs:
         from ..utils import write_edge_env, print_success
-        # Extract primary twin from cameras
-        twin_uuids = set(cam.get("twin_uuid", "") for cam in all_cameras if cam.get("twin_uuid"))
-        primary_twin = list(twin_uuids)[0] if twin_uuids else ""
+        # Extract primary twin
+        primary_twin = all_configs[0].get("twin_uuid", "") if all_configs else ""
         
         write_edge_env(
             target_dir=target_dir,
             twin_uuid=primary_twin,
-            cameras=all_cameras,
             fingerprint=fingerprint,
-            username=username,
-            password=password,
+            edge_configs=all_configs,
             generator="cyberwave edge pull",
         )
         
         print_success(f"Config pulled to {target_dir}/.env")
-        console.print(f"[dim]  {len(all_cameras)} camera(s) from {len(twins_with_config)} twin(s)[/dim]")
+        console.print(f"[dim]  {len(all_configs)} config(s) from {len(twins_with_config)} twin(s)[/dim]")
         console.print("[dim]Run: python -m cyberwave_edge.service[/dim]")
     else:
         from ..utils import print_warning
-        print_warning("No cameras configured. Use 'cyberwave connect' to set up twins.")
+        print_warning("No configs found. Use 'cyberwave connect' to set up twins.")
 
 
 @edge.command("health")
