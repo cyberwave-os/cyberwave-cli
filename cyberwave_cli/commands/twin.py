@@ -516,10 +516,12 @@ def create_twin(
         console.print(f"[dim]  Config schema: {len(edge_config_schema)} field(s)[/dim]")
 
     # 2. Find or create twin
+    # Only pass fingerprint when --pair is used; otherwise always create a new twin
+    # to ensure deterministic "create" semantics (no silent reuse of existing twins)
     twin_obj = _find_or_create_twin(
         client=client,
         asset=resolved_asset,
-        fingerprint=fingerprint,
+        fingerprint=fingerprint if do_pair else None,
         environment_uuid=environment_uuid,
         twin_name=name,
         yes=yes,
