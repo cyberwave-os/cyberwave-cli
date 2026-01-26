@@ -35,7 +35,7 @@ Assets define what edge runtimes are supported and the configuration schema for 
     "aliases": ["camera", "ip-cam"],
     
     # CLI command shown in catalog UI
-    "cli_connect_cmd": "cyberwave connect camera",
+    "cli_connect_cmd": "cyberwave twin create camera --pair",
     
     # Supported edge runtimes (can be multiple)
     "edge_runtimes": [
@@ -138,17 +138,27 @@ Twins store per-edge configurations:
 
 ## CLI Commands
 
-### Connect (Unified Entry Point)
+### Twin Create (Create Twin and Optionally Pair)
 
 ```bash
-# Create twin + configure edge in one command
-cyberwave connect camera
+# Create twin only (cloud)
+cyberwave twin create camera
 
-# Connect to existing twin
-cyberwave connect camera --twin-uuid abc-123
+# Create twin + pair device in one command
+cyberwave twin create camera --pair
 
-# Create twin only (no local setup)
-cyberwave connect camera --cloud-only
+# Create twin in specific environment
+cyberwave twin create camera --environment abc-123
+```
+
+### Twin Pair (Pair to Existing Twin)
+
+```bash
+# Pair this device to an existing twin
+cyberwave twin pair <twin-uuid>
+
+# Pair with configuration options
+cyberwave twin pair <twin-uuid> --camera-source "rtsp://..." --fps 15
 ```
 
 ### Pull Configuration
@@ -177,22 +187,22 @@ The CLI resolves assets from multiple sources:
 
 ```bash
 # Registry ID
-cyberwave connect unitree/go2
+cyberwave twin create unitree/go2
 
 # Alias (defined in asset.metadata.aliases)
-cyberwave connect camera
+cyberwave twin create camera
 
 # Local JSON file
-cyberwave connect ./my-camera.json
+cyberwave twin create ./my-camera.json
 
 # URL
-cyberwave connect https://example.com/asset.json
+cyberwave twin create https://example.com/asset.json
 ```
 
 ## Configuration Flow
 
 ```
-1. cyberwave connect camera
+1. cyberwave twin create camera --pair
    ├── Resolve asset (ID/alias/file/URL)
    ├── Generate device fingerprint
    ├── Find existing twin OR create new

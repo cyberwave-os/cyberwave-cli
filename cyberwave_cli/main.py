@@ -4,7 +4,7 @@ import click
 from rich.console import Console
 
 from . import __version__
-from .commands import camera, configure, connect, edge, environment, login, logout, model, pair, plugin, scan, so101, twin, workflow
+from .commands import camera, configure, edge, environment, login, logout, model, plugin, scan, so101, twin, workflow
 
 console = Console()
 
@@ -24,21 +24,26 @@ def cli(ctx: click.Context) -> None:
     \b
     Quick Start:
       1. cyberwave login                             # Login to your account
-      2. cyberwave pair <twin-uuid>                  # Pair device with existing twin
+      2. cyberwave twin create <asset> --pair        # Create twin and pair device
       3. cyberwave edge start                        # Start streaming
 
     \b
-    Connect & Pair:
-      pair        Pair this device with an existing twin
-      connect     Smart connect - create new twin + configure edge in one command
+    Twin Management:
+      twin create     Create a new digital twin from an asset
+      twin pair       Pair this device with an existing twin
+      twin list       List all digital twins
+      twin show       Show details of a specific twin
+      twin delete     Delete a digital twin
+
+    \b
+    Edge & Discovery:
+      edge        Manage edge node (start, stop, pull config)
       scan        Discover IP cameras on the network
 
     \b
     Resource Management:
-      twin        List, show, delete digital twins
       environment List environments
       workflow    Create and manage automation workflows
-      edge        Manage edge node (start, stop, pull config)
 
     \b
     Documentation: https://docs.cyberwave.com
@@ -51,13 +56,11 @@ def cli(ctx: click.Context) -> None:
 # Register commands
 cli.add_command(camera)
 cli.add_command(configure)
-cli.add_command(connect)
 cli.add_command(edge)
 cli.add_command(environment)
 cli.add_command(login)
 cli.add_command(logout)
 cli.add_command(model)
-cli.add_command(pair)
 cli.add_command(plugin)
 cli.add_command(scan)
 cli.add_command(so101)

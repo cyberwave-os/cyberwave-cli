@@ -154,8 +154,8 @@ def write_edge_env(
     """
     Write a .env file for Cyberwave Edge configuration.
     
-    This is a shared utility used by both 'cyberwave connect' and 'cyberwave edge pull'
-    commands to generate consistent .env files.
+    This is a shared utility used by 'cyberwave twin create', 'cyberwave twin pair',
+    and 'cyberwave edge pull' commands to generate consistent .env files.
     
     Args:
         target_dir: Directory to write .env file to

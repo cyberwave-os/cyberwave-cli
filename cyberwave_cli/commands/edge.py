@@ -441,7 +441,7 @@ def _pull_via_discovery_api(fingerprint: str, target_dir: str, yes: bool) -> boo
         
         if not twins:
             print_warning("No twins bound to this edge device.")
-            console.print("[dim]Use 'cyberwave pair <twin_uuid>' to bind twins to this edge.[/dim]")
+            console.print("[dim]Use 'cyberwave twin pair <twin_uuid>' to bind twins to this edge.[/dim]")
             return True
         
         # Display twins and collect configs
@@ -470,7 +470,7 @@ def _pull_via_discovery_api(fingerprint: str, target_dir: str, yes: bool) -> boo
         
         if not all_configs:
             print_warning("No edge configurations found.")
-            console.print("[dim]Use 'cyberwave pair <twin_uuid>' with config options to set up twins.[/dim]")
+            console.print("[dim]Use 'cyberwave twin pair <twin_uuid>' with config options to set up twins.[/dim]")
             return True
         
         # Write .env file
@@ -557,7 +557,7 @@ def _pull_single_twin_config(client: Any, twin_uuid: str, fingerprint: str, targ
                 my_config = default_config.copy()
             else:
                 from ..utils import print_error
-                print_error("No configuration found for this twin", "Use 'cyberwave connect' to set up this twin")
+                print_error("No configuration found for this twin", "Use 'cyberwave twin create <asset> --pair' to set up this twin")
                 return
     
     if not my_config:
@@ -669,7 +669,7 @@ def _pull_environment_configs(client: Any, env_uuid: str, fingerprint: str, targ
         console.print("[dim]Run: python -m cyberwave_edge.service[/dim]")
     else:
         from ..utils import print_warning
-        print_warning("No configs found. Use 'cyberwave connect' to set up twins.")
+        print_warning("No configs found. Use 'cyberwave twin create <asset> --pair' to set up twins.")
 
 
 @edge.command("health")
@@ -882,7 +882,7 @@ def remote_status(twin_uuid: str):
         if not my_config:
             console.print(f"Status:         [yellow]Not registered[/yellow]")
             console.print("\n[dim]This device hasn't connected to this twin yet.[/dim]")
-            console.print("[dim]Use 'cyberwave connect' or 'cyberwave edge pull' first.[/dim]")
+            console.print("[dim]Use 'cyberwave twin pair <uuid>' or 'cyberwave edge pull' first.[/dim]")
             return
         
         # Check last heartbeat
