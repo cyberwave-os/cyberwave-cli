@@ -45,6 +45,77 @@ def edge():
     pass
 
 
+@edge.command("install")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
+def install_edge(yes):
+    """Install cyberwave-edge-core and register it as a boot service.
+
+    Downloads the cyberwave-edge-core package (via apt-get on Debian/Ubuntu)
+    and creates a systemd service so it starts automatically on boot.
+
+    \b
+    Examples:
+        sudo cyberwave edge install
+        sudo cyberwave edge install -y
+    """
+    from ..core import setup_edge_core
+
+    setup_edge_core(skip_confirm=yes)
+
+
+@edge.command("uninstall")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
+def uninstall_edge(yes):
+    """Stop and remove the cyberwave-edge-core service.
+
+    Disables the systemd service, removes the unit file, and optionally
+    uninstalls the package.
+
+    \b
+    Examples:
+        sudo cyberwave edge uninstall
+        sudo cyberwave edge uninstall -y
+    """
+    from ..core import PACKAGE_NAME, SYSTEMD_UNIT_NAME, SYSTEMD_UNIT_PATH, _run
+
+    if not yes:
+        from rich.prompt import Confirm as RichConfirm
+
+        if not RichConfirm.ask(
+            f"Remove {SYSTEMD_UNIT_NAME} and disable boot service?", default=False
+        ):
+            console.print("[dim]Aborted.[/dim]")
+            return
+
+    # Stop and disable the service
+    try:
+        _run(["systemctl", "stop", SYSTEMD_UNIT_NAME], check=False)
+        _run(["systemctl", "disable", SYSTEMD_UNIT_NAME], check=False)
+    except FileNotFoundError:
+        console.print("[yellow]systemctl not found — skipping service cleanup.[/yellow]")
+
+    # Remove the unit file
+    if SYSTEMD_UNIT_PATH.exists():
+        SYSTEMD_UNIT_PATH.unlink()
+        console.print(f"[green]Removed:[/green] {SYSTEMD_UNIT_PATH}")
+        try:
+            _run(["systemctl", "daemon-reload"], check=False)
+        except FileNotFoundError:
+            pass
+
+    # Offer to uninstall the package
+    if not yes:
+        from rich.prompt import Confirm as RichConfirm
+
+        if RichConfirm.ask(f"Also uninstall {PACKAGE_NAME} package?", default=False):
+            try:
+                _run(["apt-get", "remove", "-y", PACKAGE_NAME], check=False)
+            except FileNotFoundError:
+                console.print("[yellow]apt-get not found — remove manually with pip.[/yellow]")
+
+    console.print("[green]Edge core service removed.[/green]")
+
+
 @edge.command("start")
 @click.option("--env-file", type=click.Path(exists=True), default=".env", help="Path to .env file")
 @click.option("--foreground", "-f", is_flag=True, help="Run in foreground (don't daemonize)")
