@@ -1,5 +1,7 @@
 """Login command for the Cyberwave CLI."""
 
+import sys
+
 import click
 from rich.console import Console
 from rich.prompt import Prompt
@@ -13,6 +15,11 @@ console = Console()
 def select_workspace(workspaces: list[Workspace]) -> Workspace:
     """Prompt user to select a workspace if multiple are available."""
     if len(workspaces) == 1:
+        return workspaces[0]
+
+    # Non-interactive: auto-select the first workspace when stdin is not a TTY.
+    if not sys.stdin.isatty():
+        console.print(f"[yellow]Auto-selecting workspace:[/yellow] {workspaces[0].name}")
         return workspaces[0]
 
     console.print("\n[bold]Select a workspace:[/bold]")
@@ -63,8 +70,10 @@ def login(email: str | None, password: str | None) -> None:
                     workspace_info = f" (workspace: [bold]{existing_creds.workspace_name}[/bold])"
                 msg = f"\n[green]✓[/green] Already logged in as [bold]{user.email}[/bold]"
                 console.print(f"{msg}{workspace_info}")
-                if not click.confirm("Do you want to log in with a different account?"):
-                    return
+                # Non-interactive: proceed with re-login (no way to ask).
+                if sys.stdin.isatty():
+                    if not click.confirm("Do you want to log in with a different account?"):
+                        return
         except AuthenticationError:
             # Token is invalid, proceed with new login
             pass

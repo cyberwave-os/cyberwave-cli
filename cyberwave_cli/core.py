@@ -35,9 +35,7 @@ ENVIRONMENT_FILE = CONFIG_DIR / "environment.json"
 FINGERPRINT_FILE = CONFIG_DIR / "fingerprint.json"
 
 # Buildkite Debian registry URL for the cyberwave-edge-core package
-BUILDKITE_DEB_REPO_URL = (
-    "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/any"
-)
+BUILDKITE_DEB_REPO_URL = "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/any"
 
 SYSTEMD_UNIT_TEMPLATE = textwrap.dedent("""\
     [Unit]
@@ -246,9 +244,7 @@ def _workspace_projects(client: Any, workspace_uuid: str) -> list[Any]:
     result = []
     for project in projects:
         project_workspace_uuid = str(
-            getattr(project, "workspace_uuid", "")
-            or getattr(project, "workspace_id", "")
-            or ""
+            getattr(project, "workspace_uuid", "") or getattr(project, "workspace_id", "") or ""
         )
         if project_workspace_uuid == workspace_uuid:
             result.append(project)
@@ -304,9 +300,7 @@ def _select_or_create_environment(client: Any, workspace_uuid: str, *, skip_conf
 
     if not environments:
         console.print("[yellow]No environments found for the selected workspace.[/yellow]")
-        return _create_environment_in_workspace(
-            client, workspace_uuid, skip_confirm=skip_confirm
-        )
+        return _create_environment_in_workspace(client, workspace_uuid, skip_confirm=skip_confirm)
 
     if skip_confirm:
         return environments[0]
@@ -316,9 +310,7 @@ def _select_or_create_environment(client: Any, workspace_uuid: str, *, skip_conf
     idx = _select_with_arrows("Select an environment", labels)
 
     if idx == len(environments):
-        return _create_environment_in_workspace(
-            client, workspace_uuid, skip_confirm=skip_confirm
-        )
+        return _create_environment_in_workspace(client, workspace_uuid, skip_confirm=skip_confirm)
     return environments[idx]
 
 
@@ -429,9 +421,7 @@ def _select_multiple_with_arrows(title: str, options: list[str]) -> list[int]:
         sys.stdout.flush()
 
 
-def _select_connected_twins(
-    client: Any, environment_uuid: str, *, skip_confirm: bool
-) -> list[str]:
+def _select_connected_twins(client: Any, environment_uuid: str, *, skip_confirm: bool) -> list[str]:
     """List twins in environment and ask user which ones are connected."""
     twins = client.twins.list(environment_id=environment_uuid)
     if not twins:
@@ -463,80 +453,22 @@ def _attach_edge_fingerprint_to_twins(
 ) -> tuple[int, int]:
     """Update selected twins metadata with edge_fingerprint.
 
-    Uses direct HTTP to avoid SDK serialization issues with the PUT
-    endpoint (the auto-generated TwinCreateSchema sends default values
-    for every optional field, which can trigger unexpected side-effects).
-
     Returns:
         (updated_count, failed_count)
     """
-    import httpx
-
-    creds = load_credentials()
-    if not creds or not creds.token:
-        console.print("[red]No credentials — cannot update twin metadata.[/red]")
-        return 0, len(twin_uuids)
-
-    base_url = get_api_url()
-    headers = {
-        "Authorization": f"Token {creds.token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
     updated = 0
     failed = 0
 
     for twin_uuid in twin_uuids:
         try:
-            # 1. GET current twin to read existing metadata.
-            get_resp = httpx.get(
-                f"{base_url}/api/v1/twins/{twin_uuid}",
-                headers=headers,
-                timeout=15.0,
-            )
-            if get_resp.status_code != 200:
-                console.print(
-                    f"[yellow]GET twin {twin_uuid[:8]}… returned {get_resp.status_code}[/yellow]"
-                )
-                failed += 1
-                continue
-
-            twin_data = get_resp.json()
-            metadata = twin_data.get("metadata") or {}
+            twin = client.twins.get(twin_uuid)
+            metadata = getattr(twin, "metadata", {}) or {}
             if not isinstance(metadata, dict):
                 metadata = {}
             metadata["edge_fingerprint"] = edge_fingerprint
-
-            # 2. PUT only the metadata field.
-            put_payload = {"metadata": metadata}
-            console.print(
-                f"[dim]  PUT twin {twin_uuid[:8]}… payload={json.dumps(put_payload)[:200]}[/dim]"
-            )
-            put_resp = httpx.put(
-                f"{base_url}/api/v1/twins/{twin_uuid}",
-                headers=headers,
-                json=put_payload,
-                timeout=15.0,
-            )
-            if put_resp.status_code != 200:
-                console.print(
-                    f"[yellow]PUT twin {twin_uuid[:8]}… returned "
-                    f"{put_resp.status_code}: {put_resp.text[:200]}[/yellow]"
-                )
-                failed += 1
-                continue
-
-            # Verify the response includes the updated metadata.
-            put_data = put_resp.json()
-            resp_metadata = put_data.get("metadata", {})
-            console.print(
-                f"[dim]  PUT response metadata={json.dumps(resp_metadata)[:200]}[/dim]"
-            )
-
+            client.twins.update(twin_uuid, metadata=metadata)
             updated += 1
-        except Exception as exc:
-            console.print(f"[yellow]Error updating twin {twin_uuid[:8]}…: {exc}[/yellow]")
+        except Exception:
             failed += 1
 
     return updated, failed
@@ -580,13 +512,9 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
                 selected_twin_uuids,
                 edge_fingerprint,
             )
-            console.print(
-                f"[dim]Updated twins with edge fingerprint: {updated_count}[/dim]"
-            )
+            console.print(f"[dim]Updated twins with edge fingerprint: {updated_count}[/dim]")
             if failed_count:
-                console.print(
-                    f"[yellow]Failed to update {failed_count} twin(s).[/yellow]"
-                )
+                console.print(f"[yellow]Failed to update {failed_count} twin(s).[/yellow]")
 
         _save_environment_file(
             workspace_uuid=workspace.uuid,
@@ -598,9 +526,7 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
 
         console.print("[green]Environment saved:[/green] ~/.cyberwave/environment.json")
         console.print(f"[dim]Environment: {env_name or env_uuid}[/dim]")
-        console.print(
-            f"[dim]Connected twins selected: {len(selected_twin_uuids)}[/dim]"
-        )
+        console.print(f"[dim]Connected twins selected: {len(selected_twin_uuids)}[/dim]")
         return True
     except AuthenticationError as exc:
         console.print(f"[red]Authentication error:[/red] {exc}")
@@ -691,9 +617,7 @@ def create_systemd_service() -> bool:
         return False
 
     binary = (
-        str(BINARY_PATH)
-        if BINARY_PATH.exists()
-        else shutil.which(PACKAGE_NAME) or str(BINARY_PATH)
+        str(BINARY_PATH) if BINARY_PATH.exists() else shutil.which(PACKAGE_NAME) or str(BINARY_PATH)
     )
     unit_contents = SYSTEMD_UNIT_TEMPLATE.format(binary_path=binary)
 
@@ -742,8 +666,7 @@ def setup_edge_core(*, skip_confirm: bool = False) -> bool:
     if not _is_linux():
         console.print("[yellow]Edge core service setup is only supported on Linux.[/yellow]")
         console.print(
-            "[dim]You can still install the package with:"
-            " pip install cyberwave-edge-core[/dim]"
+            "[dim]You can still install the package with: pip install cyberwave-edge-core[/dim]"
         )
         return False
 
