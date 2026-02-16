@@ -556,18 +556,45 @@ def _apt_get_install() -> bool:
         console.print("[cyan]Installing Cyberwave package signing key...[/cyan]")
         try:
             BUILDKITE_KEYRING_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+            # Download the armored GPG key
             curl = subprocess.run(
                 ["curl", "-fsSL", BUILDKITE_GPG_KEY_URL],
                 capture_output=True,
                 check=True,
             )
-            subprocess.run(
-                ["gpg", "--dearmor", "-o", str(BUILDKITE_KEYRING_PATH)],
+            if not curl.stdout:
+                console.print("[red]Downloaded GPG key is empty.[/red]")
+                console.print(f"[dim]URL: {BUILDKITE_GPG_KEY_URL}[/dim]")
+                return False
+
+            # Dearmor into the keyring file
+            gpg = subprocess.run(
+                ["gpg", "--batch", "--yes", "--dearmor", "-o", str(BUILDKITE_KEYRING_PATH)],
                 input=curl.stdout,
-                check=True,
+                capture_output=True,
             )
+            if gpg.returncode != 0:
+                stderr_msg = gpg.stderr.decode(errors="replace").strip()
+                console.print(f"[red]gpg --dearmor failed (exit {gpg.returncode}).[/red]")
+                if stderr_msg:
+                    console.print(f"[dim]{stderr_msg}[/dim]")
+                return False
+
         except subprocess.CalledProcessError as exc:
-            console.print(f"[red]Failed to install GPG key (exit {exc.returncode}).[/red]")
+            stderr_msg = ""
+            if exc.stderr:
+                stderr_msg = exc.stderr.decode(errors="replace").strip()
+            console.print(f"[red]Failed to download GPG key (exit {exc.returncode}).[/red]")
+            if stderr_msg:
+                console.print(f"[dim]{stderr_msg}[/dim]")
+            console.print(f"[dim]URL: {BUILDKITE_GPG_KEY_URL}[/dim]")
+            return False
+        except FileNotFoundError as exc:
+            console.print(f"[red]Required command not found: {exc.filename}[/red]")
+            console.print(
+                "[dim]Ensure curl and gpg are installed: sudo apt-get install curl gnupg[/dim]"
+            )
             return False
         except PermissionError:
             console.print(
