@@ -558,12 +558,15 @@ def _apt_get_install() -> bool:
         try:
             BUILDKITE_KEYRING_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+            child_env = clean_subprocess_env()
+            console.print(f"[dim]LD_LIBRARY_PATH for child: {child_env.get('LD_LIBRARY_PATH', '(unset)')}[/dim]")
+
             # Download the armored GPG key
             curl = subprocess.run(
                 ["curl", "-fsSL", BUILDKITE_GPG_KEY_URL],
                 capture_output=True,
                 check=True,
-                env=clean_subprocess_env(),
+                env=child_env,
             )
             if not curl.stdout:
                 console.print("[red]Downloaded GPG key is empty.[/red]")
@@ -575,7 +578,7 @@ def _apt_get_install() -> bool:
                 ["gpg", "--batch", "--yes", "--dearmor", "-o", str(BUILDKITE_KEYRING_PATH)],
                 input=curl.stdout,
                 capture_output=True,
-                env=clean_subprocess_env(),
+                env=child_env,
             )
             if gpg.returncode != 0:
                 stderr_msg = gpg.stderr.decode(errors="replace").strip()

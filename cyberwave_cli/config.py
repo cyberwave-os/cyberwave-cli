@@ -1,6 +1,7 @@
 """Configuration and constants for the Cyberwave CLI."""
 
 import os
+import sys
 from pathlib import Path
 
 # API endpoints
@@ -39,14 +40,34 @@ def clean_subprocess_env() -> dict[str, str]:
     When the CLI is packaged with PyInstaller, ``LD_LIBRARY_PATH`` is set to the
     temp extraction directory so bundled Python can find its libraries.  Child
     processes (curl, gpg, git, apt-get, systemctl …) that inherit this will load
-    the wrong shared libraries.  PyInstaller saves the original value in
-    ``LD_LIBRARY_PATH_ORIG`` — we restore it here.
+    the wrong shared libraries.
+
+    Strategy (belt-and-suspenders):
+      1. If PyInstaller saved the original value in ``LD_LIBRARY_PATH_ORIG``,
+         restore it.
+      2. Otherwise, if we detect a PyInstaller bundle (``sys._MEIPASS``),
+         strip that path from ``LD_LIBRARY_PATH`` directly.
     """
     env = os.environ.copy()
+
+    # Approach 1: restore the original LD_LIBRARY_PATH saved by PyInstaller.
     orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
     if orig is not None:
         if orig:
             env["LD_LIBRARY_PATH"] = orig
         else:
             env.pop("LD_LIBRARY_PATH", None)
+        return env
+
+    # Approach 2: manually strip the PyInstaller extraction dir.
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        ld_path = env.get("LD_LIBRARY_PATH", "")
+        if ld_path:
+            cleaned = [p for p in ld_path.split(os.pathsep) if p != meipass]
+            if cleaned:
+                env["LD_LIBRARY_PATH"] = os.pathsep.join(cleaned)
+            else:
+                env.pop("LD_LIBRARY_PATH", None)
+
     return env
