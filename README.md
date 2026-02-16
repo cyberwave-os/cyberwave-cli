@@ -13,9 +13,14 @@ pip install cyberwave-cli
 ### From APT (Debian/Ubuntu)
 
 ```bash
+# You may need to install curl and/or gpg first, if you're on a very minimal host:
+sudo apt update && sudo apt install curl gpg -y
+
 # Add Cyberwave repository (one-time setup)
-curl -fsSL https://apt.cyberwave.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/cyberwave-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/cyberwave-archive-keyring.gpg] https://apt.cyberwave.com stable main" | sudo tee /etc/apt/sources.list.d/cyberwave.list
+curl -fsSL "https://packages.buildkite.com/cyberwave/cyberwave-cli/gpgkey" | sudo gpg --dearmor -o /etc/apt/keyrings/cyberwave_cyberwave-cli-archive-keyring.gpg
+
+# Configure the source
+echo -e "deb [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-cli-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-cli/any/ any main\ndeb-src [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-cli-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-cli/any/ any main" | sudo tee /etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-cli.list > /dev/null
 
 # Install
 sudo apt update && sudo apt install cyberwave-cli
