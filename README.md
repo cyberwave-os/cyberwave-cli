@@ -81,22 +81,22 @@ cyberwave login --email you@example.com --password yourpassword
 
 Manage the edge node service lifecycle, configuration, and monitoring.
 
-| Subcommand       | Description                                      |
-| ---------------- | ------------------------------------------------ |
+| Subcommand       | Description                                              |
+| ---------------- | -------------------------------------------------------- |
 | `install`        | Install cyberwave-edge-core and register systemd service |
-| `uninstall`      | Stop and remove the systemd service              |
-| `start`          | Start the edge node                              |
-| `stop`           | Stop the edge node                               |
-| `restart`        | Restart the edge node (systemd or process)       |
-| `status`         | Check if the edge node is running                |
-| `pull`           | Pull edge configuration from backend             |
-| `whoami`         | Show device fingerprint and info                 |
-| `health`         | Check edge health status via MQTT                |
-| `remote-status`  | Check edge status from twin metadata (heartbeat) |
-| `logs`           | Show edge node logs                              |
-| `install-deps`   | Install edge ML dependencies                     |
-| `sync-workflows` | Trigger workflow sync on the edge node           |
-| `list-models`    | List model bindings loaded on the edge node      |
+| `uninstall`      | Stop and remove the systemd service                      |
+| `start`          | Start the edge node                                      |
+| `stop`           | Stop the edge node                                       |
+| `restart`        | Restart the edge node (systemd or process)               |
+| `status`         | Check if the edge node is running                        |
+| `pull`           | Pull edge configuration from backend                     |
+| `whoami`         | Show device fingerprint and info                         |
+| `health`         | Check edge health status via MQTT                        |
+| `remote-status`  | Check edge status from twin metadata (heartbeat)         |
+| `logs`           | Show edge node logs                                      |
+| `install-deps`   | Install edge ML dependencies                             |
+| `sync-workflows` | Trigger workflow sync on the edge node                   |
+| `list-models`    | List model bindings loaded on the edge node              |
 
 ### `cyberwave edge install`
 
@@ -199,9 +199,15 @@ cyberwave edge list-models --twin-uuid <UUID>      # show loaded models
 
 ## Configuration
 
-Credentials are stored in `~/.cyberwave/credentials.json` with restricted permissions (600).
+All configuration is stored in `/etc/cyberwave/` (system-wide, shared with the edge-core service):
 
-Environment variables:
+- `credentials.json` — API token and workspace info (permissions `600`)
+- `environment.json` — selected workspace, environment, and twin bindings
+- `fingerprint.json` — unique edge device identifier
+
+The `CYBERWAVE_EDGE_CONFIG_DIR` environment variable can override the config directory path.
+
+Other environment variables:
 
 - `CYBERWAVE_API_URL`: Override the API URL (default: `https://api.cyberwave.com`)
 
