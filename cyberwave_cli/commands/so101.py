@@ -7,7 +7,7 @@ from pathlib import Path
 import click
 from rich.console import Console
 
-from ..config import SO101_DEFAULT_DIR, SO101_REPO_URL
+from ..config import SO101_DEFAULT_DIR, SO101_REPO_URL, clean_subprocess_env
 from ..credentials import load_credentials
 
 console = Console()
@@ -21,6 +21,7 @@ def run_command(cmd: list[str], cwd: Path | None = None) -> bool:
             cwd=cwd,
             capture_output=True,
             text=True,
+            env=clean_subprocess_env(),
         )
         return result.returncode == 0
     except Exception:
@@ -80,6 +81,7 @@ def so101(path: str) -> None:
         ["git", "clone", SO101_REPO_URL, str(target_path)],
         capture_output=True,
         text=True,
+        env=clean_subprocess_env(),
     )
 
     if result.returncode != 0:
@@ -98,6 +100,7 @@ def so101(path: str) -> None:
         result = subprocess.run(
             ["bash", str(setup_script)],
             cwd=target_path,
+            env=clean_subprocess_env(),
         )
         if result.returncode == 0:
             console.print("[green]✓[/green] Setup completed")
@@ -109,6 +112,7 @@ def so101(path: str) -> None:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", "-e", "."],
             cwd=target_path,
+            env=clean_subprocess_env(),
         )
         if result.returncode == 0:
             console.print("[green]✓[/green] Dependencies installed")

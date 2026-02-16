@@ -13,6 +13,7 @@ from rich.prompt import Prompt
 from ..config import (
     CAMERA_EDGE_DEFAULT_DIR,
     CAMERA_EDGE_REPO_URL,
+    clean_subprocess_env,
     get_api_url,
 )
 from ..credentials import load_credentials
@@ -39,6 +40,7 @@ def run_command(cmd: list[str], cwd: Path | None = None) -> bool:
             cwd=cwd,
             capture_output=True,
             text=True,
+            env=clean_subprocess_env(),
         )
         return result.returncode == 0
     except Exception:
@@ -474,6 +476,7 @@ def camera(
             ["git", "clone", CAMERA_EDGE_REPO_URL, str(target_path)],
             capture_output=True,
             text=True,
+            env=clean_subprocess_env(),
         )
 
         if result.returncode != 0:

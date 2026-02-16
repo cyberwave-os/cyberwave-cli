@@ -138,9 +138,12 @@ def install_plugin(plugin_id, no_deps):
     if not no_deps and info.get("dependencies"):
         console.print(f"[yellow]Installing dependencies...[/yellow]")
         try:
+            from ..config import clean_subprocess_env
+
             subprocess.run(
                 [sys.executable, "-m", "pip", "install"] + info["dependencies"],
                 check=True,
+                env=clean_subprocess_env(),
             )
             console.print("[green]✓ Dependencies installed[/green]")
         except subprocess.CalledProcessError as e:

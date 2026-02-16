@@ -20,7 +20,7 @@ from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
 from .auth import AuthClient, AuthenticationError, Workspace
-from .config import CONFIG_DIR, get_api_url
+from .config import CONFIG_DIR, clean_subprocess_env, get_api_url
 from .credentials import load_credentials
 
 console = Console()
@@ -74,6 +74,7 @@ def _has_systemd() -> bool:
 def _run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.CompletedProcess:
     """Run a subprocess and stream output to the console."""
     console.print(f"[dim]$ {' '.join(cmd)}[/dim]")
+    kwargs.setdefault("env", clean_subprocess_env())
     return subprocess.run(cmd, check=check, **kwargs)
 
 
@@ -562,6 +563,7 @@ def _apt_get_install() -> bool:
                 ["curl", "-fsSL", BUILDKITE_GPG_KEY_URL],
                 capture_output=True,
                 check=True,
+                env=clean_subprocess_env(),
             )
             if not curl.stdout:
                 console.print("[red]Downloaded GPG key is empty.[/red]")
@@ -573,6 +575,7 @@ def _apt_get_install() -> bool:
                 ["gpg", "--batch", "--yes", "--dearmor", "-o", str(BUILDKITE_KEYRING_PATH)],
                 input=curl.stdout,
                 capture_output=True,
+                env=clean_subprocess_env(),
             )
             if gpg.returncode != 0:
                 stderr_msg = gpg.stderr.decode(errors="replace").strip()

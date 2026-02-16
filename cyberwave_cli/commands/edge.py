@@ -133,8 +133,10 @@ def start_edge(env_file, foreground):
     # Change to the directory containing .env
     work_dir = env_path.parent
 
-    # Set environment
-    env = os.environ.copy()
+    # Set environment (use clean env to avoid PyInstaller LD_LIBRARY_PATH leaking)
+    from ..config import clean_subprocess_env
+
+    env = clean_subprocess_env()
     env["DOTENV_PATH"] = str(env_path)
 
     try:
@@ -249,7 +251,9 @@ def restart_edge(env_file):
         console.print("[dim]Pass --env-file or run from the directory containing .env[/dim]")
         return
 
-    env = os.environ.copy()
+    from ..config import clean_subprocess_env
+
+    env = clean_subprocess_env()
     env["DOTENV_PATH"] = str(env_path)
 
     try:
