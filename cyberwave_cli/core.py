@@ -225,14 +225,10 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
         try:
             with AuthClient() as client:
                 user = client.get_current_user(creds.token)
-                console.print(
-                    f"[green]✓[/green] Logged in as [bold]{user.email}[/bold]"
-                )
+                console.print(f"[green]✓[/green] Logged in as [bold]{user.email}[/bold]")
                 return True
         except AuthenticationError:
-            console.print(
-                "[yellow]Stored credentials are invalid or expired.[/yellow]"
-            )
+            console.print("[yellow]Stored credentials are invalid or expired.[/yellow]")
 
     console.print("[yellow]No valid credentials found.[/yellow]")
     console.print("[cyan]Please log in to continue.[/cyan]\n")
@@ -253,29 +249,21 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                     f"[yellow]Logged in as [bold]{user.email}[/bold] "
                     "but no workspaces found.[/yellow]"
                 )
-                console.print(
-                    "[dim]Create a workspace at https://cyberwave.com first.[/dim]"
-                )
+                console.print("[dim]Create a workspace at https://cyberwave.com first.[/dim]")
                 return False
 
             if len(workspaces) == 1:
                 workspace = workspaces[0]
             elif skip_confirm:
                 workspace = workspaces[0]
-                console.print(
-                    f"[yellow]Auto-selecting workspace:[/yellow] {workspace.name}"
-                )
+                console.print(f"[yellow]Auto-selecting workspace:[/yellow] {workspace.name}")
             else:
                 labels = [f"{ws.name} ({ws.uuid[:8]}...)" for ws in workspaces]
                 idx = _select_with_arrows("Select a workspace", labels)
                 workspace = workspaces[idx]
 
-            console.print(
-                f"[dim]Creating API token for workspace '{workspace.name}'...[/dim]"
-            )
-            api_token: APIToken = client.create_api_token(
-                session_token, workspace.uuid
-            )
+            console.print(f"[dim]Creating API token for workspace '{workspace.name}'...[/dim]")
+            api_token: APIToken = client.create_api_token(session_token, workspace.uuid)
 
             save_credentials(
                 Credentials(
@@ -286,9 +274,7 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                 )
             )
 
-            console.print(
-                f"[green]✓[/green] Logged in as [bold]{user.email}[/bold]"
-            )
+            console.print(f"[green]✓[/green] Logged in as [bold]{user.email}[/bold]")
             console.print(f"[dim]Workspace: {workspace.name}[/dim]")
             console.print(f"[dim]Credentials saved to {CONFIG_DIR}/[/dim]\n")
             return True

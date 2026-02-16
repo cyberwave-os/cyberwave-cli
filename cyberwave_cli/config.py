@@ -13,8 +13,40 @@ WORKSPACES_ENDPOINT = "/api/v1/users/workspaces"
 
 # Config directory – system-wide location shared by the CLI, edge-core service,
 # and driver containers.  /etc/cyberwave is the FHS-standard path for
-# system service configuration.  The env var allows override (e.g. in tests).
-CONFIG_DIR = Path(os.getenv("CYBERWAVE_EDGE_CONFIG_DIR", "/etc/cyberwave"))
+# system service configuration.  Falls back to ~/.cyberwave when the user
+# doesn't have write access to /etc (e.g. non-root, CI runners).
+# The env var CYBERWAVE_EDGE_CONFIG_DIR allows explicit override.
+_SYSTEM_CONFIG_DIR = Path("/etc/cyberwave")
+_USER_CONFIG_DIR = Path.home() / ".cyberwave"
+
+
+def _resolve_config_dir() -> Path:
+    """Pick the best writable config directory.
+
+    Priority:
+      1. ``CYBERWAVE_EDGE_CONFIG_DIR`` env var (explicit override)
+      2. ``/etc/cyberwave`` if it exists and is writable, or can be created
+      3. ``~/.cyberwave`` as a fallback for non-root users
+    """
+    env_override = os.getenv("CYBERWAVE_EDGE_CONFIG_DIR")
+    if env_override:
+        return Path(env_override)
+
+    # Prefer /etc/cyberwave if we can write to it
+    if _SYSTEM_CONFIG_DIR.exists() and os.access(_SYSTEM_CONFIG_DIR, os.W_OK):
+        return _SYSTEM_CONFIG_DIR
+
+    # Try to create it (works when running as root)
+    try:
+        _SYSTEM_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        return _SYSTEM_CONFIG_DIR
+    except PermissionError:
+        pass
+
+    return _USER_CONFIG_DIR
+
+
+CONFIG_DIR = _resolve_config_dir()
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 
 # SO-101 starter template

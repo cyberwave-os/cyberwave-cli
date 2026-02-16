@@ -4,7 +4,6 @@ import json
 import os
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 from .config import CONFIG_DIR, CREDENTIALS_FILE
@@ -39,9 +38,13 @@ class Credentials:
 def ensure_config_dir() -> None:
     """Ensure the config directory exists with proper permissions."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    # Set directory permissions to user-only on Unix systems
+    # Best-effort: restrict to owner only.  May fail if the directory is
+    # owned by another user (e.g. root-created /etc/cyberwave on a CI runner).
     if os.name != "nt":
-        os.chmod(CONFIG_DIR, 0o700)
+        try:
+            os.chmod(CONFIG_DIR, 0o700)
+        except PermissionError:
+            pass
 
 
 def save_credentials(credentials: Credentials) -> None:
@@ -55,9 +58,12 @@ def save_credentials(credentials: Credentials) -> None:
     with open(CREDENTIALS_FILE, "w") as f:
         json.dump(credentials.to_dict(), f, indent=2)
 
-    # Set file permissions to user-only on Unix systems
+    # Best-effort permission restriction.
     if os.name != "nt":
-        os.chmod(CREDENTIALS_FILE, 0o600)
+        try:
+            os.chmod(CREDENTIALS_FILE, 0o600)
+        except PermissionError:
+            pass
 
 
 def load_credentials() -> Optional[Credentials]:
