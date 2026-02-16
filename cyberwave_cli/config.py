@@ -11,8 +11,10 @@ AUTH_USER_ENDPOINT = "/dj-rest-auth/user/"
 API_TOKENS_ENDPOINT = "/api-tokens/"
 WORKSPACES_ENDPOINT = "/api/v1/users/workspaces"
 
-# Config directory
-CONFIG_DIR = Path.home() / ".cyberwave"
+# Config directory – system-wide location shared by the CLI, edge-core service,
+# and driver containers.  /etc/cyberwave is the FHS-standard path for
+# system service configuration.  The env var allows override (e.g. in tests).
+CONFIG_DIR = Path(os.getenv("CYBERWAVE_EDGE_CONFIG_DIR", "/etc/cyberwave"))
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 
 # SO-101 starter template

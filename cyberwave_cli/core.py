@@ -215,9 +215,10 @@ def _load_or_generate_edge_fingerprint() -> str:
 
 
 def _ensure_credentials(*, skip_confirm: bool) -> bool:
-    """Check for credentials and run login flow inline if missing.
+    """Ensure valid credentials exist in /etc/cyberwave/ before installing.
 
-    Returns True when valid credentials are available afterward.
+    If saved credentials are found and valid, returns True immediately.
+    Otherwise prompts for email/password and runs the full login flow.
     """
     creds = load_credentials()
     if creds and creds.token:
@@ -229,7 +230,9 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                 )
                 return True
         except AuthenticationError:
-            console.print("[yellow]Stored credentials are invalid or expired.[/yellow]")
+            console.print(
+                "[yellow]Stored credentials are invalid or expired.[/yellow]"
+            )
 
     console.print("[yellow]No valid credentials found.[/yellow]")
     console.print("[cyan]Please log in to continue.[/cyan]\n")
@@ -259,14 +262,20 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                 workspace = workspaces[0]
             elif skip_confirm:
                 workspace = workspaces[0]
-                console.print(f"[yellow]Auto-selecting workspace:[/yellow] {workspace.name}")
+                console.print(
+                    f"[yellow]Auto-selecting workspace:[/yellow] {workspace.name}"
+                )
             else:
                 labels = [f"{ws.name} ({ws.uuid[:8]}...)" for ws in workspaces]
                 idx = _select_with_arrows("Select a workspace", labels)
                 workspace = workspaces[idx]
 
-            console.print(f"[dim]Creating API token for workspace '{workspace.name}'...[/dim]")
-            api_token: APIToken = client.create_api_token(session_token, workspace.uuid)
+            console.print(
+                f"[dim]Creating API token for workspace '{workspace.name}'...[/dim]"
+            )
+            api_token: APIToken = client.create_api_token(
+                session_token, workspace.uuid
+            )
 
             save_credentials(
                 Credentials(
@@ -277,9 +286,11 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                 )
             )
 
-            console.print(f"[green]✓[/green] Logged in as [bold]{user.email}[/bold]")
+            console.print(
+                f"[green]✓[/green] Logged in as [bold]{user.email}[/bold]"
+            )
             console.print(f"[dim]Workspace: {workspace.name}[/dim]")
-            console.print("[dim]Credentials saved to ~/.cyberwave/credentials.json[/dim]\n")
+            console.print(f"[dim]Credentials saved to {CONFIG_DIR}/[/dim]\n")
             return True
 
     except AuthenticationError as exc:
@@ -551,7 +562,7 @@ def _attach_edge_fingerprint_to_twins(
 
 
 def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
-    """Select workspace + environment and save ~/.cyberwave/environment.json."""
+    """Select workspace + environment and save /etc/cyberwave/environment.json."""
     creds = load_credentials()
     if not creds or not creds.token:
         console.print("[red]No credentials found.[/red]")
@@ -600,7 +611,7 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
             twin_uuids=selected_twin_uuids,
         )
 
-        console.print("[green]Environment saved:[/green] ~/.cyberwave/environment.json")
+        console.print(f"[green]Environment saved:[/green] {ENVIRONMENT_FILE}")
         console.print(f"[dim]Environment: {env_name or env_uuid}[/dim]")
         console.print(f"[dim]Connected twins selected: {len(selected_twin_uuids)}[/dim]")
         return True
@@ -632,7 +643,9 @@ def _apt_get_install() -> bool:
             BUILDKITE_KEYRING_PATH.parent.mkdir(parents=True, exist_ok=True)
 
             child_env = clean_subprocess_env()
-            console.print(f"[dim]LD_LIBRARY_PATH for child: {child_env.get('LD_LIBRARY_PATH', '(unset)')}[/dim]")
+            console.print(
+                f"[dim]LD_LIBRARY_PATH for child: {child_env.get('LD_LIBRARY_PATH', '(unset)')}[/dim]"
+            )
 
             # Download the armored GPG key
             curl = subprocess.run(

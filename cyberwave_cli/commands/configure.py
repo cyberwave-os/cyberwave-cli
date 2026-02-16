@@ -90,7 +90,7 @@ def configure(token: str | None, api_url: str | None, show: bool) -> None:
 
     # Save credentials
     save_credentials(Credentials(token=token))
-    console.print("[green]✓[/green] Token saved to ~/.cyberwave/credentials.json")
+    console.print("[green]✓[/green] Token saved to /etc/cyberwave/credentials.json")
     
     if api_url:
         console.print(f"\n[dim]Note: To use {api_url} permanently, set:[/dim]")

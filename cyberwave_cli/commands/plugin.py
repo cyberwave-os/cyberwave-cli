@@ -31,7 +31,9 @@ console = Console()
 
 def get_plugins_dir() -> Path:
     """Get the plugins directory."""
-    return Path.home() / ".cyberwave" / "plugins"
+    from ..config import CONFIG_DIR
+
+    return CONFIG_DIR / "plugins"
 
 
 def load_registry() -> dict:

@@ -21,4 +21,4 @@ def logout() -> None:
 
     clear_credentials()
     console.print("\n[green]✓[/green] Successfully logged out")
-    console.print("[dim]Credentials removed from ~/.cyberwave/credentials.json[/dim]")
+    console.print("[dim]Credentials removed from /etc/cyberwave/credentials.json[/dim]")
