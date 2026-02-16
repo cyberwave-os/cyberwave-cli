@@ -34,8 +34,10 @@ SYSTEMD_UNIT_PATH = Path(f"/etc/systemd/system/{SYSTEMD_UNIT_NAME}")
 ENVIRONMENT_FILE = CONFIG_DIR / "environment.json"
 FINGERPRINT_FILE = CONFIG_DIR / "fingerprint.json"
 
-# Buildkite Debian registry URL for the cyberwave-edge-core package
-BUILDKITE_DEB_REPO_URL = "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/any"
+# Buildkite Debian registry for the cyberwave-edge-core package
+BUILDKITE_DEB_REPO_URL = "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/"
+BUILDKITE_GPG_KEY_URL = "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/gpgkey"
+BUILDKITE_KEYRING_PATH = Path("/etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg")
 
 SYSTEMD_UNIT_TEMPLATE = textwrap.dedent("""\
     [Unit]
@@ -542,18 +544,48 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
 def _apt_get_install() -> bool:
     """Install cyberwave-edge-core via apt-get.
 
-    Adds the Buildkite package registry if not already configured,
-    then installs (or upgrades) the package.
+    Adds the Buildkite package registry GPG key and source if not already
+    configured, then installs (or upgrades) the latest version of the package.
 
     Returns True on success.
     """
-    sources_list = Path("/etc/apt/sources.list.d/cyberwave-edge-core.list")
+    sources_list = Path("/etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-edge-core.list")
+
+    # Install the GPG signing key if missing
+    if not BUILDKITE_KEYRING_PATH.exists():
+        console.print("[cyan]Installing Cyberwave package signing key...[/cyan]")
+        try:
+            BUILDKITE_KEYRING_PATH.parent.mkdir(parents=True, exist_ok=True)
+            curl = subprocess.run(
+                ["curl", "-fsSL", BUILDKITE_GPG_KEY_URL],
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                ["gpg", "--dearmor", "-o", str(BUILDKITE_KEYRING_PATH)],
+                input=curl.stdout,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            console.print(f"[red]Failed to install GPG key (exit {exc.returncode}).[/red]")
+            return False
+        except PermissionError:
+            console.print(
+                "[red]Permission denied installing GPG key.[/red]\n"
+                "[dim]Re-run with sudo: sudo cyberwave edge install[/dim]"
+            )
+            return False
 
     # Add the repository if missing
     if not sources_list.exists():
         console.print("[cyan]Adding Cyberwave package repository...[/cyan]")
+        signed_by = f"signed-by={BUILDKITE_KEYRING_PATH}"
+        source_lines = (
+            f"deb [{signed_by}] {BUILDKITE_DEB_REPO_URL} any main\n"
+            f"deb-src [{signed_by}] {BUILDKITE_DEB_REPO_URL} any main\n"
+        )
         try:
-            sources_list.write_text(f"deb {BUILDKITE_DEB_REPO_URL} /\n")
+            sources_list.write_text(source_lines)
         except PermissionError:
             console.print(
                 "[red]Permission denied writing apt sources.[/red]\n"
@@ -561,7 +593,7 @@ def _apt_get_install() -> bool:
             )
             return False
 
-    # Update and install
+    # Update and install the latest version
     console.print(f"[cyan]Installing {PACKAGE_NAME} via apt-get...[/cyan]")
     try:
         _run(["apt-get", "update", "-qq"])
@@ -652,6 +684,29 @@ def enable_and_start_service() -> bool:
         return False
 
     console.print(f"[green]Service enabled and started:[/green] {SYSTEMD_UNIT_NAME}")
+    return True
+
+
+def restart_service() -> bool:
+    """Restart the cyberwave-edge-core systemd service.
+
+    Returns True on success.
+    """
+    if not _has_systemd():
+        console.print("[yellow]systemd not detected — cannot restart via systemd.[/yellow]")
+        return False
+
+    if not SYSTEMD_UNIT_PATH.exists():
+        console.print("[red]Service unit not found — run 'cyberwave edge install' first.[/red]")
+        return False
+
+    try:
+        _run(["systemctl", "restart", SYSTEMD_UNIT_NAME])
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]systemctl restart failed (exit {exc.returncode}).[/red]")
+        return False
+
+    console.print(f"[green]Service restarted:[/green] {SYSTEMD_UNIT_NAME}")
     return True
 
 

@@ -34,42 +34,42 @@ cd cyberwave-cli
 pip install -e .
 ```
 
-## Quick Start
+## Quick Start - Edge
 
-### 1. Authenticate
-
-```bash
-cyberwave-cli login
-```
-
-Enter your email and password when prompted. Your credentials are stored locally at `~/.cyberwave/credentials.json`.
-
-### 2. Bootstrap a Project
+### 1. SSH into your edge device
 
 ```bash
-cyberwave-cli so101
+ssh yourhost@your-ip
 ```
 
-This clones the SO-101 robot arm starter template and runs the setup scripts.
+### 2. Set up your Edge device
+
+Once you are in your edge device, set it up by:
+
+```bash
+cyberwave edge install
+```
+
+This command will guide you to your first-time setup of your edge device.
 
 ## Commands
 
-| Command  | Description                                   |
-| -------- | --------------------------------------------- |
-| `login`  | Authenticate with Cyberwave                   |
-| `logout` | Remove stored credentials                     |
-| `so101`  | Clone and set up the SO-101 robot arm project |
+| Command  | Description                 |
+| -------- | --------------------------- |
+| `login`  | Authenticate with Cyberwave |
+| `logout` | Remove stored credentials   |
+| `core`   | Visualize the core commands |
 
-### `cyberwave-cli login`
+### `cyberwave login`
 
 Authenticates with Cyberwave using your email and password.
 
 ```bash
 # Interactive login (prompts for credentials)
-cyberwave-cli login
+cyberwave login
 
 # Non-interactive login
-cyberwave-cli login --email you@example.com --password yourpassword
+cyberwave login --email you@example.com --password yourpassword
 ```
 
 **Options:**
@@ -77,21 +77,125 @@ cyberwave-cli login --email you@example.com --password yourpassword
 - `-e, --email`: Email address
 - `-p, --password`: Password (will prompt if not provided)
 
-### `cyberwave-cli so101 [path]`
+## `cyberwave edge`
 
-Bootstraps a new SO-101 robot arm project.
+Manage the edge node service lifecycle, configuration, and monitoring.
+
+| Subcommand       | Description                                      |
+| ---------------- | ------------------------------------------------ |
+| `install`        | Install cyberwave-edge-core and register systemd service |
+| `uninstall`      | Stop and remove the systemd service              |
+| `start`          | Start the edge node                              |
+| `stop`           | Stop the edge node                               |
+| `restart`        | Restart the edge node (systemd or process)       |
+| `status`         | Check if the edge node is running                |
+| `pull`           | Pull edge configuration from backend             |
+| `whoami`         | Show device fingerprint and info                 |
+| `health`         | Check edge health status via MQTT                |
+| `remote-status`  | Check edge status from twin metadata (heartbeat) |
+| `logs`           | Show edge node logs                              |
+| `install-deps`   | Install edge ML dependencies                     |
+| `sync-workflows` | Trigger workflow sync on the edge node           |
+| `list-models`    | List model bindings loaded on the edge node      |
+
+### `cyberwave edge install`
+
+Installs the `cyberwave-edge-core` package (via apt-get on Debian/Ubuntu) and creates a systemd service so it starts on boot. Guides you through workspace and environment selection.
 
 ```bash
-# Clone to default directory (./so101-project)
-cyberwave-cli so101
-
-# Clone to custom directory
-cyberwave-cli so101 ~/projects/my-robot
+sudo cyberwave edge install
+sudo cyberwave edge install -y   # skip prompts
 ```
 
-**Arguments:**
+### `cyberwave edge uninstall`
 
-- `path` (optional): Target directory for the project. Defaults to `./so101-project`
+Stops the systemd service, removes the unit file, and optionally uninstalls the package.
+
+```bash
+sudo cyberwave edge uninstall
+```
+
+### `cyberwave edge start / stop / restart`
+
+```bash
+cyberwave edge start                        # background
+cyberwave edge start -f                     # foreground
+cyberwave edge start --env-file ./my/.env   # custom config
+
+cyberwave edge stop
+
+sudo cyberwave edge restart                 # systemd
+cyberwave edge restart --env-file .env      # process mode
+```
+
+### `cyberwave edge status`
+
+Checks whether the edge node process is running.
+
+```bash
+cyberwave edge status
+```
+
+### `cyberwave edge pull`
+
+Pulls edge configuration from the backend using the discovery API (or legacy twin/environment lookup).
+
+```bash
+cyberwave edge pull                              # auto-discover via fingerprint
+cyberwave edge pull --twin-uuid <UUID>           # single twin (legacy)
+cyberwave edge pull --environment-uuid <UUID>    # all twins in environment (legacy)
+cyberwave edge pull -d ./my-edge                 # custom output directory
+```
+
+### `cyberwave edge whoami`
+
+Displays the unique hardware fingerprint for this device, used to identify the edge when connecting to twins.
+
+```bash
+cyberwave edge whoami
+```
+
+### `cyberwave edge health`
+
+Queries real-time health status via MQTT (stream states, FPS, WebRTC connections).
+
+```bash
+cyberwave edge health -t <TWIN_UUID>
+cyberwave edge health -t <TWIN_UUID> --watch     # continuous
+cyberwave edge health -t <TWIN_UUID> --timeout 10
+```
+
+### `cyberwave edge remote-status`
+
+Checks the last heartbeat stored in twin metadata to determine online/offline status without MQTT.
+
+```bash
+cyberwave edge remote-status -t <TWIN_UUID>
+```
+
+### `cyberwave edge logs`
+
+```bash
+cyberwave edge logs              # last 50 lines
+cyberwave edge logs -n 100       # last 100 lines
+cyberwave edge logs -f           # follow (tail -f)
+```
+
+### `cyberwave edge install-deps`
+
+Installs common ML runtimes needed by edge plugins.
+
+```bash
+cyberwave edge install-deps                       # ultralytics + opencv
+cyberwave edge install-deps -r onnx -r tflite     # specific runtimes
+```
+
+### `cyberwave edge sync-workflows / list-models`
+
+```bash
+cyberwave edge sync-workflows --twin-uuid <UUID>  # re-sync model bindings
+cyberwave edge list-models --twin-uuid <UUID>      # show loaded models
+```
 
 ## Configuration
 
