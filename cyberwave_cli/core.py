@@ -19,9 +19,9 @@ from typing import Any
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
-from .auth import AuthClient, AuthenticationError, Workspace
+from .auth import APIToken, AuthClient, AuthenticationError, Workspace
 from .config import CONFIG_DIR, clean_subprocess_env, get_api_url
-from .credentials import load_credentials
+from .credentials import Credentials, load_credentials, save_credentials
 
 console = Console()
 
@@ -212,6 +212,79 @@ def _load_or_generate_edge_fingerprint() -> str:
     from .fingerprint import generate_fingerprint
 
     return generate_fingerprint()
+
+
+def _ensure_credentials(*, skip_confirm: bool) -> bool:
+    """Check for credentials and run login flow inline if missing.
+
+    Returns True when valid credentials are available afterward.
+    """
+    creds = load_credentials()
+    if creds and creds.token:
+        try:
+            with AuthClient() as client:
+                user = client.get_current_user(creds.token)
+                console.print(
+                    f"[green]✓[/green] Logged in as [bold]{user.email}[/bold]"
+                )
+                return True
+        except AuthenticationError:
+            console.print("[yellow]Stored credentials are invalid or expired.[/yellow]")
+
+    console.print("[yellow]No valid credentials found.[/yellow]")
+    console.print("[cyan]Please log in to continue.[/cyan]\n")
+
+    email = Prompt.ask("[bold]Email[/bold]")
+    password = Prompt.ask("[bold]Password[/bold]", password=True)
+
+    console.print("\n[dim]Authenticating...[/dim]")
+
+    try:
+        with AuthClient() as client:
+            session_token = client.login(email, password)
+            user = client.get_current_user(session_token)
+            workspaces = client.get_workspaces(session_token)
+
+            if not workspaces:
+                console.print(
+                    f"[yellow]Logged in as [bold]{user.email}[/bold] "
+                    "but no workspaces found.[/yellow]"
+                )
+                console.print(
+                    "[dim]Create a workspace at https://cyberwave.com first.[/dim]"
+                )
+                return False
+
+            if len(workspaces) == 1:
+                workspace = workspaces[0]
+            elif skip_confirm:
+                workspace = workspaces[0]
+                console.print(f"[yellow]Auto-selecting workspace:[/yellow] {workspace.name}")
+            else:
+                labels = [f"{ws.name} ({ws.uuid[:8]}...)" for ws in workspaces]
+                idx = _select_with_arrows("Select a workspace", labels)
+                workspace = workspaces[idx]
+
+            console.print(f"[dim]Creating API token for workspace '{workspace.name}'...[/dim]")
+            api_token: APIToken = client.create_api_token(session_token, workspace.uuid)
+
+            save_credentials(
+                Credentials(
+                    token=api_token.token,
+                    email=user.email,
+                    workspace_uuid=workspace.uuid,
+                    workspace_name=workspace.name,
+                )
+            )
+
+            console.print(f"[green]✓[/green] Logged in as [bold]{user.email}[/bold]")
+            console.print(f"[dim]Workspace: {workspace.name}[/dim]")
+            console.print("[dim]Credentials saved to ~/.cyberwave/credentials.json[/dim]\n")
+            return True
+
+    except AuthenticationError as exc:
+        console.print(f"[red]Login failed:[/red] {exc}")
+        return False
 
 
 def _select_workspace(token: str, *, skip_confirm: bool) -> Workspace:
@@ -763,6 +836,10 @@ def setup_edge_core(*, skip_confirm: bool = False) -> bool:
             "[red]Root privileges required.[/red]\n"
             "[dim]Re-run with sudo: sudo cyberwave edge install[/dim]"
         )
+        return False
+
+    # Ensure the user is logged in before starting the installation.
+    if not _ensure_credentials(skip_confirm=skip_confirm):
         return False
 
     if not skip_confirm:
