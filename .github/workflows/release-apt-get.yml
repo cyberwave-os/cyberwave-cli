@@ -64,7 +64,7 @@ jobs:
 
       - name: Verify binary works
         run: |
-          ./dist/cyberwave-cli --version || ./dist/cyberwave-cli --help
+          ./dist/cyberwave --version || ./dist/cyberwave --help
           echo "✅ Binary verification passed"
 
       - name: Create Debian package structure
@@ -78,8 +78,8 @@ jobs:
           mkdir -p "${PKG_DIR}/usr/share/doc/${PACKAGE_NAME}"
 
           # Copy binary
-          cp dist/cyberwave-cli "${PKG_DIR}/usr/bin/"
-          chmod 755 "${PKG_DIR}/usr/bin/cyberwave-cli"
+          cp dist/cyberwave "${PKG_DIR}/usr/bin/"
+          chmod 755 "${PKG_DIR}/usr/bin/cyberwave"
 
           # Create control file
           cat > "${PKG_DIR}/DEBIAN/control" << EOF
