@@ -3,6 +3,7 @@
 import click
 from rich.console import Console
 
+from ..config import CREDENTIALS_FILE
 from ..credentials import clear_credentials, load_credentials
 
 console = Console()
@@ -21,4 +22,4 @@ def logout() -> None:
 
     clear_credentials()
     console.print("\n[green]✓[/green] Successfully logged out")
-    console.print("[dim]Credentials removed from /etc/cyberwave/credentials.json[/dim]")
+    console.print(f"[dim]Credentials removed from {CREDENTIALS_FILE}[/dim]")

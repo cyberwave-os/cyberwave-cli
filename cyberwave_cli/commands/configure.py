@@ -4,7 +4,7 @@ import click
 from rich.console import Console
 from rich.prompt import Prompt
 
-from ..config import get_api_url
+from ..config import CREDENTIALS_FILE, get_api_url
 from ..credentials import Credentials, load_credentials, save_credentials
 
 console = Console()
@@ -90,7 +90,7 @@ def configure(token: str | None, api_url: str | None, show: bool) -> None:
 
     # Save credentials
     save_credentials(Credentials(token=token))
-    console.print("[green]✓[/green] Token saved to /etc/cyberwave/credentials.json")
+    console.print(f"[green]✓[/green] Token saved to {CREDENTIALS_FILE}")
     
     if api_url:
         console.print(f"\n[dim]Note: To use {api_url} permanently, set:[/dim]")

@@ -4,7 +4,7 @@ import click
 from rich.console import Console
 
 from . import __version__
-from .commands import camera, configure, edge, environment, login, logout, model, plugin, scan, so101, twin, workflow
+from .commands import camera, config_dir, configure, edge, environment, login, logout, model, plugin, scan, so101, twin, workflow
 
 console = Console()
 
@@ -55,6 +55,7 @@ def cli(ctx: click.Context) -> None:
 
 # Register commands
 cli.add_command(camera)
+cli.add_command(config_dir)
 cli.add_command(configure)
 cli.add_command(edge)
 cli.add_command(environment)

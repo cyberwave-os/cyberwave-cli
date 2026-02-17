@@ -127,7 +127,9 @@ def login(email: str | None, password: str | None) -> None:
 
             console.print(f"\n[green]✓[/green] Successfully logged in as [bold]{user.email}[/bold]")
             console.print(f"[dim]Workspace: {workspace.name}[/dim]")
-            console.print("[dim]API token saved to /etc/cyberwave/credentials.json[/dim]")
+            from ..config import CREDENTIALS_FILE
+
+            console.print(f"[dim]API token saved to {CREDENTIALS_FILE}[/dim]")
 
     except AuthenticationError as e:
         console.print(f"\n[red]✗[/red] Login failed: {e}")

@@ -54,11 +54,12 @@ This command will guide you to your first-time setup of your edge device.
 
 ## Commands
 
-| Command  | Description                 |
-| -------- | --------------------------- |
-| `login`  | Authenticate with Cyberwave |
-| `logout` | Remove stored credentials   |
-| `core`   | Visualize the core commands |
+| Command      | Description                              |
+| ------------ | ---------------------------------------- |
+| `login`      | Authenticate with Cyberwave              |
+| `logout`     | Remove stored credentials                |
+| `config-dir` | Print the active configuration directory |
+| `core`       | Visualize the core commands              |
 
 ### `cyberwave login`
 
@@ -76,6 +77,25 @@ cyberwave login --email you@example.com --password yourpassword
 
 - `-e, --email`: Email address
 - `-p, --password`: Password (will prompt if not provided)
+
+### `cyberwave config-dir`
+
+Prints the resolved configuration directory path. Useful in scripts to locate credentials and config files without hardcoding paths.
+
+```bash
+cyberwave config-dir
+# /etc/cyberwave
+
+# Use in a script
+CONFIG_DIR=$(cyberwave config-dir)
+cat "$CONFIG_DIR/credentials.json"
+```
+
+The CLI resolves the directory with the following priority:
+
+1. `CYBERWAVE_EDGE_CONFIG_DIR` environment variable (explicit override)
+2. `/etc/cyberwave` if writable or creatable (system-wide, preferred)
+3. `~/.cyberwave` as a fallback for non-root users
 
 ## `cyberwave edge`
 
@@ -199,13 +219,19 @@ cyberwave edge list-models --twin-uuid <UUID>      # show loaded models
 
 ## Configuration
 
-All configuration is stored in `/etc/cyberwave/` (system-wide, shared with the edge-core service):
+Configuration is stored in a single directory shared by the CLI and the edge-core service. The directory is resolved as follows:
+
+1. **`CYBERWAVE_EDGE_CONFIG_DIR`** env var — explicit override
+2. **`/etc/cyberwave`** — system-wide (preferred, requires root or write access)
+3. **`~/.cyberwave`** — per-user fallback for non-root environments
+
+Run `cyberwave config-dir` to see which directory is active.
+
+**Files inside the config directory:**
 
 - `credentials.json` — API token and workspace info (permissions `600`)
 - `environment.json` — selected workspace, environment, and twin bindings
 - `fingerprint.json` — unique edge device identifier
-
-The `CYBERWAVE_EDGE_CONFIG_DIR` environment variable can override the config directory path.
 
 Other environment variables:
 
