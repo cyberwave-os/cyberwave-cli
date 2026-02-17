@@ -60,7 +60,8 @@ def install_edge(yes):
     """
     from ..core import setup_edge_core
 
-    setup_edge_core(skip_confirm=yes)
+    if not setup_edge_core(skip_confirm=yes):
+        raise SystemExit(1)
 
 
 @edge.command("uninstall")
