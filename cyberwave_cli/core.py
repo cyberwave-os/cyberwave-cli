@@ -227,8 +227,9 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                 user = client.get_current_user(creds.token)
                 console.print(f"[green]✓[/green] Logged in as [bold]{user.email}[/bold]")
                 return True
-        except AuthenticationError:
+        except AuthenticationError as e:
             console.print("[yellow]Stored credentials are invalid or expired.[/yellow]")
+            console.print(e)  # print the error for debugging purposes
 
     console.print("[yellow]No valid credentials found.[/yellow]")
     console.print("[cyan]Please log in to continue.[/cyan]\n")
