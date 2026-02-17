@@ -116,17 +116,42 @@ def _select_with_arrows(title: str, options: list[str]) -> int:
             console.print(f"[red]Please enter a number between 1 and {len(options)}[/red]")
 
     selected = 0
+    scroll_offset = 0
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
 
+    try:
+        term_height = shutil.get_terminal_size().lines
+    except Exception:
+        term_height = 24
+    # Reserve lines for: title(1) + instructions(1) + blank(1) + scroll indicators(2)
+    max_visible = max(5, term_height - 5)
+
     def _render() -> None:
-        # Clear screen and draw menu every keypress for a simple TUI.
+        nonlocal scroll_offset
+        # Keep selected item within the visible viewport
+        if selected < scroll_offset:
+            scroll_offset = selected
+        elif selected >= scroll_offset + max_visible:
+            scroll_offset = selected - max_visible + 1
+
         sys.stdout.write("\x1b[2J\x1b[H")
         sys.stdout.write(f"{title}\n")
         sys.stdout.write("Use \u2191/\u2193 and press Enter\n\n")
-        for idx, option in enumerate(options):
+
+        visible_end = min(scroll_offset + max_visible, len(options))
+
+        if scroll_offset > 0:
+            sys.stdout.write(f"  \u2191 {scroll_offset} more above\n")
+
+        for idx in range(scroll_offset, visible_end):
             prefix = "❯" if idx == selected else " "
-            sys.stdout.write(f"{prefix} {option}\n")
+            sys.stdout.write(f"{prefix} {options[idx]}\n")
+
+        remaining = len(options) - visible_end
+        if remaining > 0:
+            sys.stdout.write(f"  \u2193 {remaining} more below\n")
+
         sys.stdout.flush()
 
     try:
@@ -443,18 +468,42 @@ def _select_multiple_with_arrows(title: str, options: list[str]) -> list[int]:
         return selected_fallback
 
     cursor = 0
+    scroll_offset = 0
     selected: set[int] = set()
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
 
+    try:
+        term_height = shutil.get_terminal_size().lines
+    except Exception:
+        term_height = 24
+    max_visible = max(5, term_height - 5)
+
     def _render() -> None:
+        nonlocal scroll_offset
+        if cursor < scroll_offset:
+            scroll_offset = cursor
+        elif cursor >= scroll_offset + max_visible:
+            scroll_offset = cursor - max_visible + 1
+
         sys.stdout.write("\x1b[2J\x1b[H")
         sys.stdout.write(f"{title}\n")
-        sys.stdout.write("Use ↑/↓ to move, Space to toggle, Enter to confirm\n\n")
-        for idx, option in enumerate(options):
+        sys.stdout.write("Use \u2191/\u2193 to move, Space to toggle, Enter to confirm\n\n")
+
+        visible_end = min(scroll_offset + max_visible, len(options))
+
+        if scroll_offset > 0:
+            sys.stdout.write(f"  \u2191 {scroll_offset} more above\n")
+
+        for idx in range(scroll_offset, visible_end):
             cursor_mark = "❯" if idx == cursor else " "
             selected_mark = "[x]" if idx in selected else "[ ]"
-            sys.stdout.write(f"{cursor_mark} {selected_mark} {option}\n")
+            sys.stdout.write(f"{cursor_mark} {selected_mark} {options[idx]}\n")
+
+        remaining = len(options) - visible_end
+        if remaining > 0:
+            sys.stdout.write(f"  \u2193 {remaining} more below\n")
+
         sys.stdout.flush()
 
     try:

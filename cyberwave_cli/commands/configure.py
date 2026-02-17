@@ -42,7 +42,7 @@ def configure(token: str | None, api_url: str | None, show: bool) -> None:
         creds = load_credentials()
         console.print("\n[bold]Current Configuration:[/bold]")
         console.print(f"  API URL: [cyan]{get_api_url()}[/cyan]")
-        
+
         if creds:
             console.print(f"  Token: [dim]{creds.token[:20]}...{creds.token[-8:]}[/dim]")
             if creds.email:
@@ -51,30 +51,33 @@ def configure(token: str | None, api_url: str | None, show: bool) -> None:
                 console.print(f"  Workspace: [cyan]{creds.workspace_name}[/cyan]")
         else:
             console.print("  Token: [yellow]Not configured[/yellow]")
-        
-        console.print("\n[dim]Tip: Set CYBERWAVE_API_URL environment variable to change API URL[/dim]")
+
+        console.print(
+            "\n[dim]Tip: Set CYBERWAVE_API_URL environment variable to change API URL[/dim]"
+        )
         return
 
     if not token:
         token = Prompt.ask("[bold]Enter API token[/bold]")
-    
+
     if not token:
         console.print("[red]✗[/red] Token is required")
         raise click.Abort()
 
     # Test the token
     import httpx
+
     test_url = api_url or get_api_url()
-    
+
     console.print(f"\n[dim]Testing token against {test_url}...[/dim]")
-    
+
     try:
         response = httpx.get(
             f"{test_url}/api/v1/environments",
             headers={"Authorization": f"Token {token}"},
             timeout=10.0,
         )
-        
+
         if response.status_code == 200:
             console.print("[green]✓[/green] Token is valid")
         elif response.status_code == 401:
@@ -91,7 +94,7 @@ def configure(token: str | None, api_url: str | None, show: bool) -> None:
     # Save credentials
     save_credentials(Credentials(token=token))
     console.print(f"[green]✓[/green] Token saved to {CREDENTIALS_FILE}")
-    
+
     if api_url:
         console.print(f"\n[dim]Note: To use {api_url} permanently, set:[/dim]")
         console.print(f"  [cyan]export CYBERWAVE_API_URL={api_url}[/cyan]")
