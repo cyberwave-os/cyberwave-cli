@@ -9,13 +9,15 @@ from typing import Optional
 
 import httpx
 
-from .config import (
-    API_TOKENS_ENDPOINT,
-    AUTH_LOGIN_ENDPOINT,
-    AUTH_USER_ENDPOINT,
-    WORKSPACES_ENDPOINT,
-    get_api_url,
-)
+from .config import get_api_url
+
+# Auth-specific endpoints — these are not part of the Cyberwave Python SDK
+# because the SDK assumes a token/api_key is already available.  The CLI
+# needs them to support the interactive email + password login flow.
+AUTH_LOGIN_ENDPOINT = "/dj-rest-auth/login/"
+AUTH_USER_ENDPOINT = "/dj-rest-auth/user/"
+API_TOKENS_ENDPOINT = "/api-tokens/"
+WORKSPACES_ENDPOINT = "/api/v1/users/workspaces"
 
 
 class AuthenticationError(Exception):
@@ -180,13 +182,12 @@ class AuthClient:
                 headers={"Authorization": f"Token {token}"},
             )
 
-            if response.status_code == 200:
-                return User.from_dict(response.json())
-
             if response.status_code == 401:
                 raise AuthenticationError("Invalid or expired token")
 
             response.raise_for_status()
+
+            return User.from_dict(response.json())
 
         except httpx.HTTPStatusError as e:
             raise AuthenticationError(f"HTTP error: {e.response.status_code}") from e

@@ -19,7 +19,7 @@ from typing import Any
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
-from .auth import APIToken, AuthClient, AuthenticationError, Workspace
+from .auth import APIToken, AuthClient, AuthenticationError
 from .config import CONFIG_DIR, clean_subprocess_env, get_api_url
 from .credentials import Credentials, load_credentials, save_credentials
 
@@ -248,11 +248,11 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
     creds = load_credentials()
     if creds and creds.token:
         try:
-            with AuthClient() as client:
-                user = client.get_current_user(creds.token)
-                console.print(f"[green]✓[/green] Logged in as [bold]{user.email}[/bold]")
-                return True
-        except AuthenticationError as e:
+            sdk_client = _get_sdk_client(creds.token)
+            sdk_client.workspaces.list()
+            console.print(f"[green]✓[/green] Logged in as [bold]{creds.email}[/bold]")
+            return True
+        except Exception as e:
             console.print("[yellow]Stored credentials are invalid or expired.[/yellow]")
             console.print(e)  # print the error for debugging purposes
 
@@ -310,10 +310,9 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
         return False
 
 
-def _select_workspace(token: str, *, skip_confirm: bool) -> Workspace:
-    """Get workspaces and let user select one."""
-    with AuthClient() as auth_client:
-        workspaces = auth_client.get_workspaces(token)
+def _select_workspace(client: Any, *, skip_confirm: bool) -> Any:
+    """Get workspaces via SDK and let user select one."""
+    workspaces = client.workspaces.list()
 
     if not workspaces:
         raise RuntimeError("No workspaces available for this account.")
@@ -321,19 +320,19 @@ def _select_workspace(token: str, *, skip_confirm: bool) -> Workspace:
     if len(workspaces) == 1:
         ws = workspaces[0]
         console.print(f"[green]Workspace:[/green] {ws.name}")
-        _save_environment_file(workspace_uuid=ws.uuid, workspace_name=ws.name)
+        _save_environment_file(workspace_uuid=str(ws.uuid), workspace_name=ws.name)
         return ws
 
     if skip_confirm:
         ws = workspaces[0]
         console.print(f"[yellow]Auto-selecting workspace:[/yellow] {ws.name}")
-        _save_environment_file(workspace_uuid=ws.uuid, workspace_name=ws.name)
+        _save_environment_file(workspace_uuid=str(ws.uuid), workspace_name=ws.name)
         return ws
 
-    labels = [f"{ws.name} ({ws.uuid[:8]}...)" for ws in workspaces]
+    labels = [f"{ws.name} ({str(ws.uuid)[:8]}...)" for ws in workspaces]
     idx = _select_with_arrows("Select a workspace", labels)
     ws = workspaces[idx]
-    _save_environment_file(workspace_uuid=ws.uuid, workspace_name=ws.name)
+    _save_environment_file(workspace_uuid=str(ws.uuid), workspace_name=ws.name)
     return ws
 
 
@@ -605,14 +604,12 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
         console.print("[dim]Run 'cyberwave login' first.[/dim]")
         return False
 
-    token = creds.token
-
     try:
-        workspace = _select_workspace(token, skip_confirm=skip_confirm)
-        client = _get_sdk_client(token)
+        client = _get_sdk_client(creds.token)
+        workspace = _select_workspace(client, skip_confirm=skip_confirm)
         environment = _select_or_create_environment(
             client,
-            workspace.uuid,
+            str(workspace.uuid),
             skip_confirm=skip_confirm,
         )
 
@@ -640,7 +637,7 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
                 console.print(f"[yellow]Failed to update {failed_count} twin(s).[/yellow]")
 
         _save_environment_file(
-            workspace_uuid=workspace.uuid,
+            workspace_uuid=str(workspace.uuid),
             workspace_name=workspace.name,
             environment_uuid=env_uuid,
             environment_name=env_name or None,

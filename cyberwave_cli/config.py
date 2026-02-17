@@ -4,12 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-# API endpoints
-DEFAULT_API_URL = "https://api.cyberwave.com"
-AUTH_LOGIN_ENDPOINT = "/dj-rest-auth/login/"
-AUTH_USER_ENDPOINT = "/dj-rest-auth/user/"
-API_TOKENS_ENDPOINT = "/api-tokens/"
-WORKSPACES_ENDPOINT = "/api/v1/users/workspaces"
+from cyberwave.config import DEFAULT_BASE_URL
 
 # Config directory – system-wide location shared by the CLI, edge-core service,
 # and driver containers.  /etc/cyberwave is the FHS-standard path for
@@ -57,15 +52,15 @@ SO101_DEFAULT_DIR = "so101-project"
 CAMERA_EDGE_REPO_URL = "https://github.com/cyberwave-os/cyberwave-edge-python.git"
 CAMERA_EDGE_DEFAULT_DIR = "cyberwave-camera"
 
-# API endpoints for resources
-ENVIRONMENTS_ENDPOINT = "/api/v1/environments"
-TWINS_ENDPOINT = "/api/v1/twins"
-ASSETS_ENDPOINT = "/api/v1/assets"
-
 
 def get_api_url() -> str:
-    """Get the API URL from environment or default."""
-    return os.getenv("CYBERWAVE_API_URL", DEFAULT_API_URL)
+    """Get the API URL from environment or default.
+
+    Checks ``CYBERWAVE_API_URL`` first (CLI convention), then falls back to
+    ``CYBERWAVE_BASE_URL`` (SDK convention), and finally to the SDK's
+    ``DEFAULT_BASE_URL``.
+    """
+    return os.getenv("CYBERWAVE_API_URL", os.getenv("CYBERWAVE_BASE_URL", DEFAULT_BASE_URL))
 
 
 def clean_subprocess_env() -> dict[str, str]:

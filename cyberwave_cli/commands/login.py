@@ -7,6 +7,7 @@ from rich.console import Console
 from rich.prompt import Prompt
 
 from ..auth import AuthClient, AuthenticationError, Workspace
+from ..config import get_api_url
 from ..credentials import Credentials, load_credentials, save_credentials
 
 console = Console()
@@ -40,6 +41,18 @@ def select_workspace(workspaces: list[Workspace]) -> Workspace:
             console.print("[red]Please enter a valid number[/red]")
 
 
+def _validate_stored_token(token: str) -> bool:
+    """Validate a stored API token by making a lightweight SDK call."""
+    try:
+        from cyberwave import Cyberwave
+
+        client = Cyberwave(base_url=get_api_url(), token=token)
+        client.workspaces.list()
+        return True
+    except Exception:
+        return False
+
+
 @click.command()
 @click.option(
     "--email",
@@ -59,24 +72,20 @@ def login(email: str | None, password: str | None) -> None:
 
     If email and password are not provided as options, you will be prompted to enter them.
     """
-    # Check if already logged in
+    # Check if already logged in by validating the stored API token via the SDK
     existing_creds = load_credentials()
     if existing_creds and existing_creds.token:
-        try:
-            with AuthClient() as client:
-                user = client.get_current_user(existing_creds.token)
-                workspace_info = ""
-                if existing_creds.workspace_name:
-                    workspace_info = f" (workspace: [bold]{existing_creds.workspace_name}[/bold])"
-                msg = f"\n[green]✓[/green] Already logged in as [bold]{user.email}[/bold]"
-                console.print(f"{msg}{workspace_info}")
-                # Non-interactive: proceed with re-login (no way to ask).
-                if sys.stdin.isatty():
-                    if not click.confirm("Do you want to log in with a different account?"):
-                        return
-        except AuthenticationError:
-            # Token is invalid, proceed with new login
-            pass
+        if _validate_stored_token(existing_creds.token):
+            workspace_info = ""
+            if existing_creds.workspace_name:
+                workspace_info = f" (workspace: [bold]{existing_creds.workspace_name}[/bold])"
+            display_email = existing_creds.email or "unknown"
+            msg = f"\n[green]✓[/green] Already logged in as [bold]{display_email}[/bold]"
+            console.print(f"{msg}{workspace_info}")
+            # Non-interactive: proceed with re-login (no way to ask).
+            if sys.stdin.isatty():
+                if not click.confirm("Do you want to log in with a different account?"):
+                    return
 
     # Prompt for credentials if not provided
     if not email:
