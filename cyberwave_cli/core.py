@@ -6,8 +6,8 @@ This module provides the logic for:
   3. Enabling and starting the service
 """
 
+import importlib
 import json
-import time
 import os
 import platform
 import shutil
@@ -255,7 +255,15 @@ def _load_or_generate_edge_fingerprint() -> str:
         except Exception:
             pass
 
-    from .fingerprint import generate_fingerprint
+    try:
+        # Prefer edge-core's own generator so twin pairing uses the exact
+        # fingerprint runtime startup checks will later use.
+        startup_module = importlib.import_module("cyberwave_edge_core.startup")
+        generate_edge_fingerprint = getattr(startup_module, "generate_fingerprint")
+
+        return generate_edge_fingerprint()
+    except Exception:
+        from .fingerprint import generate_fingerprint
 
     return generate_fingerprint()
 
@@ -341,19 +349,16 @@ def _select_workspace(client: Any, *, skip_confirm: bool) -> Any:
     if len(workspaces) == 1:
         ws = workspaces[0]
         console.print(f"[green]Workspace:[/green] {ws.name}")
-        _save_environment_file(workspace_uuid=str(ws.uuid), workspace_name=ws.name)
         return ws
 
     if skip_confirm:
         ws = workspaces[0]
         console.print(f"[yellow]Auto-selecting workspace:[/yellow] {ws.name}")
-        _save_environment_file(workspace_uuid=str(ws.uuid), workspace_name=ws.name)
         return ws
 
     labels = [f"{ws.name} ({str(ws.uuid)[:8]}...)" for ws in workspaces]
     idx = _select_with_arrows("Select a workspace", labels)
     ws = workspaces[idx]
-    _save_environment_file(workspace_uuid=str(ws.uuid), workspace_name=ws.name)
     return ws
 
 
@@ -687,8 +692,6 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
         )
 
         console.print(f"[green]Environment saved:[/green] {ENVIRONMENT_FILE}")
-        # wait for 0.2 seconds to make sure the environment file is saved
-        time.sleep(0.2)
         console.print(f"[dim]Environment: {env_name or env_uuid}[/dim]")
         console.print(f"[dim]Connected twins selected: {len(selected_twin_uuids)}[/dim]")
         return True
@@ -720,8 +723,9 @@ def _apt_get_install() -> bool:
             BUILDKITE_KEYRING_PATH.parent.mkdir(parents=True, exist_ok=True)
 
             child_env = clean_subprocess_env()
+            ld_library_path = child_env.get("LD_LIBRARY_PATH", "(unset)")
             console.print(
-                f"[dim]LD_LIBRARY_PATH for child: {child_env.get('LD_LIBRARY_PATH', '(unset)')}[/dim]"
+                f"[dim]LD_LIBRARY_PATH for child: {ld_library_path}[/dim]"
             )
 
             # Download the armored GPG key
@@ -1035,12 +1039,12 @@ def setup_edge_core(*, skip_confirm: bool = False) -> bool:
     if not create_systemd_service():
         return False
 
-    # Step 3 — enable & start
-    if not enable_and_start_service():
+    # Step 3 — pick workspace/environment and persist config
+    if not configure_edge_environment(skip_confirm=skip_confirm):
         return False
 
-    # Step 4 — pick workspace/environment and persist config
-    if not configure_edge_environment(skip_confirm=skip_confirm):
+    # Step 4 — enable & start (after environment.json is finalized)
+    if not enable_and_start_service():
         return False
 
     console.print("\n[green]Edge core is installed and running.[/green]")
