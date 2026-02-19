@@ -31,6 +31,7 @@ echo "Building standalone binary..."
 pyinstaller \
     --onefile \
     --name cyberwave \
+    --add-data "cyberwave_cli/install_docker.sh:cyberwave_cli" \
     --hidden-import cyberwave_cli \
     --hidden-import cyberwave_cli.commands \
     --hidden-import cyberwave_cli.commands.login \

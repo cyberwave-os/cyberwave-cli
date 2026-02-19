@@ -842,7 +842,7 @@ def _ensure_docker_installed() -> bool:
 
 def _install_docker() -> bool:
     """Install Docker if not present in the edge device."""
-    script_path = Path(__file__).with_name("install_docker.sh")
+    script_path = _get_docker_installer_script_path()
     if not script_path.exists():
         console.print(f"[red]Docker installer script not found: {script_path}[/red]")
         return False
@@ -870,6 +870,21 @@ def _install_docker() -> bool:
 
     console.print("[green]Docker is installed and ready.[/green]")
     return True
+
+
+def _get_docker_installer_script_path() -> Path:
+    """Resolve install_docker.sh in source and bundled runtimes."""
+    candidates = [Path(__file__).with_name("install_docker.sh")]
+
+    mei_dir = getattr(sys, "_MEIPASS", None)
+    if mei_dir:
+        candidates.append(Path(mei_dir) / "cyberwave_cli" / "install_docker.sh")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return candidates[0]
 
 
 # ---- systemd service ---------------------------------------------------------
