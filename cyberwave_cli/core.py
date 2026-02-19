@@ -788,6 +788,69 @@ def install_edge_core() -> bool:
     return _pip_install()
 
 
+# ---- docker installation -----------------------------------------------------
+
+
+def _ensure_docker_installed() -> bool:
+    """Ensure Docker is installed and running."""
+    if not shutil.which("docker"):
+        console.print("[red]Docker not found.[/red]")
+        return False
+
+    try:
+        proc = subprocess.run(
+            ["docker", "info"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=clean_subprocess_env(),
+        )
+    except FileNotFoundError:
+        console.print("[red]Docker not found in PATH.[/red]")
+        return False
+
+    if proc.returncode != 0:
+        stderr_msg = proc.stderr.decode(errors="replace").strip() if proc.stderr else ""
+        console.print("[red]Docker is installed, but the daemon is not ready/running.[/red]")
+        if stderr_msg:
+            console.print(f"[dim]{stderr_msg}[/dim]")
+        return False
+
+    return True
+
+
+def _install_docker() -> bool:
+    """Install Docker if not present in the edge device."""
+    script_path = Path(__file__).with_name("install_docker.sh")
+    if not script_path.exists():
+        console.print(f"[red]Docker installer script not found: {script_path}[/red]")
+        return False
+
+    if os.geteuid() != 0:
+        console.print(
+            "[red]Docker installation requires root permissions.[/red]\n"
+            "[dim]Re-run with sudo: sudo cyberwave edge install[/dim]"
+        )
+        return False
+
+    console.print("[cyan]Installing Docker...[/cyan]")
+    try:
+        _run(["bash", str(script_path)])
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]Docker installation failed (exit {exc.returncode}).[/red]")
+        return False
+    except FileNotFoundError as exc:
+        console.print(f"[red]Required command not found: {exc.filename}[/red]")
+        return False
+
+    if not _ensure_docker_installed():
+        console.print("[red]Docker installation did not complete successfully.[/red]")
+        return False
+
+    console.print("[green]Docker is installed and ready.[/green]")
+    return True
+
+
 # ---- systemd service ---------------------------------------------------------
 
 
@@ -899,8 +962,10 @@ def setup_edge_core(*, skip_confirm: bool = False) -> bool:
             console.print("[dim]Aborted.[/dim]")
             return False
 
-    # Step 1 — install
+    # Step 1 — install edge core and docker
     if not install_edge_core():
+        return False
+    if not _install_docker():
         return False
 
     # Step 2 — systemd unit
