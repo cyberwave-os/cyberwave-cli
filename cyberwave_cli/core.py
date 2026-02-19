@@ -404,12 +404,26 @@ def _select_or_create_environment(client: Any, workspace_uuid: str, *, skip_conf
         return environments[0]
 
     labels = [f"{getattr(env, 'name', 'Unnamed')} ({str(env.uuid)[:8]}...)" for env in environments]
-    labels.append("Create new environment")
-    idx = _select_with_arrows("Select an environment", labels)
+    page_size = 10
+    view_more_threshold = 10
+    visible_count = page_size if len(environments) > view_more_threshold else len(environments)
 
-    if idx == len(environments):
-        return _create_environment_in_workspace(client, workspace_uuid, skip_confirm=skip_confirm)
-    return environments[idx]
+    while True:
+        has_more = visible_count < len(environments)
+        visible_labels = labels[:visible_count]
+        options = [*visible_labels, "Create new environment"]
+        if has_more:
+            options.append("View more")
+
+        idx = _select_with_arrows("Select an environment", options)
+        if has_more and idx == len(options) - 1:
+            visible_count = min(visible_count + page_size, len(environments))
+            continue
+        if idx == len(visible_labels):
+            return _create_environment_in_workspace(
+                client, workspace_uuid, skip_confirm=skip_confirm
+            )
+        return environments[idx]
 
 
 def _select_multiple_with_arrows(title: str, options: list[str]) -> list[int]:
@@ -558,16 +572,23 @@ def _select_connected_twins(client: Any, environment_uuid: str, *, skip_confirm:
         f"{getattr(twin, 'name', 'Unnamed')} ({str(getattr(twin, 'uuid', ''))[:8]}...)"
         for twin in twins
     ]
-    idxs = _select_multiple_with_arrows(
-        "Which twins are physically connected to your edge?",
-        labels,
-    )
-    selected_uuids: list[str] = []
-    for idx in idxs:
-        twin_uuid = str(getattr(twins[idx], "uuid", ""))
-        if twin_uuid:
-            selected_uuids.append(twin_uuid)
-    return selected_uuids
+    while True:
+        idxs = _select_multiple_with_arrows(
+            "Which twins are physically connected to your edge?",
+            labels,
+        )
+        selected_uuids: list[str] = []
+        for idx in idxs:
+            twin_uuid = str(getattr(twins[idx], "uuid", ""))
+            if twin_uuid:
+                selected_uuids.append(twin_uuid)
+        if selected_uuids:
+            return selected_uuids
+
+        console.print(
+            "[yellow]You did not select any twin! Please select at least 1 twin among "
+            "this list pressing spacebar.[/yellow]"
+        )
 
 
 def _attach_edge_fingerprint_to_twins(
