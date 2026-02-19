@@ -7,11 +7,13 @@ This module provides the logic for:
 """
 
 import json
+import time
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -213,14 +215,33 @@ def _save_environment_file(
     if twin_uuids is not None:
         payload["twin_uuids"] = twin_uuids
 
-    ENVIRONMENT_FILE.write_text(
-        json.dumps(payload, indent=2) + "\n",
+    serialized_payload = json.dumps(payload, indent=2) + "\n"
+
+    # Write atomically so edge-core never observes a partially written file.
+    with tempfile.NamedTemporaryFile(
+        mode="w",
         encoding="utf-8",
-    )
+        dir=CONFIG_DIR,
+        prefix=f".{ENVIRONMENT_FILE.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as tmp_file:
+        tmp_path = Path(tmp_file.name)
+        tmp_file.write(serialized_payload)
+        tmp_file.flush()
+        os.fsync(tmp_file.fileno())
+
+    os.replace(tmp_path, ENVIRONMENT_FILE)
 
     # Keep same permission model as credentials.
     if os.name != "nt":
         os.chmod(ENVIRONMENT_FILE, 0o600)
+        # Also fsync the directory to persist the rename event.
+        dir_fd = os.open(CONFIG_DIR, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
 
 def _load_or_generate_edge_fingerprint() -> str:
@@ -572,11 +593,10 @@ def _select_connected_twins(client: Any, environment_uuid: str, *, skip_confirm:
         f"{getattr(twin, 'name', 'Unnamed')} ({str(getattr(twin, 'uuid', ''))[:8]}...)"
         for twin in twins
     ]
+    base_title = "Which twins are physically connected to your edge?"
+    prompt_title = base_title
     while True:
-        idxs = _select_multiple_with_arrows(
-            "Which twins are physically connected to your edge?",
-            labels,
-        )
+        idxs = _select_multiple_with_arrows(prompt_title, labels)
         selected_uuids: list[str] = []
         for idx in idxs:
             twin_uuid = str(getattr(twins[idx], "uuid", ""))
@@ -585,9 +605,10 @@ def _select_connected_twins(client: Any, environment_uuid: str, *, skip_confirm:
         if selected_uuids:
             return selected_uuids
 
-        console.print(
-            "[yellow]You did not select any twin! Please select at least 1 twin among "
-            "this list pressing spacebar.[/yellow]"
+        prompt_title = (
+            "You did not select any twin! Please select at least 1 twin among "
+            "this list pressing spacebar.\n\n"
+            f"{base_title}"
         )
 
 
@@ -666,6 +687,8 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
         )
 
         console.print(f"[green]Environment saved:[/green] {ENVIRONMENT_FILE}")
+        # wait for 0.2 seconds to make sure the environment file is saved
+        time.sleep(0.2)
         console.print(f"[dim]Environment: {env_name or env_uuid}[/dim]")
         console.print(f"[dim]Connected twins selected: {len(selected_twin_uuids)}[/dim]")
         return True
@@ -842,6 +865,10 @@ def _ensure_docker_installed() -> bool:
 
 def _install_docker() -> bool:
     """Install Docker if not present in the edge device."""
+    if shutil.which("docker"):
+        console.print("[green]Docker is already installed.[/green]")
+        return _ensure_docker_installed()
+
     script_path = _get_docker_installer_script_path()
     if not script_path.exists():
         console.print(f"[red]Docker installer script not found: {script_path}[/red]")
