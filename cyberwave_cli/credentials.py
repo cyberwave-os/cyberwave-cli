@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from .config import CONFIG_DIR, CREDENTIALS_FILE
 
@@ -23,9 +23,22 @@ class Credentials:
     cyberwave_api_url: Optional[str] = None
     cyberwave_base_url: Optional[str] = None
 
-    def to_dict(self) -> dict:
+    def runtime_envs(self) -> dict[str, str]:
+        """Return persisted runtime env vars for edge/core processes."""
+        envs: dict[str, str] = {}
+        if self.cyberwave_environment:
+            envs["CYBERWAVE_ENVIRONMENT"] = self.cyberwave_environment
+        if self.cyberwave_edge_log_level:
+            envs["CYBERWAVE_EDGE_LOG_LEVEL"] = self.cyberwave_edge_log_level
+        if self.cyberwave_api_url:
+            envs["CYBERWAVE_API_URL"] = self.cyberwave_api_url
+        if self.cyberwave_base_url:
+            envs["CYBERWAVE_BASE_URL"] = self.cyberwave_base_url
+        return envs
+
+    def to_dict(self) -> dict[str, Any]:
         """Convert credentials to dictionary."""
-        payload: dict[str, str] = {
+        payload: dict[str, Any] = {
             "token": self.token,
         }
         if self.email:
@@ -36,29 +49,37 @@ class Credentials:
             payload["workspace_uuid"] = self.workspace_uuid
         if self.workspace_name:
             payload["workspace_name"] = self.workspace_name
-        if self.cyberwave_environment:
-            payload["CYBERWAVE_ENVIRONMENT"] = self.cyberwave_environment
-        if self.cyberwave_edge_log_level:
-            payload["CYBERWAVE_EDGE_LOG_LEVEL"] = self.cyberwave_edge_log_level
-        if self.cyberwave_api_url:
-            payload["CYBERWAVE_API_URL"] = self.cyberwave_api_url
-        if self.cyberwave_base_url:
-            payload["CYBERWAVE_BASE_URL"] = self.cyberwave_base_url
+        envs = self.runtime_envs()
+        if envs:
+            payload["envs"] = envs
         return payload
 
     @classmethod
     def from_dict(cls, data: dict) -> "Credentials":
         """Create credentials from dictionary."""
+        raw_envs = data.get("envs")
+        envs: dict[str, Any] = raw_envs if isinstance(raw_envs, dict) else {}
+
+        def _env_value(key: str) -> Optional[str]:
+            value = envs.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            # Backward compatibility with old flat credentials schema.
+            flat_value = data.get(key)
+            if isinstance(flat_value, str) and flat_value.strip():
+                return flat_value.strip()
+            return None
+
         return cls(
             token=data.get("token", ""),
             email=data.get("email"),
             created_at=data.get("created_at"),
             workspace_uuid=data.get("workspace_uuid"),
             workspace_name=data.get("workspace_name"),
-            cyberwave_environment=data.get("CYBERWAVE_ENVIRONMENT"),
-            cyberwave_edge_log_level=data.get("CYBERWAVE_EDGE_LOG_LEVEL"),
-            cyberwave_api_url=data.get("CYBERWAVE_API_URL"),
-            cyberwave_base_url=data.get("CYBERWAVE_BASE_URL"),
+            cyberwave_environment=_env_value("CYBERWAVE_ENVIRONMENT"),
+            cyberwave_edge_log_level=_env_value("CYBERWAVE_EDGE_LOG_LEVEL"),
+            cyberwave_api_url=_env_value("CYBERWAVE_API_URL"),
+            cyberwave_base_url=_env_value("CYBERWAVE_BASE_URL"),
         )
 
 
@@ -121,6 +142,13 @@ def save_credentials(credentials: Credentials) -> None:
             existing_payload = {}
 
     merged_payload = {**existing_payload, **payload}
+    existing_envs = existing_payload.get("envs")
+    payload_envs = payload.get("envs")
+    if isinstance(existing_envs, dict) or isinstance(payload_envs, dict):
+        merged_payload["envs"] = {
+            **(existing_envs if isinstance(existing_envs, dict) else {}),
+            **(payload_envs if isinstance(payload_envs, dict) else {}),
+        }
     with open(CREDENTIALS_FILE, "w") as f:
         json.dump(merged_payload, f, indent=2)
 
