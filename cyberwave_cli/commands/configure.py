@@ -5,7 +5,12 @@ from rich.console import Console
 from rich.prompt import Prompt
 
 from ..config import CREDENTIALS_FILE, get_api_url
-from ..credentials import Credentials, load_credentials, save_credentials
+from ..credentials import (
+    Credentials,
+    collect_runtime_env_overrides,
+    load_credentials,
+    save_credentials,
+)
 
 console = Console()
 
@@ -91,8 +96,16 @@ def configure(token: str | None, api_url: str | None, show: bool) -> None:
         if not click.confirm("Save token anyway?"):
             raise click.Abort()
 
+    runtime_overrides = collect_runtime_env_overrides(api_url_override=api_url)
     # Save credentials
-    save_credentials(Credentials(token=token))
+    save_credentials(
+        Credentials(
+            token=token,
+            cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
+            cyberwave_api_url=runtime_overrides.get("CYBERWAVE_API_URL"),
+            cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
+        )
+    )
     console.print(f"[green]✓[/green] Token saved to {CREDENTIALS_FILE}")
 
     if api_url:

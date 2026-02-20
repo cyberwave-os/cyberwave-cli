@@ -23,7 +23,12 @@ from rich.prompt import Confirm, Prompt
 
 from .auth import APIToken, AuthClient, AuthenticationError
 from .config import CONFIG_DIR, clean_subprocess_env, get_api_url
-from .credentials import Credentials, load_credentials, save_credentials
+from .credentials import (
+    Credentials,
+    collect_runtime_env_overrides,
+    load_credentials,
+    save_credentials,
+)
 
 console = Console()
 
@@ -129,6 +134,10 @@ def _select_with_arrows(title: str, options: list[str]) -> int:
     # Reserve lines for: title(1) + instructions(1) + blank(1) + scroll indicators(2)
     max_visible = max(5, term_height - 5)
 
+    def _tty_write(text: str) -> None:
+        """Write text in raw TTY mode using CRLF line endings."""
+        sys.stdout.write(text.replace("\n", "\r\n"))
+
     def _render() -> None:
         nonlocal scroll_offset
         # Keep selected item within the visible viewport
@@ -137,22 +146,22 @@ def _select_with_arrows(title: str, options: list[str]) -> int:
         elif selected >= scroll_offset + max_visible:
             scroll_offset = selected - max_visible + 1
 
-        sys.stdout.write("\x1b[2J\x1b[H")
-        sys.stdout.write(f"{title}\n")
-        sys.stdout.write("Use \u2191/\u2193 and press Enter\n\n")
+        _tty_write("\x1b[2J\x1b[H")
+        _tty_write(f"{title}\n")
+        _tty_write("Use \u2191/\u2193 and press Enter\n\n")
 
         visible_end = min(scroll_offset + max_visible, len(options))
 
         if scroll_offset > 0:
-            sys.stdout.write(f"  \u2191 {scroll_offset} more above\n")
+            _tty_write(f"  \u2191 {scroll_offset} more above\n")
 
         for idx in range(scroll_offset, visible_end):
             prefix = "❯" if idx == selected else " "
-            sys.stdout.write(f"{prefix} {options[idx]}\n")
+            _tty_write(f"{prefix} {options[idx]}\n")
 
         remaining = len(options) - visible_end
         if remaining > 0:
-            sys.stdout.write(f"  \u2193 {remaining} more below\n")
+            _tty_write(f"  \u2193 {remaining} more below\n")
 
         sys.stdout.flush()
 
@@ -183,15 +192,15 @@ def _select_with_arrows(title: str, options: list[str]) -> int:
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         sys.stdout.write("\x1b[?25h")
-        sys.stdout.write("\n")
+        _tty_write("\n")
         sys.stdout.flush()
 
 
-def _get_sdk_client(token: str):
+def _get_sdk_client(token: str, *, base_url: str | None = None):
     """Create a Cyberwave SDK client from a token."""
     from cyberwave import Cyberwave
 
-    return Cyberwave(base_url=get_api_url(), token=token)
+    return Cyberwave(base_url=base_url or get_api_url(), token=token)
 
 
 def _save_environment_file(
@@ -277,9 +286,26 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
     creds = load_credentials()
     if creds and creds.token:
         try:
-            sdk_client = _get_sdk_client(creds.token)
+            creds_base_url = creds.cyberwave_api_url or creds.cyberwave_base_url
+            sdk_client = _get_sdk_client(creds.token, base_url=creds_base_url)
             sdk_client.workspaces.list()
             console.print(f"[green]✓[/green] Logged in as [bold]{creds.email}[/bold]")
+            # Backfill persisted environment overrides when running with explicit
+            # env vars so systemd startups can reuse them later.
+            runtime_overrides = collect_runtime_env_overrides()
+            if runtime_overrides:
+                save_credentials(
+                    Credentials(
+                        token=creds.token,
+                        email=creds.email,
+                        created_at=creds.created_at,
+                        workspace_uuid=creds.workspace_uuid,
+                        workspace_name=creds.workspace_name,
+                        cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
+                        cyberwave_api_url=runtime_overrides.get("CYBERWAVE_API_URL"),
+                        cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
+                    )
+                )
             return True
         except Exception as e:
             console.print("[yellow]Stored credentials are invalid or expired.[/yellow]")
@@ -294,6 +320,7 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
     console.print("\n[dim]Authenticating...[/dim]")
 
     try:
+        runtime_overrides = collect_runtime_env_overrides()
         with AuthClient() as client:
             session_token = client.login(email, password)
             user = client.get_current_user(session_token)
@@ -326,6 +353,9 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                     email=user.email,
                     workspace_uuid=workspace.uuid,
                     workspace_name=workspace.name,
+                    cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
+                    cyberwave_api_url=runtime_overrides.get("CYBERWAVE_API_URL"),
+                    cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
                 )
             )
 
@@ -518,6 +548,10 @@ def _select_multiple_with_arrows(title: str, options: list[str]) -> list[int]:
         term_height = 24
     max_visible = max(5, term_height - 5)
 
+    def _tty_write(text: str) -> None:
+        """Write text in raw TTY mode using CRLF line endings."""
+        sys.stdout.write(text.replace("\n", "\r\n"))
+
     def _render() -> None:
         nonlocal scroll_offset
         if cursor < scroll_offset:
@@ -525,23 +559,23 @@ def _select_multiple_with_arrows(title: str, options: list[str]) -> list[int]:
         elif cursor >= scroll_offset + max_visible:
             scroll_offset = cursor - max_visible + 1
 
-        sys.stdout.write("\x1b[2J\x1b[H")
-        sys.stdout.write(f"{title}\n")
-        sys.stdout.write("Use \u2191/\u2193 to move, Space to toggle, Enter to confirm\n\n")
+        _tty_write("\x1b[2J\x1b[H")
+        _tty_write(f"{title}\n")
+        _tty_write("Use \u2191/\u2193 to move, Space to toggle, Enter to confirm\n\n")
 
         visible_end = min(scroll_offset + max_visible, len(options))
 
         if scroll_offset > 0:
-            sys.stdout.write(f"  \u2191 {scroll_offset} more above\n")
+            _tty_write(f"  \u2191 {scroll_offset} more above\n")
 
         for idx in range(scroll_offset, visible_end):
             cursor_mark = "❯" if idx == cursor else " "
             selected_mark = "[x]" if idx in selected else "[ ]"
-            sys.stdout.write(f"{cursor_mark} {selected_mark} {options[idx]}\n")
+            _tty_write(f"{cursor_mark} {selected_mark} {options[idx]}\n")
 
         remaining = len(options) - visible_end
         if remaining > 0:
-            sys.stdout.write(f"  \u2193 {remaining} more below\n")
+            _tty_write(f"  \u2193 {remaining} more below\n")
 
         sys.stdout.flush()
 
@@ -579,7 +613,7 @@ def _select_multiple_with_arrows(title: str, options: list[str]) -> list[int]:
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         sys.stdout.write("\x1b[?25h")
-        sys.stdout.write("\n")
+        _tty_write("\n")
         sys.stdout.flush()
 
 

@@ -24,6 +24,7 @@ Example usage:
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -69,14 +70,15 @@ def install_edge(yes):
 def uninstall_edge(yes):
     """Stop and remove the cyberwave-edge-core service.
 
-    Disables the systemd service, removes the unit file, and optionally
-    uninstalls the package.
+    Disables the systemd service, removes the unit file, removes the edge
+    config directory, and optionally uninstalls the package.
 
     \b
     Examples:
         sudo cyberwave edge uninstall
         sudo cyberwave edge uninstall -y
     """
+    from ..config import CONFIG_DIR
     from ..core import PACKAGE_NAME, SYSTEMD_UNIT_NAME, SYSTEMD_UNIT_PATH, _run
 
     if not yes:
@@ -103,6 +105,19 @@ def uninstall_edge(yes):
             _run(["systemctl", "daemon-reload"], check=False)
         except FileNotFoundError:
             pass
+
+    # Remove the edge config directory (credentials.json, environment.json, etc.)
+    if CONFIG_DIR.exists():
+        try:
+            shutil.rmtree(CONFIG_DIR)
+            console.print(f"[green]Removed:[/green] {CONFIG_DIR}")
+        except PermissionError:
+            console.print(
+                "[red]Permission denied removing edge config directory.[/red]\n"
+                "[dim]Re-run with sudo: sudo cyberwave edge uninstall[/dim]"
+            )
+        except OSError as exc:
+            console.print(f"[yellow]Could not fully remove {CONFIG_DIR}: {exc}[/yellow]")
 
     # Offer to uninstall the package
     if not yes:

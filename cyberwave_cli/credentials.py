@@ -2,7 +2,7 @@
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -18,10 +18,30 @@ class Credentials:
     created_at: Optional[str] = None
     workspace_uuid: Optional[str] = None
     workspace_name: Optional[str] = None
+    cyberwave_environment: Optional[str] = None
+    cyberwave_api_url: Optional[str] = None
+    cyberwave_base_url: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Convert credentials to dictionary."""
-        return asdict(self)
+        payload: dict[str, str] = {
+            "token": self.token,
+        }
+        if self.email:
+            payload["email"] = self.email
+        if self.created_at:
+            payload["created_at"] = self.created_at
+        if self.workspace_uuid:
+            payload["workspace_uuid"] = self.workspace_uuid
+        if self.workspace_name:
+            payload["workspace_name"] = self.workspace_name
+        if self.cyberwave_environment:
+            payload["CYBERWAVE_ENVIRONMENT"] = self.cyberwave_environment
+        if self.cyberwave_api_url:
+            payload["CYBERWAVE_API_URL"] = self.cyberwave_api_url
+        if self.cyberwave_base_url:
+            payload["CYBERWAVE_BASE_URL"] = self.cyberwave_base_url
+        return payload
 
     @classmethod
     def from_dict(cls, data: dict) -> "Credentials":
@@ -32,7 +52,27 @@ class Credentials:
             created_at=data.get("created_at"),
             workspace_uuid=data.get("workspace_uuid"),
             workspace_name=data.get("workspace_name"),
+            cyberwave_environment=data.get("CYBERWAVE_ENVIRONMENT"),
+            cyberwave_api_url=data.get("CYBERWAVE_API_URL"),
+            cyberwave_base_url=data.get("CYBERWAVE_BASE_URL"),
         )
+
+
+def collect_runtime_env_overrides(*, api_url_override: Optional[str] = None) -> dict[str, str]:
+    """Collect Cyberwave environment overrides from the current process."""
+    overrides: dict[str, str] = {}
+    for key in ("CYBERWAVE_ENVIRONMENT", "CYBERWAVE_API_URL", "CYBERWAVE_BASE_URL"):
+        value = os.getenv(key)
+        if isinstance(value, str) and value.strip():
+            overrides[key] = value.strip()
+
+    if api_url_override:
+        api_url = api_url_override.strip()
+        if api_url:
+            overrides["CYBERWAVE_API_URL"] = api_url
+            # Keep SDK-compatible alias in sync when caller explicitly sets API URL.
+            overrides.setdefault("CYBERWAVE_BASE_URL", api_url)
+    return overrides
 
 
 def ensure_config_dir() -> None:
@@ -55,8 +95,20 @@ def save_credentials(credentials: Credentials) -> None:
     if not credentials.created_at:
         credentials.created_at = datetime.utcnow().isoformat()
 
+    payload = credentials.to_dict()
+    existing_payload: dict = {}
+    if CREDENTIALS_FILE.exists():
+        try:
+            with open(CREDENTIALS_FILE, "r") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                existing_payload = loaded
+        except (json.JSONDecodeError, OSError):
+            existing_payload = {}
+
+    merged_payload = {**existing_payload, **payload}
     with open(CREDENTIALS_FILE, "w") as f:
-        json.dump(credentials.to_dict(), f, indent=2)
+        json.dump(merged_payload, f, indent=2)
 
     # Best-effort permission restriction.
     if os.name != "nt":

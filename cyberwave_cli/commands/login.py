@@ -8,7 +8,12 @@ from rich.prompt import Prompt
 
 from ..auth import AuthClient, AuthenticationError, Workspace
 from ..config import get_api_url
-from ..credentials import Credentials, load_credentials, save_credentials
+from ..credentials import (
+    Credentials,
+    collect_runtime_env_overrides,
+    load_credentials,
+    save_credentials,
+)
 
 console = Console()
 
@@ -53,6 +58,11 @@ def _validate_stored_token(token: str) -> bool:
         return False
 
 
+def _stored_api_url(credentials: Credentials) -> str | None:
+    """Read API URL override persisted in credentials (if any)."""
+    return credentials.cyberwave_api_url or credentials.cyberwave_base_url
+
+
 @click.command()
 @click.option(
     "--email",
@@ -75,7 +85,22 @@ def login(email: str | None, password: str | None) -> None:
     # Check if already logged in by validating the stored API token via the SDK
     existing_creds = load_credentials()
     if existing_creds and existing_creds.token:
-        if _validate_stored_token(existing_creds.token):
+        # Validate against stored API URL first when present (edge/dev setups),
+        # then fall back to the current process URL resolution.
+        validate_token = existing_creds.token
+        if _stored_api_url(existing_creds):
+            try:
+                from cyberwave import Cyberwave
+
+                client = Cyberwave(base_url=_stored_api_url(existing_creds), token=validate_token)
+                client.workspaces.list()
+                is_valid = True
+            except Exception:
+                is_valid = _validate_stored_token(validate_token)
+        else:
+            is_valid = _validate_stored_token(validate_token)
+
+        if is_valid:
             workspace_info = ""
             if existing_creds.workspace_name:
                 workspace_info = f" (workspace: [bold]{existing_creds.workspace_name}[/bold])"
@@ -97,6 +122,7 @@ def login(email: str | None, password: str | None) -> None:
     console.print("\n[dim]Authenticating...[/dim]")
 
     try:
+        runtime_overrides = collect_runtime_env_overrides()
         with AuthClient() as client:
             # First, get a session token via OAuth
             session_token = client.login(email, password)
@@ -131,6 +157,9 @@ def login(email: str | None, password: str | None) -> None:
                     email=user.email,
                     workspace_uuid=workspace.uuid,
                     workspace_name=workspace.name,
+                    cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
+                    cyberwave_api_url=runtime_overrides.get("CYBERWAVE_API_URL"),
+                    cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
                 )
             )
 
