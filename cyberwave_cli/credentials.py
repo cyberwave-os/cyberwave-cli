@@ -19,6 +19,7 @@ class Credentials:
     workspace_uuid: Optional[str] = None
     workspace_name: Optional[str] = None
     cyberwave_environment: Optional[str] = None
+    cyberwave_edge_log_level: Optional[str] = None
     cyberwave_api_url: Optional[str] = None
     cyberwave_base_url: Optional[str] = None
 
@@ -37,6 +38,8 @@ class Credentials:
             payload["workspace_name"] = self.workspace_name
         if self.cyberwave_environment:
             payload["CYBERWAVE_ENVIRONMENT"] = self.cyberwave_environment
+        if self.cyberwave_edge_log_level:
+            payload["CYBERWAVE_EDGE_LOG_LEVEL"] = self.cyberwave_edge_log_level
         if self.cyberwave_api_url:
             payload["CYBERWAVE_API_URL"] = self.cyberwave_api_url
         if self.cyberwave_base_url:
@@ -53,6 +56,7 @@ class Credentials:
             workspace_uuid=data.get("workspace_uuid"),
             workspace_name=data.get("workspace_name"),
             cyberwave_environment=data.get("CYBERWAVE_ENVIRONMENT"),
+            cyberwave_edge_log_level=data.get("CYBERWAVE_EDGE_LOG_LEVEL"),
             cyberwave_api_url=data.get("CYBERWAVE_API_URL"),
             cyberwave_base_url=data.get("CYBERWAVE_BASE_URL"),
         )
@@ -61,10 +65,20 @@ class Credentials:
 def collect_runtime_env_overrides(*, api_url_override: Optional[str] = None) -> dict[str, str]:
     """Collect Cyberwave environment overrides from the current process."""
     overrides: dict[str, str] = {}
-    for key in ("CYBERWAVE_ENVIRONMENT", "CYBERWAVE_API_URL", "CYBERWAVE_BASE_URL"):
+    for key in (
+        "CYBERWAVE_ENVIRONMENT",
+        "CYBERWAVE_EDGE_LOG_LEVEL",
+        "CYBERWAVE_API_URL",
+        "CYBERWAVE_BASE_URL",
+    ):
         value = os.getenv(key)
         if isinstance(value, str) and value.strip():
             overrides[key] = value.strip()
+
+    # In non-production explicit environments, default edge-core to verbose logs.
+    env_name = overrides.get("CYBERWAVE_ENVIRONMENT", "").strip().lower()
+    if env_name and env_name != "production":
+        overrides.setdefault("CYBERWAVE_EDGE_LOG_LEVEL", "debug")
 
     if api_url_override:
         api_url = api_url_override.strip()

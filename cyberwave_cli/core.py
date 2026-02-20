@@ -302,6 +302,9 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                         workspace_uuid=creds.workspace_uuid,
                         workspace_name=creds.workspace_name,
                         cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
+                        cyberwave_edge_log_level=runtime_overrides.get(
+                            "CYBERWAVE_EDGE_LOG_LEVEL"
+                        ),
                         cyberwave_api_url=runtime_overrides.get("CYBERWAVE_API_URL"),
                         cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
                     )
@@ -354,6 +357,7 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                     workspace_uuid=workspace.uuid,
                     workspace_name=workspace.name,
                     cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
+                    cyberwave_edge_log_level=runtime_overrides.get("CYBERWAVE_EDGE_LOG_LEVEL"),
                     cyberwave_api_url=runtime_overrides.get("CYBERWAVE_API_URL"),
                     cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
                 )
