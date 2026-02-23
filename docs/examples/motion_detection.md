@@ -175,7 +175,7 @@ cd cyberwave-edges/cyberwave-edge-python
 
 # Configure environment
 cat > .env << EOF
-CYBERWAVE_TOKEN=your-token
+CYBERWAVE_API_KEY=your-token
 CYBERWAVE_BASE_URL=http://localhost:8000
 CYBERWAVE_TWIN_UUID=your-twin-uuid
 CAMERAS={"default": {"source": "rtsp://..."}}

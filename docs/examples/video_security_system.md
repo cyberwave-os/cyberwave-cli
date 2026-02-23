@@ -163,7 +163,7 @@ Platform:    Darwin-arm64
 # Fingerprint: macbook-pro-a1b2c3d4e5f6
 
 # Required
-CYBERWAVE_TOKEN=your-api-token
+CYBERWAVE_API_KEY=your-api-token
 CYBERWAVE_TWIN_UUID=your-twin-uuid
 
 # API Settings
@@ -186,7 +186,7 @@ LOG_LEVEL=INFO
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CYBERWAVE_TOKEN` | API authentication token | Required |
+| `CYBERWAVE_API_KEY` | API authentication token | Required |
 | `CYBERWAVE_BASE_URL` | Backend API URL | `http://localhost:8000` |
 | `CYBERWAVE_TWIN_UUID` | Twin to stream for | Required |
 | `CYBERWAVE_EDGE_UUID` | Device fingerprint | Auto-generated |

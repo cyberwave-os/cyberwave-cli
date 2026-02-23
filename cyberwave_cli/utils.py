@@ -217,7 +217,7 @@ def write_edge_env(
     env_content = f"""{chr(10).join(header_lines)}
 
 # Required
-CYBERWAVE_TOKEN={token}
+CYBERWAVE_API_KEY={token}
 CYBERWAVE_TWIN_UUID={twin_uuid}
 
 # API Settings

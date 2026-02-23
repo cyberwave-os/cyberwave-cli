@@ -25,7 +25,7 @@ cyberwave-cli configure --token YOUR_API_TOKEN
 Or set environment variables:
 ```bash
 export CYBERWAVE_API_URL=http://localhost:8000
-export CYBERWAVE_TOKEN=your-token-here
+export CYBERWAVE_API_KEY=your-token-here
 ```
 
 ### 2. Verify connection

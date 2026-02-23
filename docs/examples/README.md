@@ -70,7 +70,7 @@ cyberwave-cli edge list-models --twin-uuid UUID
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `CYBERWAVE_API_URL` | Backend API URL | `http://localhost:8000` |
-| `CYBERWAVE_TOKEN` | API token | `abc123...` |
+| `CYBERWAVE_API_KEY` | API token | `abc123...` |
 | `CYBERWAVE_TWIN_UUID` | Default twin | `uuid-here` |
 | `CAMERAS` | Camera config JSON | `{"cam1": {...}}` |
 | `MODELS` | Model config JSON | `{"yolo": {...}}` |

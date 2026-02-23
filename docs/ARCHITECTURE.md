@@ -167,7 +167,7 @@ logs    → Tail edge service logs
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `CYBERWAVE_API_URL` | Backend API URL | `https://api.cyberwave.com` |
-| `CYBERWAVE_TOKEN` | Auth token (alternative to credentials file) | - |
+| `CYBERWAVE_API_KEY` | Auth token (alternative to credentials file) | - |
 
 ## Extension Points
 
