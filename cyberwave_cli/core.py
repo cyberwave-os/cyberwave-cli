@@ -29,6 +29,7 @@ from .credentials import (
     load_credentials,
     save_credentials,
 )
+from cyberwave.fingerprint import generate_fingerprint
 
 console = Console()
 
@@ -263,16 +264,6 @@ def _load_or_generate_edge_fingerprint() -> str:
                 return value.strip()
         except Exception:
             pass
-
-    try:
-        # Prefer edge-core's own generator so twin pairing uses the exact
-        # fingerprint runtime startup checks will later use.
-        startup_module = importlib.import_module("cyberwave_edge_core.startup")
-        generate_edge_fingerprint = getattr(startup_module, "generate_fingerprint")
-
-        return generate_edge_fingerprint()
-    except Exception:
-        from .fingerprint import generate_fingerprint
 
     return generate_fingerprint()
 
