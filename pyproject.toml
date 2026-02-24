@@ -1,6 +1,6 @@
 [project]
 name = "cyberwave-cli"
-version = "0.11.27"
+version = "0.11.28"
 description = "The official command-line interface for Cyberwave"
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
