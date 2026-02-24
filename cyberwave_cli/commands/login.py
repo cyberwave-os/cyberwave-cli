@@ -46,6 +46,23 @@ def select_workspace(workspaces: list[Workspace]) -> Workspace:
             console.print("[red]Please enter a valid number[/red]")
 
 
+def _workspace_token_candidates(
+    workspaces: list[Workspace], selected_workspace: Workspace
+) -> list[Workspace]:
+    """Return workspace token-creation candidates in preferred order.
+
+    In non-interactive mode, token creation should be resilient: if the first
+    workspace fails (e.g. transient 5xx or restricted workspace), try others.
+    """
+    if sys.stdin.isatty() or len(workspaces) <= 1:
+        return [selected_workspace]
+
+    return [
+        selected_workspace,
+        *[ws for ws in workspaces if ws.uuid != selected_workspace.uuid],
+    ]
+
+
 def _validate_stored_token(token: str) -> bool:
     """Validate a stored API token by making a lightweight SDK call."""
     try:
@@ -143,20 +160,54 @@ def login(email: str | None, password: str | None) -> None:
                 )
                 raise click.Abort()
 
-            # Let user select a workspace if multiple are available
+            # Let user select a workspace if multiple are available.
+            # In non-interactive mode, fall back across other workspaces if
+            # token creation fails for the first choice.
             workspace = select_workspace(workspaces)
-            console.print(f"\n[dim]Creating API token for workspace '{workspace.name}'...[/dim]")
+            candidate_workspaces = _workspace_token_candidates(workspaces, workspace)
 
-            # Create a permanent API token for the selected workspace
-            api_token = client.create_api_token(session_token, workspace.uuid)
+            api_token = None
+            token_workspace = None
+            last_token_error: AuthenticationError | None = None
+
+            for idx, candidate in enumerate(candidate_workspaces):
+                if idx == 0:
+                    console.print(
+                        f"\n[dim]Creating API token for workspace '{candidate.name}'...[/dim]"
+                    )
+                else:
+                    console.print(
+                        f"\n[dim]Retrying API token creation with workspace "
+                        f"'{candidate.name}'...[/dim]"
+                    )
+
+                try:
+                    api_token = client.create_api_token(session_token, candidate.uuid)
+                    token_workspace = candidate
+                    break
+                except AuthenticationError as exc:
+                    last_token_error = exc
+                    if len(candidate_workspaces) == 1:
+                        raise
+                    console.print(
+                        f"[yellow]⚠[/yellow] Could not create API token for "
+                        f"'{candidate.name}': {exc}"
+                    )
+
+            if api_token is None or token_workspace is None:
+                if last_token_error:
+                    raise last_token_error
+                raise AuthenticationError(
+                    "Failed to create API token for all available workspaces"
+                )
 
             # Save the permanent API token (not the session token which expires)
             save_credentials(
                 Credentials(
                     token=api_token.token,
                     email=user.email,
-                    workspace_uuid=workspace.uuid,
-                    workspace_name=workspace.name,
+                    workspace_uuid=token_workspace.uuid,
+                    workspace_name=token_workspace.name,
                     cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
                     cyberwave_edge_log_level=runtime_overrides.get("CYBERWAVE_EDGE_LOG_LEVEL"),
                     cyberwave_api_url=runtime_overrides.get("CYBERWAVE_API_URL"),
@@ -165,7 +216,7 @@ def login(email: str | None, password: str | None) -> None:
             )
 
             console.print(f"\n[green]✓[/green] Successfully logged in as [bold]{user.email}[/bold]")
-            console.print(f"[dim]Workspace: {workspace.name}[/dim]")
+            console.print(f"[dim]Workspace: {token_workspace.name}[/dim]")
             from ..config import CREDENTIALS_FILE
 
             console.print(f"[dim]API token saved to {CREDENTIALS_FILE}[/dim]")
