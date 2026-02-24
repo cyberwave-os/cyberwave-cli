@@ -1,6 +1,7 @@
 """Login command for the Cyberwave CLI."""
 
 import sys
+import time
 
 import click
 from rich.console import Console
@@ -46,21 +47,9 @@ def select_workspace(workspaces: list[Workspace]) -> Workspace:
             console.print("[red]Please enter a valid number[/red]")
 
 
-def _workspace_token_candidates(
-    workspaces: list[Workspace], selected_workspace: Workspace
-) -> list[Workspace]:
-    """Return workspace token-creation candidates in preferred order.
-
-    In non-interactive mode, token creation should be resilient: if the first
-    workspace fails (e.g. transient 5xx or restricted workspace), try others.
-    """
-    if sys.stdin.isatty() or len(workspaces) <= 1:
-        return [selected_workspace]
-
-    return [
-        selected_workspace,
-        *[ws for ws in workspaces if ws.uuid != selected_workspace.uuid],
-    ]
+def _is_retryable_workspace_token_error(error: AuthenticationError) -> bool:
+    """Return True when API token creation should be retried."""
+    return "HTTP error: 500" in str(error)
 
 
 def _validate_stored_token(token: str) -> bool:
@@ -161,53 +150,46 @@ def login(email: str | None, password: str | None) -> None:
                 raise click.Abort()
 
             # Let user select a workspace if multiple are available.
-            # In non-interactive mode, fall back across other workspaces if
-            # token creation fails for the first choice.
+            # If API token creation hits transient backend 500s, retry the
+            # same workspace with a short backoff.
             workspace = select_workspace(workspaces)
-            candidate_workspaces = _workspace_token_candidates(workspaces, workspace)
-
+            max_attempts = 3
             api_token = None
-            token_workspace = None
-            last_token_error: AuthenticationError | None = None
 
-            for idx, candidate in enumerate(candidate_workspaces):
-                if idx == 0:
+            for attempt in range(1, max_attempts + 1):
+                if attempt == 1:
                     console.print(
-                        f"\n[dim]Creating API token for workspace '{candidate.name}'...[/dim]"
+                        f"\n[dim]Creating API token for workspace '{workspace.name}'...[/dim]"
                     )
                 else:
                     console.print(
-                        f"\n[dim]Retrying API token creation with workspace "
-                        f"'{candidate.name}'...[/dim]"
+                        f"\n[dim]Retrying API token creation for workspace "
+                        f"'{workspace.name}' (attempt {attempt}/{max_attempts})...[/dim]"
                     )
 
                 try:
-                    api_token = client.create_api_token(session_token, candidate.uuid)
-                    token_workspace = candidate
+                    api_token = client.create_api_token(session_token, workspace.uuid)
                     break
                 except AuthenticationError as exc:
-                    last_token_error = exc
-                    if len(candidate_workspaces) == 1:
+                    if attempt == max_attempts or not _is_retryable_workspace_token_error(exc):
                         raise
+                    wait_seconds = 2 * attempt
                     console.print(
-                        f"[yellow]⚠[/yellow] Could not create API token for "
-                        f"'{candidate.name}': {exc}"
+                        f"[yellow]⚠[/yellow] Temporary token creation failure: {exc}. "
+                        f"Retrying in {wait_seconds}s..."
                     )
+                    time.sleep(wait_seconds)
 
-            if api_token is None or token_workspace is None:
-                if last_token_error:
-                    raise last_token_error
-                raise AuthenticationError(
-                    "Failed to create API token for all available workspaces"
-                )
+            if api_token is None:
+                raise AuthenticationError("Failed to create API token")
 
             # Save the permanent API token (not the session token which expires)
             save_credentials(
                 Credentials(
                     token=api_token.token,
                     email=user.email,
-                    workspace_uuid=token_workspace.uuid,
-                    workspace_name=token_workspace.name,
+                    workspace_uuid=workspace.uuid,
+                    workspace_name=workspace.name,
                     cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
                     cyberwave_edge_log_level=runtime_overrides.get("CYBERWAVE_EDGE_LOG_LEVEL"),
                     cyberwave_api_url=runtime_overrides.get("CYBERWAVE_API_URL"),
@@ -216,7 +198,7 @@ def login(email: str | None, password: str | None) -> None:
             )
 
             console.print(f"\n[green]✓[/green] Successfully logged in as [bold]{user.email}[/bold]")
-            console.print(f"[dim]Workspace: {token_workspace.name}[/dim]")
+            console.print(f"[dim]Workspace: {workspace.name}[/dim]")
             from ..config import CREDENTIALS_FILE
 
             console.print(f"[dim]API token saved to {CREDENTIALS_FILE}[/dim]")
