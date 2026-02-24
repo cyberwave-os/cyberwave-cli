@@ -65,6 +65,28 @@ def _coerce_value(field_type: str, value: str | None) -> object | None:
     return value
 
 
+def _is_legacy_edge_configs_map(edge_configs: dict) -> bool:
+    if not isinstance(edge_configs, dict) or not edge_configs:
+        return False
+    if "edge_fingerprint" in edge_configs or "camera_config" in edge_configs:
+        return False
+    return all(isinstance(value, dict) for value in edge_configs.values())
+
+
+def _binding_for_fingerprint(edge_configs: dict, fingerprint: str) -> dict | None:
+    if not isinstance(edge_configs, dict) or not fingerprint:
+        return None
+
+    if _is_legacy_edge_configs_map(edge_configs):
+        candidate = edge_configs.get(fingerprint)
+        return candidate if isinstance(candidate, dict) else None
+
+    candidate_fingerprint = edge_configs.get("edge_fingerprint")
+    if isinstance(candidate_fingerprint, str) and candidate_fingerprint == fingerprint:
+        return edge_configs
+    return None
+
+
 def _prompt_for_schema_fields(
     schema: list[dict],
     cli_overrides: dict[str, str],
@@ -211,11 +233,11 @@ def _find_or_create_twin(
             for twin in twins:
                 metadata = getattr(twin, 'metadata', {}) or {}
                 edge_configs = metadata.get('edge_configs', {})
+                config = _binding_for_fingerprint(edge_configs, fingerprint)
 
-                if fingerprint in edge_configs:
+                if config:
                     # Found existing twin for this device
                     found_name = getattr(twin, 'name', 'Unknown')
-                    config = edge_configs[fingerprint]
                     last_sync = config.get('last_sync', 'unknown')
 
                     console.print(f"\n[cyan]Found existing twin:[/cyan] {found_name}")
@@ -280,7 +302,7 @@ def _configure_edge(
     edge_configs = metadata.get('edge_configs', {})
 
     # Check for existing config (skip if CLI overrides provided)
-    existing_config = edge_configs.get(fingerprint)
+    existing_config = _binding_for_fingerprint(edge_configs, fingerprint)
 
     if existing_config and not cli_overrides:
         console.print("\n[cyan]Found existing config for this device.[/cyan]")
@@ -377,9 +399,8 @@ def _save_config_to_twin(client: Any, twin_uuid: str, fingerprint: str, config: 
     try:
         twin = client.twins.get(twin_uuid)
         metadata = getattr(twin, 'metadata', {}) or {}
-        edge_configs = metadata.get('edge_configs', {})
-        edge_configs[fingerprint] = config_for_cloud
-        metadata['edge_configs'] = edge_configs
+        config_for_cloud["edge_fingerprint"] = fingerprint
+        metadata['edge_configs'] = config_for_cloud
 
         client.twins.update(twin_uuid, metadata=metadata)
     except Exception as e:
@@ -567,7 +588,7 @@ def create_twin(
     if edge_uuid:
         console.print(f"  - Cloud: edge/{edge_uuid[:8]}... -> twin/{twin_uuid[:8]}...")
     else:
-        console.print(f"  - Cloud: twin/{twin_uuid}/edge_configs/{fingerprint[:20]}... (legacy)")
+        console.print(f"  - Cloud: twin/{twin_uuid}/metadata.edge_configs")
     console.print(f"  - Local: {target_dir}/.env")
     console.print(f"\n[dim]Run: cyberwave edge start[/dim]")
 

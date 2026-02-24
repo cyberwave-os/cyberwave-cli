@@ -40,6 +40,38 @@ from rich.table import Table
 console = Console()
 
 
+def _is_legacy_edge_configs_map(edge_configs: dict) -> bool:
+    if not isinstance(edge_configs, dict) or not edge_configs:
+        return False
+    if "edge_fingerprint" in edge_configs or "camera_config" in edge_configs:
+        return False
+    return all(isinstance(value, dict) for value in edge_configs.values())
+
+
+def _iter_edge_bindings(edge_configs: dict) -> list[tuple[str, dict]]:
+    if not isinstance(edge_configs, dict) or not edge_configs:
+        return []
+
+    if _is_legacy_edge_configs_map(edge_configs):
+        bindings: list[tuple[str, dict]] = []
+        for fingerprint, binding in edge_configs.items():
+            if isinstance(fingerprint, str) and isinstance(binding, dict):
+                bindings.append((fingerprint, binding))
+        return bindings
+
+    fingerprint = edge_configs.get("edge_fingerprint")
+    if isinstance(fingerprint, str) and fingerprint:
+        return [(fingerprint, edge_configs)]
+    return []
+
+
+def _binding_for_fingerprint(edge_configs: dict, fingerprint: str) -> dict | None:
+    for candidate_fingerprint, binding in _iter_edge_bindings(edge_configs):
+        if candidate_fingerprint == fingerprint:
+            return binding
+    return None
+
+
 @click.group()
 def edge():
     """Manage the edge node service."""
@@ -696,7 +728,7 @@ def _pull_single_twin_config(
 
     console.print(f"[cyan]Twin:[/cyan] {twin_name}")
 
-    my_config = edge_configs.get(fingerprint)
+    my_config = _binding_for_fingerprint(edge_configs, fingerprint)
 
     if my_config:
         from ..utils import print_success
@@ -709,13 +741,14 @@ def _pull_single_twin_config(
             console.print(f"[dim]  Cameras: {len(cameras)} configured[/dim]")
     else:
         # No config for this fingerprint - check for other configs or default
-        if edge_configs:
+        available_bindings = _iter_edge_bindings(edge_configs)
+        if available_bindings:
             from ..utils import print_warning
 
             print_warning("No config for this device fingerprint")
             console.print(f"\n[dim]Available configs from other devices:[/dim]")
 
-            for i, (fp, cfg) in enumerate(edge_configs.items(), 1):
+            for i, (fp, cfg) in enumerate(available_bindings, 1):
                 device_info = cfg.get("device_info", {})
                 hostname = device_info.get("hostname", "unknown")
                 registered = (
@@ -734,8 +767,8 @@ def _pull_single_twin_config(
                 if choice.lower() != "n":
                     try:
                         idx = int(choice) - 1
-                        source_fp = list(edge_configs.keys())[idx]
-                        my_config = edge_configs[source_fp].copy()
+                        source_fp, source_cfg = available_bindings[idx]
+                        my_config = source_cfg.copy()
                         from ..utils import print_success
 
                         print_success(f"Copying config from {source_fp[:20]}...")
@@ -824,7 +857,7 @@ def _pull_environment_configs(
         metadata = getattr(twin, "metadata", {}) or {}
         edge_configs = metadata.get("edge_configs", {})
 
-        my_config = edge_configs.get(fingerprint)
+        my_config = _binding_for_fingerprint(edge_configs, fingerprint)
 
         if my_config:
             twins_with_config.append((twin, my_config))
@@ -1103,7 +1136,7 @@ def remote_status(twin_uuid: str):
         metadata = getattr(twin, "metadata", {}) or {}
         edge_configs = metadata.get("edge_configs", {})
 
-        my_config = edge_configs.get(fingerprint)
+        my_config = _binding_for_fingerprint(edge_configs, fingerprint)
 
         console.print(f'\n[bold]Edge Status for "{twin_name}"[/bold]')
         console.print("━" * 40)

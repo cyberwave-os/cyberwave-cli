@@ -130,12 +130,11 @@ Configurations are stored in twin metadata and synced to the cloud:
 ```python
 # twin.metadata.edge_configs
 {
-  "macbook-pro-a1b2c3d4e5f6": {
-    "cameras": [{"camera_id": "default", "source": "rtsp://...", "fps": 10}],
-    "device_info": {"hostname": "macbook-pro.local", "platform": "Darwin-arm64"},
-    "registered_at": "2026-01-13T10:00:00Z",
-    "last_sync": "2026-01-13T12:00:00Z"
-  }
+  "edge_fingerprint": "macbook-pro-a1b2c3d4e5f6",
+  "camera_config": {"camera_id": "default", "source": "rtsp://...", "fps": 10},
+  "device_info": {"hostname": "macbook-pro.local", "platform": "Darwin-arm64"},
+  "registered_at": "2026-01-13T10:00:00Z",
+  "last_sync": "2026-01-13T12:00:00Z"
 }
 ```
 

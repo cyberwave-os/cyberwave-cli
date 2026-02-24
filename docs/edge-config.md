@@ -4,9 +4,9 @@ This document describes how edge device configurations are stored and synced bet
 
 ## Overview
 
-Edge configurations are stored in **twin metadata** (`twin.metadata.edge_configs`), keyed by device fingerprint. This allows:
+Edge configurations are stored in **twin metadata** (`twin.metadata.edge_configs`) as a single binding object. This allows:
 
-- Multiple edge devices to connect to the same twin with different configurations
+- A twin to keep one active edge binding at a time
 - Configuration to be pushed from cloud to edge (Steam-like)
 - Configuration to persist across edge restarts
 
@@ -104,28 +104,21 @@ Twins store per-edge configurations:
 # twin.metadata
 {
     "edge_configs": {
-        # Keyed by device fingerprint
-        "macbook-pro-a1b2c3d4e5f6": {
-            "cameras": [
-                {
-                    "camera_id": "default",
-                    "source": "rtsp://192.168.1.100:554/stream",
-                    "fps": 10
-                }
-            ],
-            "models": [],
-            "device_info": {
-                "hostname": "macbook-pro.local",
-                "platform": "Darwin-arm64",
-                "python_version": "3.11.0",
-                "mac_address": "a4:83:e7:xx:xx:xx"
-            },
-            "registered_at": "2026-01-13T10:00:00Z",
-            "last_sync": "2026-01-13T12:00:00Z"
+        "edge_fingerprint": "macbook-pro-a1b2c3d4e5f6",
+        "camera_config": {
+            "camera_id": "default",
+            "source": "rtsp://192.168.1.100:554/stream",
+            "fps": 10
         },
-        "rpi4-x9y8z7w6v5u4": {
-            # Another device's config
-        }
+        "models": [],
+        "device_info": {
+            "hostname": "macbook-pro.local",
+            "platform": "Darwin-arm64",
+            "python_version": "3.11.0",
+            "mac_address": "a4:83:e7:xx:xx:xx"
+        },
+        "registered_at": "2026-01-13T10:00:00Z",
+        "last_sync": "2026-01-13T12:00:00Z"
     },
     
     # Optional: template for new edges
@@ -208,14 +201,14 @@ cyberwave twin create https://example.com/asset.json
    ├── Find existing twin OR create new
    ├── Configure edge (interactive)
    └── Save to:
-       ├── Cloud: twin.metadata.edge_configs[fingerprint]
+       ├── Cloud: twin.metadata.edge_configs
        └── Local: ./.env (secrets only)
 
 2. Edge service startup
    ├── Load .env (token, twin_uuid, secrets)
    ├── Connect to MQTT
    ├── Fetch twin metadata
-   ├── Load edge_configs[fingerprint]
+   ├── Load edge_configs (match by edge_fingerprint)
    └── Merge with local config (local wins for secrets)
 ```
 
