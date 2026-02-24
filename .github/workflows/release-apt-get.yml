@@ -62,6 +62,8 @@ jobs:
                 python3 \
                 python3-venv \
                 python3-pip \
+                python3-dev \
+                libpython3.10 \
                 ca-certificates \
                 build-essential
 
