@@ -22,9 +22,9 @@ console = Console()
     help="API token to save",
 )
 @click.option(
-    "--api-url",
+    "--base-url",
     "-u",
-    help="API URL (sets CYBERWAVE_API_URL env var hint)",
+    help="API URL (sets CYBERWAVE_BASE_URL env var hint)",
 )
 @click.option(
     "--show",
@@ -58,7 +58,7 @@ def configure(token: str | None, api_url: str | None, show: bool) -> None:
             console.print("  Token: [yellow]Not configured[/yellow]")
 
         console.print(
-            "\n[dim]Tip: Set CYBERWAVE_API_URL environment variable to change API URL[/dim]"
+            "\n[dim]Tip: Set CYBERWAVE_BASE_URL environment variable to change API URL[/dim]"
         )
         return
 
@@ -103,7 +103,6 @@ def configure(token: str | None, api_url: str | None, show: bool) -> None:
             token=token,
             cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
             cyberwave_edge_log_level=runtime_overrides.get("CYBERWAVE_EDGE_LOG_LEVEL"),
-            cyberwave_api_url=runtime_overrides.get("CYBERWAVE_API_URL"),
             cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
         )
     )
@@ -111,4 +110,4 @@ def configure(token: str | None, api_url: str | None, show: bool) -> None:
 
     if api_url:
         console.print(f"\n[dim]Note: To use {api_url} permanently, set:[/dim]")
-        console.print(f"  [cyan]export CYBERWAVE_API_URL={api_url}[/cyan]")
+        console.print(f"  [cyan]export CYBERWAVE_BASE_URL={api_url}[/cyan]")

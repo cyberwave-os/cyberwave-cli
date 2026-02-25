@@ -159,7 +159,6 @@ def login(email: str | None, password: str | None) -> None:
                     workspace_name=workspace.name,
                     cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
                     cyberwave_edge_log_level=runtime_overrides.get("CYBERWAVE_EDGE_LOG_LEVEL"),
-                    cyberwave_api_url=runtime_overrides.get("CYBERWAVE_API_URL"),
                     cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
                 )
             )

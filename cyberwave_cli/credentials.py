@@ -20,7 +20,6 @@ class Credentials:
     workspace_name: Optional[str] = None
     cyberwave_environment: Optional[str] = None
     cyberwave_edge_log_level: Optional[str] = None
-    cyberwave_api_url: Optional[str] = None
     cyberwave_base_url: Optional[str] = None
 
     def runtime_envs(self) -> dict[str, str]:
@@ -30,8 +29,6 @@ class Credentials:
             envs["CYBERWAVE_ENVIRONMENT"] = self.cyberwave_environment
         if self.cyberwave_edge_log_level:
             envs["CYBERWAVE_EDGE_LOG_LEVEL"] = self.cyberwave_edge_log_level
-        if self.cyberwave_api_url:
-            envs["CYBERWAVE_API_URL"] = self.cyberwave_api_url
         if self.cyberwave_base_url:
             envs["CYBERWAVE_BASE_URL"] = self.cyberwave_base_url
         return envs
@@ -78,7 +75,6 @@ class Credentials:
             workspace_name=data.get("workspace_name"),
             cyberwave_environment=_env_value("CYBERWAVE_ENVIRONMENT"),
             cyberwave_edge_log_level=_env_value("CYBERWAVE_EDGE_LOG_LEVEL"),
-            cyberwave_api_url=_env_value("CYBERWAVE_API_URL"),
             cyberwave_base_url=_env_value("CYBERWAVE_BASE_URL"),
         )
 
@@ -89,7 +85,6 @@ def collect_runtime_env_overrides(*, api_url_override: Optional[str] = None) -> 
     for key in (
         "CYBERWAVE_ENVIRONMENT",
         "CYBERWAVE_EDGE_LOG_LEVEL",
-        "CYBERWAVE_API_URL",
         "CYBERWAVE_BASE_URL",
     ):
         value = os.getenv(key)
@@ -100,13 +95,6 @@ def collect_runtime_env_overrides(*, api_url_override: Optional[str] = None) -> 
     env_name = overrides.get("CYBERWAVE_ENVIRONMENT", "").strip().lower()
     if env_name and env_name != "production":
         overrides.setdefault("CYBERWAVE_EDGE_LOG_LEVEL", "debug")
-
-    if api_url_override:
-        api_url = api_url_override.strip()
-        if api_url:
-            overrides["CYBERWAVE_API_URL"] = api_url
-            # Keep SDK-compatible alias in sync when caller explicitly sets API URL.
-            overrides.setdefault("CYBERWAVE_BASE_URL", api_url)
     return overrides
 
 
