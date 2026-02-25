@@ -235,8 +235,7 @@ Run `cyberwave config-dir` to see which directory is active.
 
 Other environment variables:
 
-- `CYBERWAVE_API_URL`: Override the API URL (default: `https://api.cyberwave.com`)
-- `CYBERWAVE_BASE_URL`: SDK-compatible alias for API URL
+- `CYBERWAVE_BASE_URL`: Override the API URL (default: `https://api.cyberwave.com`)
 - `CYBERWAVE_ENVIRONMENT`: Environment name (for example `dev`, defaults to `production`)
 
 When credentials are written, the CLI also persists these `CYBERWAVE_*` values into
