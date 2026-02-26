@@ -1,6 +1,7 @@
 """Login command for the Cyberwave CLI."""
 
 import sys
+import time
 
 import click
 from rich.console import Console
@@ -44,6 +45,11 @@ def select_workspace(workspaces: list[Workspace]) -> Workspace:
             console.print(f"[red]Please enter a number between 1 and {len(workspaces)}[/red]")
         except ValueError:
             console.print("[red]Please enter a valid number[/red]")
+
+
+def _is_retryable_workspace_token_error(error: AuthenticationError) -> bool:
+    """Return True when API token creation should be retried."""
+    return "HTTP error: 500" in str(error)
 
 
 def _validate_stored_token(token: str) -> bool:
@@ -143,12 +149,39 @@ def login(email: str | None, password: str | None) -> None:
                 )
                 raise click.Abort()
 
-            # Let user select a workspace if multiple are available
+            # Let user select a workspace if multiple are available.
+            # If API token creation hits transient backend 500s, retry the
+            # same workspace with a short backoff.
             workspace = select_workspace(workspaces)
-            console.print(f"\n[dim]Creating API token for workspace '{workspace.name}'...[/dim]")
+            max_attempts = 3
+            api_token = None
 
-            # Create a permanent API token for the selected workspace
-            api_token = client.create_api_token(session_token, workspace.uuid)
+            for attempt in range(1, max_attempts + 1):
+                if attempt == 1:
+                    console.print(
+                        f"\n[dim]Creating API token for workspace '{workspace.name}'...[/dim]"
+                    )
+                else:
+                    console.print(
+                        f"\n[dim]Retrying API token creation for workspace "
+                        f"'{workspace.name}' (attempt {attempt}/{max_attempts})...[/dim]"
+                    )
+
+                try:
+                    api_token = client.create_api_token(session_token, workspace.uuid)
+                    break
+                except AuthenticationError as exc:
+                    if attempt == max_attempts or not _is_retryable_workspace_token_error(exc):
+                        raise
+                    wait_seconds = 2 * attempt
+                    console.print(
+                        f"[yellow]⚠[/yellow] Temporary token creation failure: {exc}. "
+                        f"Retrying in {wait_seconds}s..."
+                    )
+                    time.sleep(wait_seconds)
+
+            if api_token is None:
+                raise AuthenticationError("Failed to create API token")
 
             # Save the permanent API token (not the session token which expires)
             save_credentials(
@@ -159,7 +192,6 @@ def login(email: str | None, password: str | None) -> None:
                     workspace_name=workspace.name,
                     cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
                     cyberwave_edge_log_level=runtime_overrides.get("CYBERWAVE_EDGE_LOG_LEVEL"),
-                    cyberwave_api_url=runtime_overrides.get("CYBERWAVE_API_URL"),
                     cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
                 )
             )

@@ -56,11 +56,10 @@ CAMERA_EDGE_DEFAULT_DIR = "cyberwave-camera"
 def get_api_url() -> str:
     """Get the API URL from environment or default.
 
-    Checks ``CYBERWAVE_API_URL`` first (CLI convention), then falls back to
-    ``CYBERWAVE_BASE_URL`` (SDK convention), and finally to the SDK's
+    Checks ``CYBERWAVE_BASE_URL`` first, and finally to the SDK's
     ``DEFAULT_BASE_URL``.
     """
-    return os.getenv("CYBERWAVE_API_URL", os.getenv("CYBERWAVE_BASE_URL", DEFAULT_BASE_URL))
+    return os.getenv("CYBERWAVE_BASE_URL", DEFAULT_BASE_URL)
 
 
 def clean_subprocess_env() -> dict[str, str]:
