@@ -166,7 +166,7 @@ def _select_environment(client: Any, yes: bool) -> str | None:
                 else:
                     workspace_id = workspaces[0].uuid
 
-                project = client.projects.create(name="Default Project", workspace_id=str(workspace_id))
+                project = client.projects.create(name="Default Folder", workspace_id=str(workspace_id))
                 project_id = project.uuid
             else:
                 project_id = projects[0].uuid
