@@ -678,6 +678,43 @@ def _attach_edge_fingerprint_to_twins(
     return updated, failed
 
 
+def sync_discovered_devices_to_twins(
+    client: Any,
+    twin_uuids: list[str],
+    edge_fingerprint: str,
+) -> tuple[int, int]:
+    """Discover USB cameras and update each twin's metadata with discovered_devices.
+
+    Returns:
+        (updated_count, failed_count)
+    """
+    from .device_utils import discover_usb_cameras, write_cameras_json
+
+    cameras = discover_usb_cameras()
+    write_cameras_json(cameras, CONFIG_DIR)
+
+    devices_list = [cam.to_dict() for cam in cameras]
+    if not devices_list:
+        return 0, 0
+
+    updated = 0
+    failed = 0
+
+    for twin_uuid in twin_uuids:
+        try:
+            twin = client.twins.get(twin_uuid)
+            metadata = getattr(twin, "metadata", {}) or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["discovered_devices"] = devices_list
+            client.twins.update(twin_uuid, metadata=metadata)
+            updated += 1
+        except Exception:
+            failed += 1
+
+    return updated, failed
+
+
 def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
     """Select workspace + environment and save /etc/cyberwave/environment.json."""
     creds = load_credentials()
@@ -717,6 +754,21 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
             console.print(f"[dim]Updated twins with edge fingerprint: {updated_count}[/dim]")
             if failed_count:
                 console.print(f"[yellow]Failed to update {failed_count} twin(s).[/yellow]")
+
+            # Discover cameras and update each twin's metadata with discovered_devices
+            dev_updated, dev_failed = sync_discovered_devices_to_twins(
+                client,
+                selected_twin_uuids,
+                edge_fingerprint,
+            )
+            if dev_updated:
+                console.print(
+                    f"[dim]Synced discovered camera devices to {dev_updated} twin(s)[/dim]"
+                )
+            if dev_failed:
+                console.print(
+                    f"[yellow]Failed to sync devices to {dev_failed} twin(s).[/yellow]"
+                )
 
         _save_environment_file(
             workspace_uuid=str(workspace.uuid),

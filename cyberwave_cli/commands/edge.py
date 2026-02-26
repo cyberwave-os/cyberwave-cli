@@ -484,6 +484,75 @@ def list_models(twin_uuid):
 # =============================================================================
 
 
+@edge.command("sync-devices")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
+def sync_devices(yes: bool):
+    """
+    Discover USB cameras and sync them to twin metadata via REST API.
+
+    Runs v4l2-ctl to discover cameras, writes cameras.json to the config directory,
+    and updates each twin linked to this edge with metadata.discovered_devices.
+    The frontend will handle device selection via dialogs.
+
+    \b
+    Example:
+        cyberwave edge sync-devices
+    """
+    from ..config import CONFIG_DIR
+    from ..core import (
+        _load_or_generate_edge_fingerprint,
+        sync_discovered_devices_to_twins,
+    )
+    from ..utils import get_sdk_client, print_error, print_success, print_warning
+
+    client = get_sdk_client()
+    if not client:
+        print_error("Not authenticated.", "Run 'cyberwave login' first.")
+        return
+
+    # Load environment to get twin UUIDs
+    env_file = CONFIG_DIR / "environment.json"
+    if not env_file.exists():
+        print_error(
+            "No environment configured.",
+            "Run 'cyberwave edge install' first to configure the edge.",
+        )
+        return
+
+    try:
+        with open(env_file) as f:
+            env_data = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        print_error(f"Failed to read environment file: {exc}")
+        return
+
+    twin_uuids = env_data.get("twin_uuids", [])
+    if not twin_uuids:
+        print_warning("No twins linked to this edge.")
+        console.print(
+            "[dim]Run 'cyberwave edge install' and select twins to link.[/dim]"
+        )
+        return
+
+    fingerprint = _load_or_generate_edge_fingerprint()
+    console.print(f"\n[dim]Fingerprint: {fingerprint}[/dim]")
+    console.print(f"[cyan]Syncing discovered devices to {len(twin_uuids)} twin(s)...[/cyan]\n")
+
+    updated, failed = sync_discovered_devices_to_twins(
+        client,
+        twin_uuids,
+        fingerprint,
+    )
+
+    if updated:
+        print_success(f"Synced discovered devices to {updated} twin(s)")
+        console.print(f"[dim]cameras.json written to {CONFIG_DIR}[/dim]")
+    if failed:
+        print_warning(f"Failed to sync to {failed} twin(s)")
+    if not updated and not failed:
+        console.print("[dim]No cameras discovered (v4l2-ctl may not be available on this system)[/dim]")
+
+
 @edge.command("whoami")
 def whoami():
     """
