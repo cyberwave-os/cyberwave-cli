@@ -237,6 +237,7 @@ Other environment variables:
 
 - `CYBERWAVE_BASE_URL`: Override the API URL (default: `https://api.cyberwave.com`)
 - `CYBERWAVE_ENVIRONMENT`: Environment name (for example `dev`, defaults to `production`)
+- `CYBERWAVE_MQTT_HOST`: MQTT broker host (for example `dev.mqtt.cyberwave.com` for dev; defaults to `mqtt.cyberwave.com`)
 
 When credentials are written, the CLI also persists these `CYBERWAVE_*` values into
 `credentials.json` so `cyberwave-edge-core` can reuse them in service mode.

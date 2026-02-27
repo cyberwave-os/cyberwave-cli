@@ -66,7 +66,7 @@ def _validate_stored_token(token: str) -> bool:
 
 def _stored_api_url(credentials: Credentials) -> str | None:
     """Read API URL override persisted in credentials (if any)."""
-    return credentials.cyberwave_api_url or credentials.cyberwave_base_url
+    return credentials.cyberwave_base_url
 
 
 @click.command()
@@ -193,6 +193,7 @@ def login(email: str | None, password: str | None) -> None:
                     cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
                     cyberwave_edge_log_level=runtime_overrides.get("CYBERWAVE_EDGE_LOG_LEVEL"),
                     cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
+                    cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
                 )
             )
 

@@ -285,7 +285,7 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
     creds = load_credentials()
     if creds and creds.token:
         try:
-            creds_base_url = creds.cyberwave_api_url or creds.cyberwave_base_url
+            creds_base_url = creds.cyberwave_base_url
             sdk_client = _get_sdk_client(creds.token, base_url=creds_base_url)
             sdk_client.workspaces.list()
             console.print(f"[green]✓[/green] Logged in as [bold]{creds.email}[/bold]")
@@ -303,6 +303,7 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                         cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
                         cyberwave_edge_log_level=_resolved_edge_log_level(runtime_overrides),
                         cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
+                        cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
                     )
                 )
             return True
@@ -355,6 +356,7 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                     cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
                     cyberwave_edge_log_level=_resolved_edge_log_level(runtime_overrides),
                     cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
+                    cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
                 )
             )
 

@@ -21,6 +21,7 @@ class Credentials:
     cyberwave_environment: Optional[str] = None
     cyberwave_edge_log_level: Optional[str] = None
     cyberwave_base_url: Optional[str] = None
+    cyberwave_mqtt_host: Optional[str] = None
 
     def runtime_envs(self) -> dict[str, str]:
         """Return persisted runtime env vars for edge/core processes."""
@@ -31,6 +32,8 @@ class Credentials:
             envs["CYBERWAVE_EDGE_LOG_LEVEL"] = self.cyberwave_edge_log_level
         if self.cyberwave_base_url:
             envs["CYBERWAVE_BASE_URL"] = self.cyberwave_base_url
+        if self.cyberwave_mqtt_host:
+            envs["CYBERWAVE_MQTT_HOST"] = self.cyberwave_mqtt_host
         return envs
 
     def to_dict(self) -> dict[str, Any]:
@@ -76,6 +79,7 @@ class Credentials:
             cyberwave_environment=_env_value("CYBERWAVE_ENVIRONMENT"),
             cyberwave_edge_log_level=_env_value("CYBERWAVE_EDGE_LOG_LEVEL"),
             cyberwave_base_url=_env_value("CYBERWAVE_BASE_URL"),
+            cyberwave_mqtt_host=_env_value("CYBERWAVE_MQTT_HOST"),
         )
 
 
@@ -86,10 +90,14 @@ def collect_runtime_env_overrides(*, api_url_override: Optional[str] = None) -> 
         "CYBERWAVE_ENVIRONMENT",
         "CYBERWAVE_EDGE_LOG_LEVEL",
         "CYBERWAVE_BASE_URL",
+        "CYBERWAVE_MQTT_HOST",
     ):
         value = os.getenv(key)
         if isinstance(value, str) and value.strip():
             overrides[key] = value.strip()
+
+    if api_url_override and api_url_override.strip():
+        overrides["CYBERWAVE_BASE_URL"] = api_url_override.strip()
 
     # In non-production explicit environments, default edge-core to verbose logs.
     env_name = overrides.get("CYBERWAVE_ENVIRONMENT", "").strip().lower()
