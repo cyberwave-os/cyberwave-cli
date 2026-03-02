@@ -17,6 +17,9 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Raspberry Pi platform devices that v4l2-ctl lists but are not actual cameras
+EXCLUDED_CAMERA_CARDS = frozenset({"pispbe", "rpi-hevc-dec"})
+
 
 @dataclass
 class CameraDevice:
@@ -192,6 +195,13 @@ def discover_usb_cameras_v4l2() -> list[CameraDevice]:
         # Parse stdout regardless of return code - v4l2-ctl may output valid devices
         # before failing on an inaccessible one (e.g. unplugged /dev/video0)
         devices = _parse_v4l2_list_devices(result.stdout or "")
+
+        # Exclude Raspberry Pi platform devices (pispbe, rpi-hevc-dec) - not actual cameras
+        devices = [
+            d
+            for d in devices
+            if (d.card or "").lower().strip() not in EXCLUDED_CAMERA_CARDS
+        ]
 
         for device in devices:
             if device.primary_path:
