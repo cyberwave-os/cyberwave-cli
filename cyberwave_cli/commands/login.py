@@ -141,7 +141,7 @@ def login(email: str | None, password: str | None) -> None:
 
             if not workspaces:
                 console.print(
-                    f"\n[yellow]⚠[/yellow] Logged in as [bold]{user.email}[/bold] "
+                    f"\n[yellow][WARN][/yellow] Logged in as [bold]{user.email}[/bold] "
                     "but no workspaces found."
                 )
                 console.print(
@@ -175,7 +175,7 @@ def login(email: str | None, password: str | None) -> None:
                         raise
                     wait_seconds = 2 * attempt
                     console.print(
-                        f"[yellow]⚠[/yellow] Temporary token creation failure: {exc}. "
+                        f"[yellow][WARN][/yellow] Temporary token creation failure: {exc}. "
                         f"Retrying in {wait_seconds}s..."
                     )
                     time.sleep(wait_seconds)
@@ -197,7 +197,9 @@ def login(email: str | None, password: str | None) -> None:
                 )
             )
 
-            console.print(f"\n[green][OK][/green] Successfully logged in as [bold]{user.email}[/bold]")
+            console.print(
+                f"\n[green][OK][/green] Successfully logged in as [bold]{user.email}[/bold]"
+            )
             console.print(f"[dim]Workspace: {workspace.name}[/dim]")
             from ..config import CREDENTIALS_FILE
 
