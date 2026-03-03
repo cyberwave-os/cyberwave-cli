@@ -27,7 +27,7 @@ def get_sdk_client(token: str):
         from cyberwave import Cyberwave
         return Cyberwave(base_url=get_api_url(), token=token)
     except ImportError:
-        console.print("[red]✗[/red] Cyberwave SDK not installed.")
+        console.print("[red][ERROR][/red] Cyberwave SDK not installed.")
         console.print("[dim]Install with: pip install cyberwave[/dim]")
         return None
 
@@ -90,7 +90,7 @@ def create_environment_sdk(client, name: str, description: str = "") -> Optional
         )
         return {"uuid": str(env.uuid), "name": env.name}
     except Exception as e:
-        console.print(f"[red]✗[/red] Failed to create environment: {e}")
+        console.print(f"[red][ERROR][/red] Failed to create environment: {e}")
         return None
 
 
@@ -135,7 +135,7 @@ def create_twin_sdk(
         )
         return {"uuid": str(twin.uuid), "name": twin.name}
     except Exception as e:
-        console.print(f"[red]✗[/red] Failed to create twin: {e}")
+        console.print(f"[red][ERROR][/red] Failed to create twin: {e}")
         return None
 
 
@@ -198,7 +198,7 @@ LOG_LEVEL=INFO
         env_file.write_text(env_content)
         return True
     except Exception as e:
-        console.print(f"[red]✗[/red] Error writing .env file: {e}")
+        console.print(f"[red][ERROR][/red] Error writing .env file: {e}")
         return False
 
 
@@ -315,7 +315,7 @@ def camera(
     # Check authentication
     creds = load_credentials()
     if not creds or not creds.token:
-        console.print("\n[red]✗[/red] Not logged in.")
+        console.print("\n[red][ERROR][/red] Not logged in.")
         console.print("[dim]Run [bold]cyberwave-cli login[/bold] or [bold]cyberwave-cli configure --token YOUR_TOKEN[/bold][/dim]")
         raise click.Abort()
 
@@ -329,12 +329,12 @@ def camera(
     # Skip git check if using local edge or env-only mode
     if not local_edge and not env_only:
         if not check_git_installed():
-            console.print("[red]✗[/red] Git is not installed. Please install git first.")
+            console.print("[red][ERROR][/red] Git is not installed. Please install git first.")
             raise click.Abort()
 
         # Check if target directory already exists
         if target_path.exists():
-            console.print(f"[red]✗[/red] Directory already exists: [bold]{target_path}[/bold]")
+            console.print(f"[red][ERROR][/red] Directory already exists: [bold]{target_path}[/bold]")
             if not yes and not click.confirm("Do you want to overwrite it?"):
                 raise click.Abort()
             shutil.rmtree(target_path)
@@ -369,7 +369,7 @@ def camera(
                         env_uuid = existing_envs[idx].get("uuid")
                         env_name = existing_envs[idx].get("name")
                         console.print(
-                            f"[green]✓[/green] Using environment: [bold]{env_name}[/bold]"
+                            f"[green][OK][/green] Using environment: [bold]{env_name}[/bold]"
                         )
                 except ValueError:
                     pass
@@ -396,11 +396,11 @@ def camera(
             env_data = create_environment_sdk(sdk_client, env_name)
 
             if not env_data:
-                console.print("[red]✗[/red] Failed to create environment")
+                console.print("[red][ERROR][/red] Failed to create environment")
                 raise click.Abort()
 
             env_uuid = env_data.get("uuid")
-            console.print(f"[green]✓[/green] Created environment: [bold]{env_name}[/bold]")
+            console.print(f"[green][OK][/green] Created environment: [bold]{env_name}[/bold]")
             console.print(f"[dim]  UUID: {env_uuid}[/dim]")
 
     # Handle twin - use provided UUID or create new
@@ -420,7 +420,7 @@ def camera(
         else:
             asset_uuid = camera_asset.get("uuid")
             asset_name = camera_asset.get("name", "Unknown")
-            console.print(f"[green]✓[/green] Using asset: [bold]{asset_name}[/bold]")
+            console.print(f"[green][OK][/green] Using asset: [bold]{asset_name}[/bold]")
 
         # Determine twin name
         final_twin_name = twin_name
@@ -450,7 +450,7 @@ def camera(
 
         if twin_data:
             final_twin_uuid = twin_data.get("uuid")
-            console.print(f"[green]✓[/green] Created twin: [bold]{final_twin_name}[/bold]")
+            console.print(f"[green][OK][/green] Created twin: [bold]{final_twin_name}[/bold]")
             console.print(f"[dim]  UUID: {final_twin_uuid}[/dim]")
         elif not yes:
             final_twin_uuid = Prompt.ask(
@@ -459,14 +459,14 @@ def camera(
             )
 
         if not final_twin_uuid:
-            console.print("[red]✗[/red] Twin UUID is required for camera setup")
+            console.print("[red][ERROR][/red] Twin UUID is required for camera setup")
             raise click.Abort()
     else:
-        console.print(f"[green]✓[/green] Using existing twin: [dim]{final_twin_uuid}[/dim]")
+        console.print(f"[green][OK][/green] Using existing twin: [dim]{final_twin_uuid}[/dim]")
 
     # Handle edge software setup
     if local_edge or env_only:
-        console.print(f"\n[green]✓[/green] Using local edge code: [bold]{target_path}[/bold]")
+        console.print(f"\n[green][OK][/green] Using local edge code: [bold]{target_path}[/bold]")
     else:
         # Clone the repository
         console.print("\n[bold]Cloning camera edge software...[/bold]")
@@ -480,11 +480,11 @@ def camera(
         )
 
         if result.returncode != 0:
-            console.print("[red]✗[/red] Failed to clone repository")
+            console.print("[red][ERROR][/red] Failed to clone repository")
             console.print(f"[dim]{result.stderr}[/dim]")
             raise click.Abort()
 
-        console.print(f"[green]✓[/green] Cloned to [bold]{target_path}[/bold]")
+        console.print(f"[green][OK][/green] Cloned to [bold]{target_path}[/bold]")
 
     # Write the .env file
     console.print("\n[bold]Configuring credentials...[/bold]")
@@ -499,16 +499,16 @@ def camera(
         camera_username=camera_user,
         camera_password=camera_pass,
     ):
-        console.print("[green]✓[/green] Created .env file with credentials")
+        console.print("[green][OK][/green] Created .env file with credentials")
         if camera_url:
-            console.print(f"[green]✓[/green] Configured IP camera: [dim]{camera_url}[/dim]")
+            console.print(f"[green][OK][/green] Configured IP camera: [dim]{camera_url}[/dim]")
         else:
-            console.print(f"[green]✓[/green] Configured local camera: [dim]device {camera_id}[/dim]")
+            console.print(f"[green][OK][/green] Configured local camera: [dim]device {camera_id}[/dim]")
     else:
         raise click.Abort()
 
     # Print success and next steps
-    console.print("\n[bold green]✓ Camera setup completed![/bold green]")
+    console.print("\n[bold green][OK] Camera setup completed![/bold green]")
 
     console.print("\n[bold]Environment Details:[/bold]")
     console.print(f"  • Environment: [bold]{env_name or 'Unknown'}[/bold]")
