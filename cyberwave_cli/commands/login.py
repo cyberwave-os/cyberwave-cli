@@ -111,7 +111,7 @@ def login(email: str | None, password: str | None) -> None:
             if existing_creds.workspace_name:
                 workspace_info = f" (workspace: [bold]{existing_creds.workspace_name}[/bold])"
             display_email = existing_creds.email or "unknown"
-            msg = f"\n[green]✓[/green] Already logged in as [bold]{display_email}[/bold]"
+            msg = f"\n[green][OK][/green] Already logged in as [bold]{display_email}[/bold]"
             console.print(f"{msg}{workspace_info}")
             # Non-interactive: proceed with re-login (no way to ask).
             if sys.stdin.isatty():
@@ -141,7 +141,7 @@ def login(email: str | None, password: str | None) -> None:
 
             if not workspaces:
                 console.print(
-                    f"\n[yellow]⚠[/yellow] Logged in as [bold]{user.email}[/bold] "
+                    f"\n[yellow][WARN][/yellow] Logged in as [bold]{user.email}[/bold] "
                     "but no workspaces found."
                 )
                 console.print(
@@ -175,7 +175,7 @@ def login(email: str | None, password: str | None) -> None:
                         raise
                     wait_seconds = 2 * attempt
                     console.print(
-                        f"[yellow]⚠[/yellow] Temporary token creation failure: {exc}. "
+                        f"[yellow][WARN][/yellow] Temporary token creation failure: {exc}. "
                         f"Retrying in {wait_seconds}s..."
                     )
                     time.sleep(wait_seconds)
@@ -197,12 +197,14 @@ def login(email: str | None, password: str | None) -> None:
                 )
             )
 
-            console.print(f"\n[green]✓[/green] Successfully logged in as [bold]{user.email}[/bold]")
+            console.print(
+                f"\n[green][OK][/green] Successfully logged in as [bold]{user.email}[/bold]"
+            )
             console.print(f"[dim]Workspace: {workspace.name}[/dim]")
             from ..config import CREDENTIALS_FILE
 
             console.print(f"[dim]API token saved to {CREDENTIALS_FILE}[/dim]")
 
     except AuthenticationError as e:
-        console.print(f"\n[red]✗[/red] Login failed: {e}")
+        console.print(f"\n[red][ERROR][/red] Login failed: {e}")
         raise click.Abort()
