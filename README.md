@@ -42,19 +42,19 @@ Manage the edge node service lifecycle, configuration, and monitoring.
 | Subcommand       | Description                                              |
 | ---------------- | -------------------------------------------------------- |
 | `install`        | Install cyberwave-edge-core and register systemd service |
-| `install-deps`   | Install edge ML dependencies                             |
-| `list-drivers`   | List running driver containers                           |
-| `list-models`    | List model bindings loaded on the edge node              |
-| `logs`           | Show edge node logs                                      |
-| `pull`           | Pull edge configuration from backend                     |
-| `restart`        | Restart the edge node (systemd or process)               |
-| `start`          | Start the edge node                                      |
-| `status`         | Check if the edge node is running                        |
-| `stop`           | Stop the edge node                                       |
-| `stop-driver`    | Stop a running driver container                          |
-| `sync-workflows` | Trigger workflow sync on the edge node                   |
 | `uninstall`      | Stop and remove the systemd service                      |
+| `start`          | Start the edge node                                      |
+| `stop`           | Stop the edge node                                       |
+| `restart`        | Restart the edge node (systemd or process)               |
+| `status`         | Check if the edge node is running                        |
+| `pull`           | Pull edge configuration from backend                     |
 | `whoami`         | Show device fingerprint and info                         |
+| `logs`           | Show edge node logs                                      |
+| `list-drivers`   | List running driver containers                           |
+| `stop-driver`    | Stop a running driver container                          |
+| `install-deps`   | Install edge ML dependencies                             |
+| `sync-workflows` | Trigger workflow sync on the edge node                   |
+| `list-models`    | List model bindings loaded on the edge node              |
 
 ### `cyberwave edge install`
 
@@ -80,7 +80,7 @@ cyberwave edge start                        # background
 cyberwave edge start -f                     # foreground
 cyberwave edge start --env-file ./my/.env   # custom config
 
-cyberwave edge stop
+cyberwave edge stop                         
 
 sudo cyberwave edge restart                 # systemd
 cyberwave edge restart --env-file .env      # process mode
@@ -116,6 +116,8 @@ cyberwave edge whoami
 ### `cyberwave edge logs`
 
 Streams logs from the systemd journal for the edge service.
+
+```bash
 cyberwave edge logs              # last 50 lines
 cyberwave edge logs -n 100       # last 100 lines
 cyberwave edge logs -f           # follow (tail -f)
@@ -152,14 +154,23 @@ cyberwave edge install-deps                       # ultralytics + opencv
 cyberwave edge install-deps -r onnx -r tflite     # specific runtimes
 ```
 
-### `cyberwave edge sync-workflows / list-models`
+### `cyberwave edge sync-workflows`
+
+Trigger workflow sync on the edge node.
 
 ```bash
-cyberwave edge sync-workflows --twin-uuid <UUID>  # re-sync model bindings
-cyberwave edge list-models --twin-uuid <UUID>      # show loaded models
+cyberwave edge sync-workflows --twin-uuid <UUID>
 ```
 
-## Commands CLI tool
+### `cyberwave edge list-models`
+
+Show model bindings loaded on the edge node.
+
+```bash
+cyberwave edge list-models --twin-uuid <UUID>
+```
+
+## Commands
 
 | Command      | Description                              |
 | ------------ | ---------------------------------------- |
