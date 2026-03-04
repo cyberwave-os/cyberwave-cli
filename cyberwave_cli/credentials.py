@@ -7,13 +7,32 @@ from datetime import datetime
 from typing import Any, Optional
 
 import click
+from rich.console import Console
 
 from .config import CONFIG_DIR, CREDENTIALS_FILE
 
-_PERMISSION_HINT = (
-    f"Permission denied accessing {CREDENTIALS_FILE}.\n"
-    "  Try running with sudo: sudo cyberwave ..."
-)
+_console = Console()
+
+
+def _raise_permission_error() -> None:
+    """Print a colored permission-denied message and exit."""
+    try:
+        ctx: click.Context | None = click.get_current_context()
+        parts: list[str] = []
+        while ctx is not None:
+            name = "cyberwave" if ctx.parent is None else ctx.info_name
+            if name:
+                parts.append(name)
+            ctx = ctx.parent
+        parts.reverse()
+        cmd = " ".join(parts)
+    except RuntimeError:
+        cmd = "cyberwave edge install"
+    _console.print(
+        "[red]Root privileges required.[/red]\n"
+        f"[dim]Re-run with sudo: sudo {cmd}[/dim]"
+    )
+    raise SystemExit(1)
 
 
 @dataclass
@@ -130,7 +149,7 @@ def save_credentials(credentials: Credentials) -> None:
     try:
         ensure_config_dir()
     except PermissionError:
-        raise click.ClickException(_PERMISSION_HINT)
+        _raise_permission_error()
 
     # Add timestamp if not present
     if not credentials.created_at:
@@ -148,7 +167,7 @@ def save_credentials(credentials: Credentials) -> None:
             except (json.JSONDecodeError, OSError):
                 existing_payload = {}
     except PermissionError:
-        raise click.ClickException(_PERMISSION_HINT)
+        _raise_permission_error()
 
     merged_payload = {**existing_payload, **payload}
     existing_envs = existing_payload.get("envs")
@@ -162,7 +181,7 @@ def save_credentials(credentials: Credentials) -> None:
         with open(CREDENTIALS_FILE, "w") as f:
             json.dump(merged_payload, f, indent=2)
     except PermissionError:
-        raise click.ClickException(_PERMISSION_HINT)
+        _raise_permission_error()
 
     # Best-effort permission restriction.
     if os.name != "nt":
@@ -178,14 +197,14 @@ def load_credentials() -> Optional[Credentials]:
         if not CREDENTIALS_FILE.exists():
             return None
     except PermissionError:
-        raise click.ClickException(_PERMISSION_HINT)
+        _raise_permission_error()
 
     try:
         with open(CREDENTIALS_FILE, "r") as f:
             data = json.load(f)
             return Credentials.from_dict(data)
     except PermissionError:
-        raise click.ClickException(_PERMISSION_HINT)
+        _raise_permission_error()
     except (json.JSONDecodeError, KeyError):
         return None
 
