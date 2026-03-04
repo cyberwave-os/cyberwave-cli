@@ -174,6 +174,8 @@ def _select_with_arrows(title: str, options: list[str]) -> int:
             char = sys.stdin.read(1)
             if char in ("\r", "\n"):
                 return selected
+            if char == "\x03":  # Ctrl+C — restore terminal then abort
+                raise KeyboardInterrupt
             if char == "\x1b":
                 nxt = sys.stdin.read(1)
                 if nxt == "[":
@@ -193,7 +195,6 @@ def _select_with_arrows(title: str, options: list[str]) -> int:
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         sys.stdout.write("\x1b[?25h")
-        _tty_write("\n")
         sys.stdout.flush()
 
 

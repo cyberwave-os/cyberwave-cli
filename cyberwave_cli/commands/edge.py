@@ -380,10 +380,46 @@ def list_drivers():
         console.print(f"[red]Error listing drivers: {e}[/red]")
 
 
+def _pick_driver_name() -> str | None:
+    """Interactively pick a running cyberwave-driver container name."""
+    from ..core import _select_with_arrows
+
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--filter", "name=cyberwave-driver", "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        console.print("[red]Error: docker not found — is Docker installed and running?[/red]")
+        return None
+
+    lines = [l for l in result.stdout.strip().splitlines() if l]
+    if not lines:
+        console.print("[yellow]No running driver containers found[/yellow]")
+        return None
+
+    names = []
+    options = []
+    for line in lines:
+        parts = line.split("\t")
+        name   = parts[0]
+        image  = parts[1] if len(parts) > 1 else ""
+        status = parts[2] if len(parts) > 2 else ""
+        names.append(name)
+        options.append(f"{name} [{image}]")
+
+    idx = _select_with_arrows("Select a driver to stop", options)
+    return names[idx]
+
+
 @edge.command("stop-driver")
-@click.argument("name")
-def stop_driver(name: str):
+@click.argument("name", required=False, default=None)
+def stop_driver(name: str | None):
     """Stop a running driver container.
+
+    If NAME is omitted, shows an interactive list of running driver containers
+    to pick from.
 
     Disables any Docker restart policy before stopping, so the container
     does not come back automatically.
@@ -397,9 +433,15 @@ def stop_driver(name: str):
 
     \b
     Examples:
+        cyberwave edge stop-driver
         cyberwave edge stop-driver cyberwave-driver-624d7fe2
         cyberwave edge stop-driver cyberwave-go2-driver
     """
+    if name is None:
+        name = _pick_driver_name()
+        if name is None:
+            return
+
     try:
         # Check the container exists and is running
         inspect = subprocess.run(
