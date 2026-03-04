@@ -255,11 +255,7 @@ def _save_environment_file(
 
 
 def _load_or_generate_edge_fingerprint() -> str:
-    """Load edge fingerprint saved by edge-core, fallback to CLI generator.
-
-    When generating a new fingerprint, persist it to disk so that edge-core
-    reads the same value on its first startup.
-    """
+    """Load edge fingerprint saved by edge-core, fallback to CLI generator."""
     if FINGERPRINT_FILE.exists():
         try:
             data = json.loads(FINGERPRINT_FILE.read_text(encoding="utf-8"))
@@ -269,16 +265,7 @@ def _load_or_generate_edge_fingerprint() -> str:
         except Exception:
             pass
 
-    fingerprint = generate_fingerprint()
-    try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        FINGERPRINT_FILE.write_text(
-            json.dumps({"fingerprint": fingerprint}, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
-    return fingerprint
+    return generate_fingerprint()
 
 
 def _resolved_edge_log_level(runtime_overrides: dict[str, str | None]) -> str | None:
@@ -665,52 +652,6 @@ def _select_connected_twins(client: Any, environment_uuid: str, *, skip_confirm:
         )
 
 
-def _download_twin_json_files(client: Any, twin_uuids: list[str]) -> int:
-    """Download twin+asset data and write JSON files consumed by edge drivers.
-
-    Each selected twin gets a ``{twin_uuid}.json`` file in CONFIG_DIR so that
-    edge-core and driver containers can read them immediately after install
-    without needing an extra API round-trip on first boot.
-
-    Returns the number of files successfully written.
-    """
-    from datetime import date, datetime
-
-    def _json_default(obj: Any) -> Any:
-        if isinstance(obj, (datetime, date)):
-            return obj.isoformat()
-        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
-
-    written = 0
-    for twin_uuid in twin_uuids:
-        try:
-            twin = client.twins.get(twin_uuid)
-            twin_data: dict[str, Any] = (
-                twin.to_dict()
-                if hasattr(twin, "to_dict")
-                else {"uuid": twin_uuid, "name": getattr(twin, "name", None)}
-            )
-
-            asset_uuid = getattr(twin, "asset_uuid", None) or getattr(twin, "asset_id", "")
-            asset_data: dict[str, Any] = {}
-            if asset_uuid:
-                try:
-                    asset = client.assets.get(str(asset_uuid))
-                    asset_data = asset.to_dict() if hasattr(asset, "to_dict") else {}
-                except Exception:
-                    pass
-
-            twin_data["asset"] = asset_data
-            twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
-            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            with open(twin_json_file, "w") as f:
-                json.dump(twin_data, f, indent=2, default=_json_default)
-            written += 1
-        except Exception as exc:
-            console.print(f"[yellow]Failed to download twin JSON for {twin_uuid[:8]}…: {exc}[/yellow]")
-    return written
-
-
 def _attach_edge_fingerprint_to_twins(
     client: Any, twin_uuids: list[str], edge_fingerprint: str
 ) -> tuple[int, int]:
@@ -788,10 +729,6 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
         console.print(f"[green]Environment saved:[/green] {ENVIRONMENT_FILE}")
         console.print(f"[dim]Environment: {env_name or env_uuid}[/dim]")
         console.print(f"[dim]Connected twins selected: {len(selected_twin_uuids)}[/dim]")
-
-        if selected_twin_uuids:
-            written = _download_twin_json_files(client, selected_twin_uuids)
-            console.print(f"[dim]Twin JSON files downloaded: {written}[/dim]")
         return True
     except AuthenticationError as exc:
         console.print(f"[red]Authentication error:[/red] {exc}")
@@ -1085,6 +1022,29 @@ def restart_service() -> bool:
         return False
 
     console.print(f"[green]Service restarted:[/green] {SYSTEMD_UNIT_NAME}")
+    return True
+
+
+def stop_service() -> bool:
+    """Stop the cyberwave-edge-core systemd service.
+
+    Returns True on success.
+    """
+    if not _has_systemd():
+        console.print("[yellow]systemd not detected — cannot stop via systemd.[/yellow]")
+        return False
+
+    if not SYSTEMD_UNIT_PATH.exists():
+        console.print("[red]Service unit not found — run 'cyberwave edge install' first.[/red]")
+        return False
+
+    try:
+        _run(["systemctl", "stop", SYSTEMD_UNIT_NAME])
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]systemctl stop failed (exit {exc.returncode}).[/red]")
+        return False
+
+    console.print(f"[green]Service stopped:[/green] {SYSTEMD_UNIT_NAME}")
     return True
 
 

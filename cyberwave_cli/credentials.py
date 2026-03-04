@@ -6,7 +6,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+import click
+
 from .config import CONFIG_DIR, CREDENTIALS_FILE
+
+_PERMISSION_HINT = (
+    f"Permission denied accessing {CREDENTIALS_FILE}.\n"
+    "  Try running with sudo: sudo cyberwave ..."
+)
 
 
 @dataclass
@@ -120,7 +127,10 @@ def ensure_config_dir() -> None:
 
 def save_credentials(credentials: Credentials) -> None:
     """Save credentials to the config file."""
-    ensure_config_dir()
+    try:
+        ensure_config_dir()
+    except PermissionError:
+        raise click.ClickException(_PERMISSION_HINT)
 
     # Add timestamp if not present
     if not credentials.created_at:
@@ -128,14 +138,17 @@ def save_credentials(credentials: Credentials) -> None:
 
     payload = credentials.to_dict()
     existing_payload: dict = {}
-    if CREDENTIALS_FILE.exists():
-        try:
-            with open(CREDENTIALS_FILE, "r") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                existing_payload = loaded
-        except (json.JSONDecodeError, OSError):
-            existing_payload = {}
+    try:
+        if CREDENTIALS_FILE.exists():
+            try:
+                with open(CREDENTIALS_FILE, "r") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    existing_payload = loaded
+            except (json.JSONDecodeError, OSError):
+                existing_payload = {}
+    except PermissionError:
+        raise click.ClickException(_PERMISSION_HINT)
 
     merged_payload = {**existing_payload, **payload}
     existing_envs = existing_payload.get("envs")
@@ -145,8 +158,11 @@ def save_credentials(credentials: Credentials) -> None:
             **(existing_envs if isinstance(existing_envs, dict) else {}),
             **(payload_envs if isinstance(payload_envs, dict) else {}),
         }
-    with open(CREDENTIALS_FILE, "w") as f:
-        json.dump(merged_payload, f, indent=2)
+    try:
+        with open(CREDENTIALS_FILE, "w") as f:
+            json.dump(merged_payload, f, indent=2)
+    except PermissionError:
+        raise click.ClickException(_PERMISSION_HINT)
 
     # Best-effort permission restriction.
     if os.name != "nt":
@@ -158,13 +174,18 @@ def save_credentials(credentials: Credentials) -> None:
 
 def load_credentials() -> Optional[Credentials]:
     """Load credentials from the config file."""
-    if not CREDENTIALS_FILE.exists():
-        return None
+    try:
+        if not CREDENTIALS_FILE.exists():
+            return None
+    except PermissionError:
+        raise click.ClickException(_PERMISSION_HINT)
 
     try:
         with open(CREDENTIALS_FILE, "r") as f:
             data = json.load(f)
             return Credentials.from_dict(data)
+    except PermissionError:
+        raise click.ClickException(_PERMISSION_HINT)
     except (json.JSONDecodeError, KeyError):
         return None
 
