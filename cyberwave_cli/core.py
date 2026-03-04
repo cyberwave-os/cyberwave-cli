@@ -419,11 +419,49 @@ def _workspace_projects(client: Any, workspace_uuid: str) -> list[Any]:
     return result
 
 
+def _environment_workspace_uuid(environment: Any) -> str:
+    """Best-effort workspace UUID extraction for environment objects."""
+    workspace_uuid = str(
+        getattr(environment, "workspace_uuid", "")
+        or getattr(environment, "workspace_id", "")
+        or ""
+    )
+    if workspace_uuid:
+        return workspace_uuid
+
+    settings = getattr(environment, "settings", None)
+    if isinstance(settings, dict):
+        standalone_workspace_uuid = settings.get("_workspace_uuid")
+        if isinstance(standalone_workspace_uuid, str) and standalone_workspace_uuid:
+            return standalone_workspace_uuid
+
+    project = getattr(environment, "project", None)
+    if project is not None:
+        project_workspace_uuid = str(
+            getattr(project, "workspace_uuid", "") or getattr(project, "workspace_id", "") or ""
+        )
+        if project_workspace_uuid:
+            return project_workspace_uuid
+
+        workspace = getattr(project, "workspace", None)
+        if workspace is not None:
+            nested_workspace_uuid = str(getattr(workspace, "uuid", "") or "")
+            if nested_workspace_uuid:
+                return nested_workspace_uuid
+
+    return ""
+
+
 def _workspace_environments(client: Any, workspace_uuid: str) -> list[Any]:
-    """Return environments scoped to selected workspace projects."""
+    """Return environments for the selected workspace.
+
+    Includes both project-scoped environments and standalone environments
+    attached directly to a workspace.
+    """
     environments: list[Any] = []
     seen_uuids: set[str] = set()
     projects = _workspace_projects(client, workspace_uuid)
+
     for project in projects:
         envs = client.environments.list(project_id=str(project.uuid))
         for env in envs:
@@ -431,6 +469,26 @@ def _workspace_environments(client: Any, workspace_uuid: str) -> list[Any]:
             if env_uuid and env_uuid not in seen_uuids:
                 environments.append(env)
                 seen_uuids.add(env_uuid)
+
+    # Also include standalone environments that are not inside a project.
+    # We use the global listing because standalone environments cannot be
+    # discovered via project_id queries.
+    try:
+        all_environments = client.environments.list()
+    except Exception:
+        return environments
+
+    if not all_environments:
+        return environments
+
+    for env in all_environments:
+        if _environment_workspace_uuid(env) != workspace_uuid:
+            continue
+        env_uuid = str(getattr(env, "uuid", ""))
+        if env_uuid and env_uuid not in seen_uuids:
+            environments.append(env)
+            seen_uuids.add(env_uuid)
+
     return environments
 
 
