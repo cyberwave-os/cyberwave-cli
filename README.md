@@ -107,6 +107,13 @@ Manage the edge node service lifecycle, configuration, and monitoring.
 | `install-deps`   | Install edge ML dependencies                             |
 | `sync-workflows` | Trigger workflow sync on the edge node                   |
 | `list-models`    | List model bindings loaded on the edge node              |
+| `driver`         | Manage edge driver containers (subgroup)                 |
+
+| `driver` subcommand | Description                      |
+| ------------------- | -------------------------------- |
+| `driver list`       | List running driver containers (`--all` includes exited) |
+| `driver start`      | Start a stopped driver container |
+| `driver stop`       | Stop a running driver container  |
 
 ### `cyberwave edge install`
 
@@ -205,6 +212,35 @@ cyberwave edge install-deps -r onnx -r tflite     # specific runtimes
 ```bash
 cyberwave edge sync-workflows --twin-uuid <UUID>  # re-sync model bindings
 cyberwave edge list-models --twin-uuid <UUID>      # show loaded models
+```
+
+### `cyberwave edge driver`
+
+Manage edge driver containers.
+
+| Subcommand | Description                                              |
+| ---------- | -------------------------------------------------------- |
+| `list`     | List running driver containers (`--all` includes exited) |
+| `start`    | Start a stopped driver container |
+| `stop`     | Stop a running driver container  |
+
+```bash
+cyberwave edge driver list           # running containers only
+cyberwave edge driver list --all     # include exited containers
+
+cyberwave edge driver start                             # interactive picker (stopped containers)
+cyberwave edge driver start cyberwave-driver-624d7fe2   # directly by name
+
+cyberwave edge driver stop                              # interactive picker (running containers)
+cyberwave edge driver stop cyberwave-driver-624d7fe2    # directly by name
+```
+
+`start` restarts an existing stopped container and sets a `--restart=on-failure` Docker policy, so the driver automatically retries if it exits due to a transient error (e.g. robot not yet reachable on the network). To launch a brand-new driver, use the edge-core service which manages image selection and environment configuration.
+
+`stop` disables the Docker restart policy before stopping, so the container does not come back automatically. If the driver is managed by a systemd service, stop that instead:
+
+```bash
+sudo systemctl stop cyberwave-video-grabber.service
 ```
 
 ## Configuration

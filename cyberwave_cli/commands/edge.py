@@ -349,16 +349,26 @@ def status_edge():
         console.print(f"[red]Error checking status: {e}[/red]")
 
 
-@edge.command("list-drivers")
-def list_drivers():
+@edge.group("driver")
+def driver():
+    """Manage edge driver containers."""
+    pass
+
+
+@driver.command("list")
+@click.option("--all", "show_all", is_flag=True, default=False, help="Also show exited driver containers.")
+def list_drivers(show_all: bool):
     """List running driver containers."""
     try:
+        cmd = [
+            "docker", "ps",
+            "--filter", "name=cyberwave-driver",
+            "--format", "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.ID}}",
+        ]
+        if show_all:
+            cmd.insert(2, "--all")
         result = subprocess.run(
-            [
-                "docker", "ps",
-                "--filter", "name=cyberwave-driver",
-                "--format", "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.ID}}",
-            ],
+            cmd,
             capture_output=True,
             text=True,
         )
@@ -380,13 +390,23 @@ def list_drivers():
         console.print(f"[red]Error listing drivers: {e}[/red]")
 
 
-def _pick_driver_name() -> str | None:
-    """Interactively pick a running cyberwave-driver container name."""
+def _pick_driver_name(title: str = "Select a driver", *, stopped: bool = False) -> str | None:
+    """Interactively pick a cyberwave-driver container name.
+
+    When stopped=False (default) only running containers are listed.
+    When stopped=True only exited/stopped containers are listed.
+    """
     from ..core import _select_with_arrows
 
+    filter_status = "exited" if stopped else "running"
     try:
         result = subprocess.run(
-            ["docker", "ps", "--filter", "name=cyberwave-driver", "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}"],
+            [
+                "docker", "ps", "-a",
+                "--filter", "name=cyberwave-driver",
+                "--filter", f"status={filter_status}",
+                "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}",
+            ],
             capture_output=True,
             text=True,
         )
@@ -396,24 +416,89 @@ def _pick_driver_name() -> str | None:
 
     lines = [l for l in result.stdout.strip().splitlines() if l]
     if not lines:
-        console.print("[yellow]No running driver containers found[/yellow]")
+        kind = "stopped" if stopped else "running"
+        console.print(f"[yellow]No {kind} driver containers found[/yellow]")
         return None
 
     names = []
     options = []
     for line in lines:
         parts = line.split("\t")
-        name   = parts[0]
-        image  = parts[1] if len(parts) > 1 else ""
-        status = parts[2] if len(parts) > 2 else ""
+        name  = parts[0]
+        image = parts[1] if len(parts) > 1 else ""
         names.append(name)
         options.append(f"{name} [{image}]")
 
-    idx = _select_with_arrows("Select a driver to stop", options)
+    idx = _select_with_arrows(title, options)
     return names[idx]
 
 
-@edge.command("stop-driver")
+@driver.command("start")
+@click.argument("name", required=False, default=None)
+def start_driver(name: str | None):
+    """Start a stopped driver container.
+
+    If NAME is omitted, shows an interactive list of stopped driver containers
+    to pick from.
+
+    Note: this restarts an existing container that was previously stopped.
+    To launch a brand-new driver, use the edge-core service which manages
+    image selection and environment configuration.
+
+    \b
+    Examples:
+        cyberwave edge driver start
+        cyberwave edge driver start cyberwave-driver-624d7fe2
+    """
+    if name is None:
+        name = _pick_driver_name("Select a driver to start", stopped=True)
+        if name is None:
+            return
+
+    try:
+        inspect = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Status}}", name],
+            capture_output=True,
+            text=True,
+        )
+        if inspect.returncode != 0:
+            console.print(f"[red]Container '{name}' not found[/red]")
+            return
+
+        status = inspect.stdout.strip()
+        if status == "running":
+            console.print(f"[yellow]Container '{name}' is already running[/yellow]")
+            return
+
+        console.print(f"[cyan]Starting driver container '{name}'...[/cyan]")
+
+        # Re-enable restart policy so the container recovers automatically on failure
+        subprocess.run(
+            ["docker", "update", "--restart=on-failure", name],
+            capture_output=True,
+            check=True,
+        )
+
+        result = subprocess.run(
+            ["docker", "start", name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            console.print(f"[red]Failed to start container: {result.stderr.strip()}[/red]")
+            return
+
+        console.print(f"[green]✓ Started '{name}'[/green]")
+        console.print(f"[dim]Restart policy set to on-failure — container will retry automatically[/dim]")
+
+    except FileNotFoundError:
+        console.print("[red]Error: docker not found — is Docker installed and running?[/red]")
+    except Exception as e:
+        console.print(f"[red]Error starting driver: {e}[/red]")
+
+
+
+@driver.command("stop")
 @click.argument("name", required=False, default=None)
 def stop_driver(name: str | None):
     """Stop a running driver container.
@@ -433,12 +518,12 @@ def stop_driver(name: str | None):
 
     \b
     Examples:
-        cyberwave edge stop-driver
-        cyberwave edge stop-driver cyberwave-driver-624d7fe2
-        cyberwave edge stop-driver cyberwave-go2-driver
+        cyberwave edge driver stop
+        cyberwave edge driver stop cyberwave-driver-624d7fe2
+        cyberwave edge driver stop cyberwave-go2-driver
     """
     if name is None:
-        name = _pick_driver_name()
+        name = _pick_driver_name("Select a driver to stop")
         if name is None:
             return
 
