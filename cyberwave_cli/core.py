@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 from typing import Any
 
@@ -935,7 +936,29 @@ def _apt_get_install() -> bool:
     # Update and install the latest version
     console.print(f"[cyan]Installing {PACKAGE_NAME} via apt-get...[/cyan]")
     try:
-        _run(["apt-get", "update", "-qq"])
+        # Retry apt-get update to handle transient CDN mirror sync failures.
+        # After all attempts, warn and continue — apt will use its cached index
+        # for any failing source and the install may still succeed.
+        apt_update_retries = 3
+        apt_update_retry_delay = 8  # seconds
+        for attempt in range(1, apt_update_retries + 1):
+            try:
+                _run(["apt-get", "update", "-qq"])
+                break
+            except subprocess.CalledProcessError:
+                if attempt < apt_update_retries:
+                    console.print(
+                        f"[yellow]apt-get update failed (attempt {attempt}/{apt_update_retries}),"
+                        f" retrying in {apt_update_retry_delay}s"
+                        " (likely a transient mirror sync — will resolve shortly)...[/yellow]"
+                    )
+                    time.sleep(apt_update_retry_delay)
+                else:
+                    console.print(
+                        "[yellow]apt-get update failed after all retries — "
+                        "one or more sources may be temporarily unavailable. "
+                        "Proceeding with cached package index...[/yellow]"
+                    )
         _run(["apt-get", "install", "-y", "-qq", PACKAGE_NAME])
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]apt-get failed (exit {exc.returncode}).[/red]")

@@ -221,7 +221,7 @@ def _find_or_create_twin(
     yes: bool,
 ) -> Any | None:
     """Find existing twin for this fingerprint or create a new one."""
-    from ..fingerprint import get_device_info
+    from cyberwave.fingerprint import get_device_info
 
     asset_uuid = asset.get('uuid')
 
@@ -503,7 +503,7 @@ def create_twin(
             i += 1
 
     from ..asset_resolver import AssetResolutionError, get_asset_display_name, resolve_asset
-    from ..fingerprint import generate_fingerprint, get_device_info
+    from cyberwave.fingerprint import generate_fingerprint, get_device_info
 
     # Get SDK client
     client = get_sdk_client()
@@ -638,7 +638,7 @@ def pair_twin(ctx: click.Context, twin_uuid: str, target_dir: str, yes: bool):
     """
     from ..config import get_api_url
     from ..credentials import load_credentials
-    from ..fingerprint import generate_fingerprint, get_device_info
+    from cyberwave.fingerprint import generate_fingerprint, get_device_info
 
     # Parse extra args as --key value pairs for schema fields
     cli_overrides: dict[str, str] = {}
