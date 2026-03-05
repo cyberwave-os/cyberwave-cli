@@ -94,17 +94,18 @@ def login(email: str | None, password: str | None) -> None:
         # Validate against stored API URL first when present (edge/dev setups),
         # then fall back to the current process URL resolution.
         validate_token = existing_creds.token
-        if _stored_api_url(existing_creds):
-            try:
-                from cyberwave import Cyberwave
+        with console.status("[dim]Checking existing credentials...[/dim]"):
+            if _stored_api_url(existing_creds):
+                try:
+                    from cyberwave import Cyberwave
 
-                client = Cyberwave(base_url=_stored_api_url(existing_creds), token=validate_token)
-                client.workspaces.list()
-                is_valid = True
-            except Exception:
+                    client = Cyberwave(base_url=_stored_api_url(existing_creds), token=validate_token)
+                    client.workspaces.list()
+                    is_valid = True
+                except Exception:
+                    is_valid = _validate_stored_token(validate_token)
+            else:
                 is_valid = _validate_stored_token(validate_token)
-        else:
-            is_valid = _validate_stored_token(validate_token)
 
         if is_valid:
             workspace_info = ""
@@ -125,19 +126,18 @@ def login(email: str | None, password: str | None) -> None:
     if not password:
         password = Prompt.ask("[bold]Password[/bold]", password=True)
 
-    console.print("\n[dim]Authenticating...[/dim]")
-
     try:
         runtime_overrides = collect_runtime_env_overrides()
         with AuthClient() as client:
-            # First, get a session token via OAuth
-            session_token = client.login(email, password)
+            with console.status("[dim]Authenticating...[/dim]"):
+                # First, get a session token via OAuth
+                session_token = client.login(email, password)
 
-            # Get user info to confirm login
-            user = client.get_current_user(session_token)
+                # Get user info to confirm login
+                user = client.get_current_user(session_token)
 
-            # Get user's workspaces to create a permanent API token
-            workspaces = client.get_workspaces(session_token)
+                # Get user's workspaces to create a permanent API token
+                workspaces = client.get_workspaces(session_token)
 
             if not workspaces:
                 console.print(
@@ -157,28 +157,24 @@ def login(email: str | None, password: str | None) -> None:
             api_token = None
 
             for attempt in range(1, max_attempts + 1):
-                if attempt == 1:
-                    console.print(
-                        f"\n[dim]Creating API token for workspace '{workspace.name}'...[/dim]"
-                    )
-                else:
-                    console.print(
-                        f"\n[dim]Retrying API token creation for workspace "
-                        f"'{workspace.name}' (attempt {attempt}/{max_attempts})...[/dim]"
-                    )
-
-                try:
-                    api_token = client.create_api_token(session_token, workspace.uuid)
-                    break
-                except AuthenticationError as exc:
-                    if attempt == max_attempts or not _is_retryable_workspace_token_error(exc):
-                        raise
-                    wait_seconds = 2 * attempt
-                    console.print(
-                        f"[yellow][WARN][/yellow] Temporary token creation failure: {exc}. "
-                        f"Retrying in {wait_seconds}s..."
-                    )
-                    time.sleep(wait_seconds)
+                status_msg = (
+                    f"[dim]Creating API token for workspace '{workspace.name}'...[/dim]"
+                    if attempt == 1
+                    else f"[dim]Retrying API token creation for workspace '{workspace.name}' ({attempt}/{max_attempts})...[/dim]"
+                )
+                with console.status(status_msg):
+                    try:
+                        api_token = client.create_api_token(session_token, workspace.uuid)
+                        break
+                    except AuthenticationError as exc:
+                        if attempt == max_attempts or not _is_retryable_workspace_token_error(exc):
+                            raise
+                wait_seconds = 2 * attempt
+                console.print(
+                    f"[yellow][WARN][/yellow] Temporary token creation failure. "
+                    f"Retrying in {wait_seconds}s..."
+                )
+                time.sleep(wait_seconds)
 
             if api_token is None:
                 raise AuthenticationError("Failed to create API token")
@@ -203,7 +199,7 @@ def login(email: str | None, password: str | None) -> None:
             console.print(f"[dim]Workspace: {workspace.name}[/dim]")
             from ..config import CREDENTIALS_FILE
 
-            console.print(f"[dim]API token saved to {CREDENTIALS_FILE}[/dim]")
+            console.print(f"[dim]API token saved to {CREDENTIALS_FILE}[/dim]", highlight=False)
 
     except AuthenticationError as e:
         console.print(f"\n[red][ERROR][/red] Login failed: {e}")

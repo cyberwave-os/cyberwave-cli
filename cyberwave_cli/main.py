@@ -31,7 +31,8 @@ def cli(ctx: click.Context) -> None:
     Quick Start:
       1. cyberwave login                             # Login to your account
       2. cyberwave twin create <asset> --pair        # Create twin and pair device
-      3. cyberwave edge start                        # Start streaming
+      3. cyberwave edge install                      # Install edge node on device
+      4. cyberwave edge driver list                  # List available drivers
 
     \b
     Twin Management:

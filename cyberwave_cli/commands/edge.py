@@ -131,7 +131,11 @@ def install_edge(yes):
     """
     from ..core import setup_edge_core
 
-    if not setup_edge_core(skip_confirm=yes):
+    try:
+        if not setup_edge_core(skip_confirm=yes):
+            raise SystemExit(1)
+    except KeyboardInterrupt:
+        console.print("\n[dim]Aborted.[/dim]")
         raise SystemExit(1)
 
 
@@ -176,12 +180,18 @@ def uninstall_edge(yes):
 
     # Remove the unit file
     if SYSTEMD_UNIT_PATH.exists():
-        SYSTEMD_UNIT_PATH.unlink()
-        console.print(f"[green]Removed:[/green] {SYSTEMD_UNIT_PATH}")
         try:
-            _run(["systemctl", "daemon-reload"], check=False)
-        except FileNotFoundError:
-            pass
+            SYSTEMD_UNIT_PATH.unlink()
+            console.print(f"[green]Removed:[/green] {SYSTEMD_UNIT_PATH}")
+            try:
+                _run(["systemctl", "daemon-reload"], check=False)
+            except FileNotFoundError:
+                pass
+        except PermissionError:
+            console.print(
+                "[red]Permission denied removing systemd unit file.[/red]\n"
+                "[dim]Re-run with sudo: sudo cyberwave edge uninstall[/dim]"
+            )
 
     # Remove the edge config directory (credentials.json, environment.json, etc.)
     if CONFIG_DIR.exists():
@@ -376,22 +386,52 @@ def restart_edge(env_file):
 @edge.command("status")
 def status_edge():
     """Check edge node status."""
+    from ..core import SYSTEMD_UNIT_NAME
+
+    # --- systemd service ---
     try:
         result = subprocess.run(
-            ["pgrep", "-f", "cyberwave_edge.service"],
+            ["systemctl", "is-active", SYSTEMD_UNIT_NAME],
             capture_output=True,
             text=True,
         )
-        pids = result.stdout.strip().split("\n")
-        pids = [p for p in pids if p]
-
-        if pids:
-            console.print(f"[green]✓ Edge node is running (PIDs: {', '.join(pids)})[/green]")
+        service_state = result.stdout.strip()  # "active", "inactive", "failed", etc.
+        if service_state == "active":
+            console.print(f"[green]✓ Service {SYSTEMD_UNIT_NAME}:[/green] active")
+        elif service_state == "failed":
+            console.print(f"[red]✗ Service {SYSTEMD_UNIT_NAME}:[/red] failed")
         else:
-            console.print("[yellow]Edge node is not running[/yellow]")
+            console.print(f"[yellow]  Service {SYSTEMD_UNIT_NAME}:[/yellow] {service_state or 'not installed'}")
+    except FileNotFoundError:
+        console.print("[dim]  systemctl not found — skipping service check.[/dim]")
 
+    # --- driver containers ---
+    try:
+        result = subprocess.run(
+            [
+                "docker", "ps",
+                "--filter", "name=cyberwave-driver",
+                "--filter", "status=running",
+                "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        lines = [l for l in result.stdout.strip().splitlines() if l]
+        if lines:
+            console.print(f"[green]✓ Driver containers running: {len(lines)}[/green]")
+            for line in lines:
+                parts = line.split("\t")
+                name = parts[0]
+                image = parts[1] if len(parts) > 1 else ""
+                status = parts[2] if len(parts) > 2 else ""
+                console.print(f"   [cyan]{name}[/cyan]  [dim]{image}[/dim]  [dim]{status}[/dim]")
+        else:
+            console.print("[yellow]  No driver containers running[/yellow]")
+    except FileNotFoundError:
+        console.print("[dim]  docker not found — skipping driver container check.[/dim]")
     except Exception as e:
-        console.print(f"[red]Error checking status: {e}[/red]")
+        console.print(f"[red]Error checking driver containers: {e}[/red]")
 
 
 @edge.group("driver")
@@ -499,7 +539,11 @@ def start_driver(name: str | None):
         cyberwave edge driver start cyberwave-driver-624d7fe2
     """
     if name is None:
-        name = _pick_driver_name("Select a driver to start", stopped=True)
+        try:
+            name = _pick_driver_name("Select a driver to start", stopped=True)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Aborted.[/dim]")
+            return
         if name is None:
             return
 
@@ -571,7 +615,11 @@ def stop_driver(name: str | None):
         cyberwave edge driver stop cyberwave-go2-driver
     """
     if name is None:
-        name = _pick_driver_name("Select a driver to stop")
+        try:
+            name = _pick_driver_name("Select a driver to stop")
+        except KeyboardInterrupt:
+            console.print("\n[dim]Aborted.[/dim]")
+            return
         if name is None:
             return
 
@@ -885,7 +933,7 @@ def pull_config(twin_uuid: str | None, environment_uuid: str | None, target_dir:
         return
 
     fingerprint = generate_fingerprint()
-    console.print(f"\n[dim]Fingerprint: {fingerprint}[/dim]\n")
+    console.print(f"\nFingerprint: {fingerprint}\n")
 
     try:
         # Try new discovery API first
@@ -1005,7 +1053,8 @@ def _pull_via_discovery_api(fingerprint: str, target_dir: str, yes: bool) -> boo
 
         print_success(f"Config pulled to {target_dir}/.env")
         console.print(f"[dim]{len(all_configs)} config(s) from {len(twins)} twin(s)[/dim]")
-        console.print("[dim]Run: cyberwave edge start[/dim]")
+
+        console.print("\n[dim]Run: cyberwave edge start[/dim]")
 
         return True
 

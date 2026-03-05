@@ -288,7 +288,8 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
         try:
             creds_base_url = creds.cyberwave_base_url
             sdk_client = _get_sdk_client(creds.token, base_url=creds_base_url)
-            sdk_client.workspaces.list()
+            with console.status("[dim]Checking existing credentials...[/dim]"):
+                sdk_client.workspaces.list()
             console.print(f"[green]✓[/green] Logged in as [bold]{creds.email}[/bold]")
             # Backfill persisted environment overrides when running with explicit
             # env vars so systemd startups can reuse them later.
@@ -318,14 +319,13 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
     email = Prompt.ask("[bold]Email[/bold]")
     password = Prompt.ask("[bold]Password[/bold]", password=True)
 
-    console.print("\n[dim]Authenticating...[/dim]")
-
     try:
         runtime_overrides = collect_runtime_env_overrides()
         with AuthClient() as client:
-            session_token = client.login(email, password)
-            user = client.get_current_user(session_token)
-            workspaces = client.get_workspaces(session_token)
+            with console.status("[dim]Authenticating...[/dim]"):
+                session_token = client.login(email, password)
+                user = client.get_current_user(session_token)
+                workspaces = client.get_workspaces(session_token)
 
             if not workspaces:
                 console.print(
@@ -345,8 +345,8 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                 idx = _select_with_arrows("Select a workspace", labels)
                 workspace = workspaces[idx]
 
-            console.print(f"[dim]Creating API token for workspace '{workspace.name}'...[/dim]")
-            api_token: APIToken = client.create_api_token(session_token, workspace.uuid)
+            with console.status(f"[dim]Creating API token for workspace '{workspace.name}'...[/dim]"):
+                api_token: APIToken = client.create_api_token(session_token, workspace.uuid)
 
             save_credentials(
                 Credentials(
@@ -1211,5 +1211,5 @@ def setup_edge_core(*, skip_confirm: bool = False) -> bool:
 
     console.print("\n[green]Edge core is installed and running.[/green]")
     console.print("[dim]Check status: systemctl status cyberwave-edge-core[/dim]")
-    console.print("[dim]View logs:    journalctl -u cyberwave-edge-core -f[/dim]")
+    console.print("[dim]View logs:    cyberwave edge logs -f[/dim]")
     return True
