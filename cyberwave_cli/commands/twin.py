@@ -15,8 +15,12 @@ Examples:
 """
 
 import logging
+import os
 import platform
+import subprocess
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import click
@@ -677,6 +681,8 @@ def pair_twin(ctx: click.Context, twin_uuid: str, target_dir: str, yes: bool):
     console.print(f"Platform:    {device_info.get('platform', 'unknown')}")
 
     # Get twin info and asset capabilities
+    edge_config_schema: list[dict] = []
+    driver_image: str | None = None
     try:
         twin_obj = client.twins.get(twin_uuid)
         twin_name = getattr(twin_obj, 'name', 'Unknown')
@@ -685,12 +691,19 @@ def pair_twin(ctx: click.Context, twin_uuid: str, target_dir: str, yes: bool):
         # Get asset capabilities including edge_config_schema
         # Twin may have asset_uuid or asset_id depending on SDK version
         asset_uuid = getattr(twin_obj, 'asset_uuid', None) or getattr(twin_obj, 'asset_id', None)
-        edge_config_schema: list[dict] = []
         if asset_uuid:
             try:
                 asset = client.assets.get(asset_uuid)
                 capabilities = getattr(asset, 'capabilities', {}) or {}
                 edge_config_schema = capabilities.get("edge_config_schema", []) or []
+
+                # Extract driver image from asset drivers metadata
+                asset_metadata = getattr(asset, 'metadata', {}) or {}
+                drivers_meta = asset_metadata.get('drivers', {}) or {}
+                driver_image = (
+                    drivers_meta.get('default', {}).get('docker_image')
+                    or capabilities.get('docker_image')
+                )
 
                 # Show capabilities summary
                 sensors = capabilities.get('sensors', [])
@@ -705,6 +718,8 @@ def pair_twin(ctx: click.Context, twin_uuid: str, target_dir: str, yes: bool):
                     console.print(f"[dim]  Capabilities: {', '.join(caps_summary)}[/dim]")
                 if edge_config_schema:
                     console.print(f"[dim]  Config schema: {len(edge_config_schema)} field(s)[/dim]")
+                if driver_image:
+                    console.print(f"[dim]  Driver image: {driver_image}[/dim]")
             except Exception as e:
                 console.print(f"[dim]  Could not fetch asset details: {e}[/dim]")
     except Exception as e:
@@ -784,6 +799,17 @@ def pair_twin(ctx: click.Context, twin_uuid: str, target_dir: str, yes: bool):
         print_error(f"Failed to pair twin: {e}")
         return
 
+    # Stamp edge_fingerprint into twin metadata so edge-core can match this
+    # twin to the device at startup (it filters twins by this field).
+    try:
+        current_twin = client.twins.get(twin_uuid)
+        current_meta = getattr(current_twin, 'metadata', {}) or {}
+        current_meta["edge_fingerprint"] = fingerprint
+        client.twins.update(twin_uuid, metadata=current_meta)
+        console.print("[dim]  edge_fingerprint written to twin metadata[/dim]")
+    except Exception as e:
+        print_warning(f"Could not stamp edge_fingerprint on twin: {e}")
+
     # Step 4: Write local .env file
     write_edge_env(
         target_dir=target_dir,
@@ -796,9 +822,20 @@ def pair_twin(ctx: click.Context, twin_uuid: str, target_dir: str, yes: bool):
     print_success(f"Configuration saved to {target_dir}/.env")
 
     print_success("Pairing complete!")
-    console.print("\n[dim]To start streaming:[/dim]")
-    console.print(f"  cd {target_dir}")
-    console.print("  cyberwave edge start")
+
+    # If the edge-core service is already running, restart it so the newly
+    # paired twin's driver starts immediately — no manual step required.
+    from ..core import _has_systemd, is_service_active, restart_service
+
+    if _has_systemd() and is_service_active():
+        console.print(
+            "\n[dim]Edge-core service is running — restarting to activate the new twin...[/dim]"
+        )
+        restart_service()
+    else:
+        console.print("\n[dim]To start streaming:[/dim]")
+        console.print(f"  cd {target_dir}")
+        console.print("  cyberwave edge start")
 
     # Show current bindings
     console.print("\n[dim]This edge device is now paired to:[/dim]")

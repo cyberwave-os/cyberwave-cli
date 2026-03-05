@@ -80,6 +80,21 @@ def _has_systemd() -> bool:
     return Path("/run/systemd/system").is_dir()
 
 
+def is_service_active() -> bool:
+    """Return True if the cyberwave-edge-core systemd service is currently active."""
+    if not _has_systemd():
+        return False
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", SYSTEMD_UNIT_NAME],
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() == "active"
+    except (FileNotFoundError, OSError):
+        return False
+
+
 def _run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.CompletedProcess:
     """Run a subprocess and stream output to the console."""
     console.print(f"[dim]$ {' '.join(cmd)}[/dim]")
