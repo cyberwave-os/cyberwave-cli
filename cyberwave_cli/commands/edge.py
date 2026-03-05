@@ -38,6 +38,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 console = Console()
+DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
 
 
 def _is_legacy_edge_configs_map(edge_configs: dict) -> bool:
@@ -70,6 +71,43 @@ def _binding_for_fingerprint(edge_configs: dict, fingerprint: str) -> dict | Non
         if candidate_fingerprint == fingerprint:
             return binding
     return None
+
+
+def _stop_edge_driver_containers(run_command) -> list[str]:
+    """Stop running edge driver containers managed by edge-core."""
+    if not shutil.which("docker"):
+        return []
+
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "--format",
+                "{{.Names}}",
+                "--filter",
+                f"name=^{DRIVER_CONTAINER_PREFIX}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        console.print(f"[yellow]Could not list edge driver containers: {exc}[/yellow]")
+        return []
+
+    containers = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not containers:
+        return []
+
+    try:
+        run_command(["docker", "stop", *containers], check=False)
+    except FileNotFoundError:
+        console.print("[yellow]docker not found — skipping driver container cleanup.[/yellow]")
+        return []
+
+    return containers
 
 
 @click.group()
@@ -128,6 +166,13 @@ def uninstall_edge(yes):
         _run(["systemctl", "disable", SYSTEMD_UNIT_NAME], check=False)
     except FileNotFoundError:
         console.print("[yellow]systemctl not found — skipping service cleanup.[/yellow]")
+
+    # Stop edge driver containers started by edge-core
+    stopped_driver_containers = _stop_edge_driver_containers(_run)
+    if stopped_driver_containers:
+        console.print(
+            f"[green]Stopped {len(stopped_driver_containers)} edge driver container(s).[/green]"
+        )
 
     # Remove the unit file
     if SYSTEMD_UNIT_PATH.exists():
