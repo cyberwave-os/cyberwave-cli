@@ -653,6 +653,53 @@ def _select_connected_twins(client: Any, environment_uuid: str, *, skip_confirm:
         )
 
 
+def _download_twin_json_files(client: Any, twin_uuids: list[str]) -> int:
+    """Download twin+asset data and write JSON files consumed by edge drivers.
+
+    Each selected twin gets a ``{twin_uuid}.json`` file in CONFIG_DIR so that
+    edge-core and driver containers can read them immediately after install
+    without needing an extra API round-trip on first boot.
+
+    Returns the number of files successfully written.
+    """
+    from datetime import date, datetime
+
+    def _json_default(obj: Any) -> Any:
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+    written = 0
+    for twin_uuid in twin_uuids:
+        try:
+            twin = client.twins.get(twin_uuid)
+            twin_data: dict[str, Any] = (
+                twin.to_dict()
+                if hasattr(twin, "to_dict")
+                else {"uuid": twin_uuid, "name": getattr(twin, "name", None)}
+            )
+
+            asset_uuid = getattr(twin, "asset_uuid", None) or getattr(twin, "asset_id", "")
+            asset_data: dict[str, Any] = {}
+            if asset_uuid:
+                try:
+                    asset = client.assets.get(str(asset_uuid))
+                    asset_data = asset.to_dict() if hasattr(asset, "to_dict") else {}
+                except Exception:
+                    pass
+
+            twin_data["asset"] = asset_data
+            twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(twin_json_file, "w") as f:
+                json.dump(twin_data, f, indent=2, default=_json_default)
+            written += 1
+        except Exception as exc:
+            console.print(f"[yellow]Failed to download twin JSON for {twin_uuid[:8]}…: {exc}[/yellow]")
+            
+    return written
+
+
 def _attach_edge_fingerprint_to_twins(
     client: Any, twin_uuids: list[str], edge_fingerprint: str
 ) -> tuple[int, int]:
