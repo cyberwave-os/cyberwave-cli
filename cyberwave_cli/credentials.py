@@ -6,7 +6,33 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+import click
+from rich.console import Console
+
 from .config import CONFIG_DIR, CREDENTIALS_FILE
+
+_console = Console()
+
+
+def _raise_permission_error() -> None:
+    """Print a colored permission-denied message and exit."""
+    try:
+        ctx: click.Context | None = click.get_current_context()
+        parts: list[str] = []
+        while ctx is not None:
+            name = "cyberwave" if ctx.parent is None else ctx.info_name
+            if name:
+                parts.append(name)
+            ctx = ctx.parent
+        parts.reverse()
+        cmd = " ".join(parts)
+    except RuntimeError:
+        cmd = "cyberwave edge install"
+    _console.print(
+        "[red]Root privileges required.[/red]\n"
+        f"[dim]Re-run with sudo: sudo {cmd}[/dim]"
+    )
+    raise SystemExit(1)
 
 
 @dataclass
@@ -120,7 +146,10 @@ def ensure_config_dir() -> None:
 
 def save_credentials(credentials: Credentials) -> None:
     """Save credentials to the config file."""
-    ensure_config_dir()
+    try:
+        ensure_config_dir()
+    except PermissionError:
+        _raise_permission_error()
 
     # Add timestamp if not present
     if not credentials.created_at:
@@ -128,14 +157,17 @@ def save_credentials(credentials: Credentials) -> None:
 
     payload = credentials.to_dict()
     existing_payload: dict = {}
-    if CREDENTIALS_FILE.exists():
-        try:
-            with open(CREDENTIALS_FILE, "r") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                existing_payload = loaded
-        except (json.JSONDecodeError, OSError):
-            existing_payload = {}
+    try:
+        if CREDENTIALS_FILE.exists():
+            try:
+                with open(CREDENTIALS_FILE, "r") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    existing_payload = loaded
+            except (json.JSONDecodeError, OSError):
+                existing_payload = {}
+    except PermissionError:
+        _raise_permission_error()
 
     merged_payload = {**existing_payload, **payload}
     existing_envs = existing_payload.get("envs")
@@ -145,8 +177,11 @@ def save_credentials(credentials: Credentials) -> None:
             **(existing_envs if isinstance(existing_envs, dict) else {}),
             **(payload_envs if isinstance(payload_envs, dict) else {}),
         }
-    with open(CREDENTIALS_FILE, "w") as f:
-        json.dump(merged_payload, f, indent=2)
+    try:
+        with open(CREDENTIALS_FILE, "w") as f:
+            json.dump(merged_payload, f, indent=2)
+    except PermissionError:
+        _raise_permission_error()
 
     # Best-effort permission restriction.
     if os.name != "nt":
@@ -158,13 +193,18 @@ def save_credentials(credentials: Credentials) -> None:
 
 def load_credentials() -> Optional[Credentials]:
     """Load credentials from the config file."""
-    if not CREDENTIALS_FILE.exists():
-        return None
+    try:
+        if not CREDENTIALS_FILE.exists():
+            return None
+    except PermissionError:
+        _raise_permission_error()
 
     try:
         with open(CREDENTIALS_FILE, "r") as f:
             data = json.load(f)
             return Credentials.from_dict(data)
+    except PermissionError:
+        _raise_permission_error()
     except (json.JSONDecodeError, KeyError):
         return None
 

@@ -4,8 +4,6 @@ import os
 import sys
 from pathlib import Path
 
-from cyberwave.config import DEFAULT_BASE_URL
-
 # Config directory – system-wide location shared by the CLI, edge-core service,
 # and driver containers.  /etc/cyberwave is the FHS-standard path for
 # system service configuration.  Falls back to ~/.cyberwave when the user
@@ -59,6 +57,11 @@ def get_api_url() -> str:
     Checks ``CYBERWAVE_BASE_URL`` first, and finally to the SDK's
     ``DEFAULT_BASE_URL``.
     """
+    # Imported here (not at module level) to avoid triggering the full
+    # cyberwave SDK init, which transitively imports numpy and adds ~2 s of
+    # startup latency even for commands like `--help` that never touch the API.
+    from cyberwave.config import DEFAULT_BASE_URL  # noqa: PLC0415
+
     return os.getenv("CYBERWAVE_BASE_URL", DEFAULT_BASE_URL)
 
 

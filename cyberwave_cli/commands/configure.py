@@ -31,7 +31,7 @@ console = Console()
     is_flag=True,
     help="Show current configuration",
 )
-def configure(token: str | None, api_url: str | None, show: bool) -> None:
+def configure(token: str | None, base_url: str | None, show: bool) -> None:
     """Configure CLI settings and credentials.
 
     Save an API token directly without going through the login flow.
@@ -72,7 +72,7 @@ def configure(token: str | None, api_url: str | None, show: bool) -> None:
     # Test the token
     import httpx
 
-    test_url = api_url or get_api_url()
+    test_url = base_url or get_api_url()
 
     console.print(f"\n[dim]Testing token against {test_url}...[/dim]")
 
@@ -96,7 +96,7 @@ def configure(token: str | None, api_url: str | None, show: bool) -> None:
         if not click.confirm("Save token anyway?"):
             raise click.Abort()
 
-    runtime_overrides = collect_runtime_env_overrides(api_url_override=api_url)
+    runtime_overrides = collect_runtime_env_overrides(api_url_override=base_url)
     # Save credentials
     save_credentials(
         Credentials(
@@ -109,6 +109,6 @@ def configure(token: str | None, api_url: str | None, show: bool) -> None:
     )
     console.print(f"[green]✓[/green] Token saved to {CREDENTIALS_FILE}")
 
-    if api_url:
-        console.print(f"\n[dim]Note: To use {api_url} permanently, set:[/dim]")
-        console.print(f"  [cyan]export CYBERWAVE_BASE_URL={api_url}[/cyan]")
+    if base_url:
+        console.print(f"\n[dim]Note: To use {base_url} permanently, set:[/dim]")
+        console.print(f"  [cyan]export CYBERWAVE_BASE_URL={base_url}[/cyan]")

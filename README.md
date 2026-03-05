@@ -1,6 +1,17 @@
+```ansi
+ ██████╗██╗   ██╗██████╗ ███████╗██████╗ ██╗    ██╗ █████╗ ██╗   ██╗███████╗
+██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██║    ██║██╔══██╗██║   ██║██╔════╝
+██║      ╚████╔╝ ██████╔╝█████╗  ██████╔╝██║ █╗ ██║███████║██║   ██║█████╗
+██║       ╚██╔╝  ██╔══██╗██╔══╝  ██╔══██╗██║███╗██║██╔══██║╚██╗ ██╔╝██╔══╝
+╚██████╗   ██║   ██████╔╝███████╗██║  ██║╚███╔███╔╝██║  ██║ ╚████╔╝ ███████╗
+ ╚═════╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝  ╚═══╝  ╚══════╝
+```
+
 # Cyberwave CLI
 
 The official command-line interface for Cyberwave. Authenticate and bootstrap robotics projects from your terminal.
+
+Licensed under the [MIT License](LICENSE).
 
 ## Installation
 
@@ -24,16 +35,68 @@ cd cyberwave-cli
 pip install -e .
 ```
 
-## Quick Start
+## Quick Start - Edge
 
-SSH into your edge device, then run:
+### 1. SSH into your edge device
 
 ```bash
-cyberwave login
+ssh yourhost@your-ip
+```
+
+### 2. Set up your Edge device
+
+Once you are in your edge device, set it up by:
+
+```bash
 cyberwave edge install
 ```
 
-`cyberwave edge install` guides you through workspace and environment selection and registers the edge node as a systemd service that starts on boot.
+This command will guide you to your first-time setup of your edge device.
+
+## Commands
+
+| Command      | Description                              |
+| ------------ | ---------------------------------------- |
+| `login`      | Authenticate with Cyberwave              |
+| `logout`     | Remove stored credentials                |
+| `config-dir` | Print the active configuration directory |
+| `core`       | Visualize the core commands              |
+
+### `cyberwave login`
+
+Authenticates with Cyberwave using your email and password.
+
+```bash
+# Interactive login (prompts for credentials)
+cyberwave login
+
+# Non-interactive login
+cyberwave login --email you@example.com --password yourpassword
+```
+
+**Options:**
+
+- `-e, --email`: Email address
+- `-p, --password`: Password (will prompt if not provided)
+
+### `cyberwave config-dir`
+
+Prints the resolved configuration directory path. Useful in scripts to locate credentials and config files without hardcoding paths.
+
+```bash
+cyberwave config-dir
+# /etc/cyberwave
+
+# Use in a script
+CONFIG_DIR=$(cyberwave config-dir)
+cat "$CONFIG_DIR/credentials.json"
+```
+
+The CLI resolves the directory with the following priority:
+
+1. `CYBERWAVE_EDGE_CONFIG_DIR` environment variable (explicit override)
+2. `/etc/cyberwave` if writable or creatable (system-wide, preferred)
+3. `~/.cyberwave` as a fallback for non-root users
 
 ## `cyberwave edge`
 
@@ -49,12 +112,19 @@ Manage the edge node service lifecycle, configuration, and monitoring.
 | `status`         | Check if the edge node is running                        |
 | `pull`           | Pull edge configuration from backend                     |
 | `whoami`         | Show device fingerprint and info                         |
+| `health`         | Check edge health status via MQTT                        |
+| `remote-status`  | Check edge status from twin metadata (heartbeat)         |
 | `logs`           | Show edge node logs                                      |
-| `list-drivers`   | List running driver containers                           |
-| `stop-driver`    | Stop a running driver container                          |
 | `install-deps`   | Install edge ML dependencies                             |
 | `sync-workflows` | Trigger workflow sync on the edge node                   |
 | `list-models`    | List model bindings loaded on the edge node              |
+| `driver`         | Manage edge driver containers (subgroup)                 |
+
+| `driver` subcommand | Description                      |
+| ------------------- | -------------------------------- |
+| `driver list`       | List running driver containers (`--all` includes exited) |
+| `driver start`      | Start a stopped driver container |
+| `driver stop`       | Stop a running driver container  |
 
 ### `cyberwave edge install`
 
@@ -80,7 +150,7 @@ cyberwave edge start                        # background
 cyberwave edge start -f                     # foreground
 cyberwave edge start --env-file ./my/.env   # custom config
 
-cyberwave edge stop                         
+cyberwave edge stop
 
 sudo cyberwave edge restart                 # systemd
 cyberwave edge restart --env-file .env      # process mode
@@ -113,36 +183,30 @@ Displays the unique hardware fingerprint for this device, used to identify the e
 cyberwave edge whoami
 ```
 
-### `cyberwave edge logs`
+### `cyberwave edge health`
 
-Streams logs from the systemd journal for the edge service.
+Queries real-time health status via MQTT (stream states, FPS, WebRTC connections).
+
+```bash
+cyberwave edge health -t <TWIN_UUID>
+cyberwave edge health -t <TWIN_UUID> --watch     # continuous
+cyberwave edge health -t <TWIN_UUID> --timeout 10
+```
+
+### `cyberwave edge remote-status`
+
+Checks the last heartbeat stored in twin metadata to determine online/offline status without MQTT.
+
+```bash
+cyberwave edge remote-status -t <TWIN_UUID>
+```
+
+### `cyberwave edge logs`
 
 ```bash
 cyberwave edge logs              # last 50 lines
 cyberwave edge logs -n 100       # last 100 lines
 cyberwave edge logs -f           # follow (tail -f)
-```
-
-### `cyberwave edge list-drivers`
-
-Lists all running Docker containers whose name contains `cyberwave-driver`.
-
-```bash
-cyberwave edge list-drivers
-```
-
-### `cyberwave edge stop-driver`
-
-Stops a named driver container. Disables any Docker restart policy first so the container does not restart automatically.
-
-> **Note:** If the container is backed by a systemd service (e.g. on a Go2), Docker stop alone is not enough — systemd will restart it. Stop the backing service instead:
-> ```bash
-> sudo systemctl stop cyberwave-video-grabber.service
-> ```
-
-```bash
-cyberwave edge stop-driver cyberwave-driver-624d7fe2
-cyberwave edge stop-driver cyberwave-go2-driver
 ```
 
 ### `cyberwave edge install-deps`
@@ -154,62 +218,41 @@ cyberwave edge install-deps                       # ultralytics + opencv
 cyberwave edge install-deps -r onnx -r tflite     # specific runtimes
 ```
 
-### `cyberwave edge sync-workflows`
-
-Trigger workflow sync on the edge node.
+### `cyberwave edge sync-workflows / list-models`
 
 ```bash
-cyberwave edge sync-workflows --twin-uuid <UUID>
+cyberwave edge sync-workflows --twin-uuid <UUID>  # re-sync model bindings
+cyberwave edge list-models --twin-uuid <UUID>      # show loaded models
 ```
 
-### `cyberwave edge list-models`
+### `cyberwave edge driver`
 
-Show model bindings loaded on the edge node.
+Manage edge driver containers.
+
+| Subcommand | Description                                              |
+| ---------- | -------------------------------------------------------- |
+| `list`     | List running driver containers (`--all` includes exited) |
+| `start`    | Start a stopped driver container |
+| `stop`     | Stop a running driver container  |
 
 ```bash
-cyberwave edge list-models --twin-uuid <UUID>
+cyberwave edge driver list           # running containers only
+cyberwave edge driver list --all     # include exited containers
+
+cyberwave edge driver start                             # interactive picker (stopped containers)
+cyberwave edge driver start cyberwave-driver-624d7fe2   # directly by name
+
+cyberwave edge driver stop                              # interactive picker (running containers)
+cyberwave edge driver stop cyberwave-driver-624d7fe2    # directly by name
 ```
 
-## Commands
+`start` restarts an existing stopped container and sets a `--restart=on-failure` Docker policy, so the driver automatically retries if it exits due to a transient error (e.g. robot not yet reachable on the network). To launch a brand-new driver, use the edge-core service which manages image selection and environment configuration.
 
-| Command      | Description                              |
-| ------------ | ---------------------------------------- |
-| `login`      | Authenticate with Cyberwave              |
-| `logout`     | Remove stored credentials                |
-| `edge`       | Manage the edge node service             |
-| `config-dir` | Print the active configuration directory |
-
-### `cyberwave login`
-
-Authenticates with Cyberwave using your email and password.
+`stop` disables the Docker restart policy before stopping, so the container does not come back automatically. If the driver is managed by a systemd service, stop that instead:
 
 ```bash
-# Interactive login (prompts for credentials)
-cyberwave login
-
-# Non-interactive login
-cyberwave login --email you@example.com --password yourpassword
+sudo systemctl stop cyberwave-video-grabber.service
 ```
-
-**Options:**
-
-- `-e, --email`: Email address
-- `-p, --password`: Password (will prompt if not provided)
-
-### `cyberwave config-dir`
-
-Prints the resolved configuration directory path. Useful in scripts to locate credentials and config files without hardcoding paths.
-
-```bash
-cyberwave config-dir
-# /etc/cyberwave
-
-# Use in a script
-CONFIG_DIR=$(cyberwave config-dir)
-cat "$CONFIG_DIR/credentials.json"
-```
-
-See the [Configuration](#configuration) section for the full resolution order.
 
 ## Configuration
 

@@ -174,6 +174,8 @@ def _select_with_arrows(title: str, options: list[str]) -> int:
             char = sys.stdin.read(1)
             if char in ("\r", "\n"):
                 return selected
+            if char == "\x03":  # Ctrl+C — restore terminal then abort
+                raise KeyboardInterrupt
             if char == "\x1b":
                 nxt = sys.stdin.read(1)
                 if nxt == "[":
@@ -193,7 +195,6 @@ def _select_with_arrows(title: str, options: list[str]) -> int:
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         sys.stdout.write("\x1b[?25h")
-        _tty_write("\n")
         sys.stdout.flush()
 
 
@@ -255,11 +256,7 @@ def _save_environment_file(
 
 
 def _load_or_generate_edge_fingerprint() -> str:
-    """Load edge fingerprint saved by edge-core, fallback to CLI generator.
-
-    When generating a new fingerprint, persist it to disk so that edge-core
-    reads the same value on its first startup.
-    """
+    """Load edge fingerprint saved by edge-core, fallback to CLI generator."""
     if FINGERPRINT_FILE.exists():
         try:
             data = json.loads(FINGERPRINT_FILE.read_text(encoding="utf-8"))
@@ -269,16 +266,7 @@ def _load_or_generate_edge_fingerprint() -> str:
         except Exception:
             pass
 
-    fingerprint = generate_fingerprint()
-    try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        FINGERPRINT_FILE.write_text(
-            json.dumps({"fingerprint": fingerprint}, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
-    return fingerprint
+    return generate_fingerprint()
 
 
 def _resolved_edge_log_level(runtime_overrides: dict[str, str | None]) -> str | None:
@@ -766,6 +754,7 @@ def _download_twin_json_files(client: Any, twin_uuids: list[str]) -> int:
             written += 1
         except Exception as exc:
             console.print(f"[yellow]Failed to download twin JSON for {twin_uuid[:8]}…: {exc}[/yellow]")
+            
     return written
 
 
@@ -846,10 +835,6 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
         console.print(f"[green]Environment saved:[/green] {ENVIRONMENT_FILE}")
         console.print(f"[dim]Environment: {env_name or env_uuid}[/dim]")
         console.print(f"[dim]Connected twins selected: {len(selected_twin_uuids)}[/dim]")
-
-        if selected_twin_uuids:
-            written = _download_twin_json_files(client, selected_twin_uuids)
-            console.print(f"[dim]Twin JSON files downloaded: {written}[/dim]")
         return True
     except AuthenticationError as exc:
         console.print(f"[red]Authentication error:[/red] {exc}")
@@ -1143,6 +1128,29 @@ def restart_service() -> bool:
         return False
 
     console.print(f"[green]Service restarted:[/green] {SYSTEMD_UNIT_NAME}")
+    return True
+
+
+def stop_service() -> bool:
+    """Stop the cyberwave-edge-core systemd service.
+
+    Returns True on success.
+    """
+    if not _has_systemd():
+        console.print("[yellow]systemd not detected — cannot stop via systemd.[/yellow]")
+        return False
+
+    if not SYSTEMD_UNIT_PATH.exists():
+        console.print("[red]Service unit not found — run 'cyberwave edge install' first.[/red]")
+        return False
+
+    try:
+        _run(["systemctl", "stop", SYSTEMD_UNIT_NAME])
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]systemctl stop failed (exit {exc.returncode}).[/red]")
+        return False
+
+    console.print(f"[green]Service stopped:[/green] {SYSTEMD_UNIT_NAME}")
     return True
 
 
