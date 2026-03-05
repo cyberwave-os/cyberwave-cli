@@ -398,13 +398,16 @@ def _pick_driver_name(title: str = "Select a driver", *, stopped: bool = False) 
     """
     from ..core import _select_with_arrows
 
-    filter_status = "exited" if stopped else "running"
+    if stopped:
+        filter_args = ["--filter", "status=exited"]
+    else:
+        filter_args = ["--filter", "status=running", "--filter", "status=restarting"]
     try:
         result = subprocess.run(
             [
                 "docker", "ps", "-a",
                 "--filter", "name=cyberwave-driver",
-                "--filter", f"status={filter_status}",
+                *filter_args,
                 "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}",
             ],
             capture_output=True,
@@ -530,7 +533,7 @@ def stop_driver(name: str | None):
     try:
         # Check the container exists and is running
         inspect = subprocess.run(
-            ["docker", "inspect", "--format", "{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}", name],
+            ["docker", "inspect", "--format", "{{.State.Running}} {{.State.Restarting}} {{.HostConfig.RestartPolicy.Name}}", name],
             capture_output=True,
             text=True,
         )
@@ -540,9 +543,10 @@ def stop_driver(name: str | None):
 
         parts = inspect.stdout.strip().split()
         is_running = parts[0] == "true" if parts else False
-        restart_policy = parts[1] if len(parts) > 1 else "no"
+        is_restarting = parts[1] == "true" if len(parts) > 1 else False
+        restart_policy = parts[2] if len(parts) > 2 else "no"
 
-        if not is_running:
+        if not is_running and not is_restarting:
             console.print(f"[yellow]Container '{name}' is not running[/yellow]")
             return
 
