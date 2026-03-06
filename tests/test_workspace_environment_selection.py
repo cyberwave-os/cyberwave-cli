@@ -25,13 +25,19 @@ class _FakeEnvironmentsManager:
 
 
 class _FakeTwinsManager:
-    def __init__(self, twins, *, fail_on_update=None):
+    def __init__(self, twins, *, fail_on_update=None, allowed_environment_id=None):
         self._twins = twins
         self._fail_on_update = set(fail_on_update or [])
+        self._allowed_environment_id = allowed_environment_id
         self.updated: list[tuple[str, dict]] = []
+        self.list_calls: list[str | None] = []
 
     def list(self, environment_id=None):
-        if environment_id is not None:
+        self.list_calls.append(environment_id)
+        if (
+            self._allowed_environment_id is not None
+            and environment_id != self._allowed_environment_id
+        ):
             return []
         return list(self._twins)
 
@@ -152,6 +158,7 @@ def test_workspace_environments_deduplicates_between_project_and_global_lists(mo
 def test_detach_edge_fingerprint_from_other_twins_removes_only_stale_non_selected(monkeypatch):
     core = _load_core_module(monkeypatch)
 
+    environment_uuid = "env-1"
     fingerprint = "fp-123"
     selected_twin = SimpleNamespace(uuid="twin-selected", metadata={"edge_fingerprint": fingerprint})
     stale_twin = SimpleNamespace(
@@ -161,30 +168,41 @@ def test_detach_edge_fingerprint_from_other_twins_removes_only_stale_non_selecte
     unrelated_twin = SimpleNamespace(uuid="twin-other", metadata={"edge_fingerprint": "other-fp"})
     malformed_twin = SimpleNamespace(uuid="twin-malformed", metadata="not-a-dict")
 
-    twins = _FakeTwinsManager([selected_twin, stale_twin, unrelated_twin, malformed_twin])
+    twins = _FakeTwinsManager(
+        [selected_twin, stale_twin, unrelated_twin, malformed_twin],
+        allowed_environment_id=environment_uuid,
+    )
     client = SimpleNamespace(twins=twins)
 
     detached, failed = core._detach_edge_fingerprint_from_other_twins(
         client,
+        environment_uuid=environment_uuid,
         keep_twin_uuids=["twin-selected"],
         edge_fingerprint=fingerprint,
     )
 
     assert detached == 1
     assert failed == 0
+    assert twins.list_calls == [environment_uuid]
     assert twins.updated == [("twin-stale", {"label": "old-binding"})]
 
 
 def test_detach_edge_fingerprint_from_other_twins_counts_update_failures(monkeypatch):
     core = _load_core_module(monkeypatch)
 
+    environment_uuid = "env-1"
     fingerprint = "fp-123"
     stale_twin = SimpleNamespace(uuid="twin-stale", metadata={"edge_fingerprint": fingerprint})
-    twins = _FakeTwinsManager([stale_twin], fail_on_update={"twin-stale"})
+    twins = _FakeTwinsManager(
+        [stale_twin],
+        fail_on_update={"twin-stale"},
+        allowed_environment_id=environment_uuid,
+    )
     client = SimpleNamespace(twins=twins)
 
     detached, failed = core._detach_edge_fingerprint_from_other_twins(
         client,
+        environment_uuid=environment_uuid,
         keep_twin_uuids=[],
         edge_fingerprint=fingerprint,
     )

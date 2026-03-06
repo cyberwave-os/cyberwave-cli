@@ -801,7 +801,10 @@ def _attach_edge_fingerprint_to_twins(
 
 
 def _detach_edge_fingerprint_from_other_twins(
-    client: Any, keep_twin_uuids: list[str], edge_fingerprint: str
+    client: Any,
+    environment_uuid: str,
+    keep_twin_uuids: list[str],
+    edge_fingerprint: str,
 ) -> tuple[int, int]:
     """Remove stale edge_fingerprint from twins not selected for this edge.
 
@@ -813,7 +816,7 @@ def _detach_edge_fingerprint_from_other_twins(
     failed = 0
 
     try:
-        twins = client.twins.list()
+        twins = client.twins.list(environment_id=environment_uuid)
     except Exception:
         return detached, 1
 
@@ -872,6 +875,7 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
         edge_fingerprint = _load_or_generate_edge_fingerprint()
         detached_count, detach_failed_count = _detach_edge_fingerprint_from_other_twins(
             client,
+            env_uuid,
             selected_twin_uuids,
             edge_fingerprint,
         )
