@@ -60,9 +60,12 @@ def _resolve_config_dir() -> Path:
     if platform.system() == "Darwin":
         return _resolve_macos_config_dir()
 
-    # Prefer /etc/cyberwave if we can write to it
-    if _SYSTEM_CONFIG_DIR.exists() and os.access(_SYSTEM_CONFIG_DIR, os.W_OK):
-        return _SYSTEM_CONFIG_DIR
+    # Prefer /etc/cyberwave if we can write to it. If it already exists and is
+    # not writable, fall back to user config immediately.
+    if _SYSTEM_CONFIG_DIR.exists():
+        if os.access(_SYSTEM_CONFIG_DIR, os.W_OK):
+            return _SYSTEM_CONFIG_DIR
+        return _USER_CONFIG_DIR
 
     # Try to create it (works when running as root)
     try:
