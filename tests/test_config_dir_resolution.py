@@ -41,6 +41,20 @@ def test_resolve_config_dir_uses_system_dir_on_linux_when_writable(tmp_path, mon
     assert config._resolve_config_dir() == system_dir
 
 
+def test_resolve_config_dir_creates_system_dir_on_linux_when_missing(tmp_path, monkeypatch):
+    system_dir = tmp_path / "etc-cyberwave"
+    user_dir = tmp_path / "user-cyberwave"
+
+    monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(config.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(config, "_SYSTEM_CONFIG_DIR", system_dir)
+    monkeypatch.setattr(config, "_USER_CONFIG_DIR", user_dir)
+
+    assert config._resolve_config_dir() == system_dir
+    assert system_dir.exists()
+    assert system_dir.is_dir()
+
+
 def test_resolve_config_dir_falls_back_to_user_dir_when_system_dir_not_writable(
     tmp_path, monkeypatch
 ):
