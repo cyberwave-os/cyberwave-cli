@@ -722,34 +722,27 @@ def install_deps(runtime):
 @click.option("--lines", "-n", default=50, help="Number of lines to show")
 def show_logs(follow, lines):
     """Show edge node logs."""
+    from ..config import clean_subprocess_env
+    from ..core import SYSTEMD_UNIT_NAME
+
+    service_name = SYSTEMD_UNIT_NAME.removesuffix(".service")
     cmd = [
-        "journalctl", "-u", "cyberwave-edge-core",
+        "journalctl",
+        "-u",
+        service_name,
         f"-n{lines}", "--no-pager", "--output=cat",
     ]
     if follow:
         cmd.append("-f")
 
-    def _colorize(line: str) -> str:
-        if line.startswith("ERROR") or line.startswith("CRITICAL"):
-            return f"[red]{line}[/red]"
-        if line.startswith("WARNING"):
-            return f"[yellow]{line}[/yellow]"
-        if line.startswith("INFO"):
-            return line
-        if line.startswith("DEBUG"):
-            return f"[dim]{line}[/dim]"
-        return line
-
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        for line in proc.stdout:
-            console.print(_colorize(line.rstrip()), highlight=False)
-        proc.wait()
-        if proc.returncode != 0:
-            err = proc.stderr.read().strip()
-            if err:
-                console.print(f"[red]{err}[/red]")
+        # Run journalctl directly as a pass-through command; this keeps behavior
+        # aligned with systemctl tooling and avoids Python parsing dependencies.
+        result = subprocess.run(cmd, env=clean_subprocess_env(), check=False)
+        if result.returncode != 0:
             console.print("[dim]Tip: run with sudo if you see no output.[/dim]")
+    except FileNotFoundError:
+        console.print("[red]journalctl not found. Is systemd available on this host?[/red]")
     except KeyboardInterrupt:
         pass
 
