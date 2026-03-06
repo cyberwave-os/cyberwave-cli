@@ -1200,14 +1200,14 @@ def setup_edge_core(*, skip_confirm: bool = False) -> bool:
 
     Returns True if everything succeeded.
     """
-    if not _is_linux():
-        console.print("[yellow]Edge core service setup is only supported on Linux.[/yellow]")
+    service_setup_supported = _is_linux()
+    if not service_setup_supported:
         console.print(
-            "[dim]You can still install the package with: pip install cyberwave-edge-core[/dim]"
+            "[yellow]Edge core service setup is only supported on Linux. "
+            "You will to start the core manually upon restart[/yellow]"
         )
-        return False
 
-    if os.geteuid() != 0:
+    if service_setup_supported and os.geteuid() != 0:
         console.print(
             "[red]Root privileges required.[/red]\n"
             "[dim]Re-run with sudo: sudo cyberwave edge install[/dim]"
@@ -1219,35 +1219,51 @@ def setup_edge_core(*, skip_confirm: bool = False) -> bool:
         return False
 
     if not skip_confirm:
-        console.print(
-            f"\nThis will:\n"
-            f"  1. Install [bold]{PACKAGE_NAME}[/bold] via apt-get\n"
-            f"  2. Create a systemd service ([bold]{SYSTEMD_UNIT_NAME}[/bold])\n"
-            f"  3. Enable it to start on boot\n"
-        )
+        if service_setup_supported:
+            console.print(
+                f"\nThis will:\n"
+                f"  1. Install [bold]{PACKAGE_NAME}[/bold] via apt-get\n"
+                f"  2. Create a systemd service ([bold]{SYSTEMD_UNIT_NAME}[/bold])\n"
+                f"  3. Enable it to start on boot\n"
+            )
+        else:
+            console.print(
+                f"\nThis will:\n"
+                f"  1. Install [bold]{PACKAGE_NAME}[/bold] via pip\n"
+                f"  2. Configure edge credentials and environment\n"
+                f"  3. Skip service setup (manual startup required)\n"
+            )
         if not Confirm.ask("Continue?", default=True):
             console.print("[dim]Aborted.[/dim]")
             return False
 
-    # Step 1 — install edge core and docker
+    # Step 1 — install edge core
     if not install_edge_core():
         return False
-    if not _install_docker():
-        return False
 
-    # Step 2 — systemd unit
-    if not create_systemd_service():
-        return False
+    # Linux-only service setup.
+    if service_setup_supported:
+        if not _install_docker():
+            return False
 
-    # Step 3 — pick workspace/environment and persist config
+        if not create_systemd_service():
+            return False
+
+    # Step 2 (or 3 on Linux) — pick workspace/environment and persist config
     if not configure_edge_environment(skip_confirm=skip_confirm):
         return False
 
-    # Step 4 — enable & start (after environment.json is finalized)
-    if not enable_and_start_service():
-        return False
+    if service_setup_supported:
+        # Final Linux-only step — enable & start after environment.json is finalized.
+        if not enable_and_start_service():
+            return False
 
-    console.print("\n[green]Edge core is installed and running.[/green]")
-    console.print("[dim]Check status: systemctl status cyberwave-edge-core[/dim]")
-    console.print("[dim]View logs:    cyberwave edge logs -f[/dim]")
+        console.print("\n[green]Edge core is installed and running.[/green]")
+        console.print("[dim]Check status: systemctl status cyberwave-edge-core[/dim]")
+        console.print("[dim]View logs:    cyberwave edge logs -f[/dim]")
+    else:
+        console.print("\n[green]Edge core is installed.[/green]")
+        console.print("[dim]Start manually: cyberwave-edge-core[/dim]")
+        console.print("[dim]After restart, start the core manually again.[/dim]")
+
     return True
