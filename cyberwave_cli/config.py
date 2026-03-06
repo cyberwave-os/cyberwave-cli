@@ -1,16 +1,47 @@
 """Configuration and constants for the Cyberwave CLI."""
 
 import os
+import platform
 import sys
 from pathlib import Path
 
-# Config directory – system-wide location shared by the CLI, edge-core service,
-# and driver containers.  /etc/cyberwave is the FHS-standard path for
-# system service configuration.  Falls back to ~/.cyberwave when the user
-# doesn't have write access to /etc (e.g. non-root, CI runners).
-# The env var CYBERWAVE_EDGE_CONFIG_DIR allows explicit override.
+# Config directory shared by CLI, edge-core service, and driver containers.
+# - macOS defaults to ~/.cyberwave for Docker Desktop bind-mount compatibility
+# - other platforms prefer /etc/cyberwave and fall back to ~/.cyberwave when
+#   /etc is not writable
+# CYBERWAVE_EDGE_CONFIG_DIR always overrides the default.
 _SYSTEM_CONFIG_DIR = Path("/etc/cyberwave")
 _USER_CONFIG_DIR = Path.home() / ".cyberwave"
+
+
+def _resolve_sudo_user_home() -> Path | None:
+    """Return invoking user's home when running via sudo (best effort)."""
+    sudo_user = os.getenv("SUDO_USER", "").strip()
+    if not sudo_user:
+        return None
+
+    try:
+        import pwd
+
+        home = pwd.getpwnam(sudo_user).pw_dir
+    except Exception:
+        return None
+    if not home:
+        return None
+    return Path(home)
+
+
+def _resolve_macos_config_dir() -> Path:
+    """Resolve a Docker Desktop-friendly config dir on macOS.
+
+    On macOS, storing edge config under /etc can fail when Docker Desktop
+    tries to bind-mount it into driver containers. Prefer the invoking user's
+    home directory so both regular and sudo executions converge to the same
+    path (e.g. /Users/alice/.cyberwave).
+    """
+    sudo_home = _resolve_sudo_user_home()
+    base_home = sudo_home or Path.home()
+    return base_home / ".cyberwave"
 
 
 def _resolve_config_dir() -> Path:
@@ -18,12 +49,16 @@ def _resolve_config_dir() -> Path:
 
     Priority:
       1. ``CYBERWAVE_EDGE_CONFIG_DIR`` env var (explicit override)
-      2. ``/etc/cyberwave`` if it exists and is writable, or can be created
-      3. ``~/.cyberwave`` as a fallback for non-root users
+      2. On macOS: ``~/.cyberwave`` for Docker bind-mount compatibility
+      3. On other platforms: ``/etc/cyberwave`` if writable/creatable
+      4. ``~/.cyberwave`` as a fallback for non-root users
     """
     env_override = os.getenv("CYBERWAVE_EDGE_CONFIG_DIR")
     if env_override:
         return Path(env_override)
+
+    if platform.system() == "Darwin":
+        return _resolve_macos_config_dir()
 
     # Prefer /etc/cyberwave if we can write to it
     if _SYSTEM_CONFIG_DIR.exists() and os.access(_SYSTEM_CONFIG_DIR, os.W_OK):
