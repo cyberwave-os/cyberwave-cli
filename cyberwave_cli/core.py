@@ -800,6 +800,46 @@ def _attach_edge_fingerprint_to_twins(
     return updated, failed
 
 
+def _detach_edge_fingerprint_from_other_twins(
+    client: Any, keep_twin_uuids: list[str], edge_fingerprint: str
+) -> tuple[int, int]:
+    """Remove stale edge_fingerprint from twins not selected for this edge.
+
+    Returns:
+        (detached_count, failed_count)
+    """
+    keep_set = {str(twin_uuid) for twin_uuid in keep_twin_uuids if twin_uuid}
+    detached = 0
+    failed = 0
+
+    try:
+        twins = client.twins.list()
+    except Exception:
+        return detached, 1
+
+    for twin in twins:
+        twin_uuid = str(getattr(twin, "uuid", ""))
+        if not twin_uuid or twin_uuid in keep_set:
+            continue
+
+        metadata = getattr(twin, "metadata", {}) or {}
+        if not isinstance(metadata, dict):
+            continue
+
+        if metadata.get("edge_fingerprint") != edge_fingerprint:
+            continue
+
+        updated_metadata = dict(metadata)
+        updated_metadata.pop("edge_fingerprint", None)
+        try:
+            client.twins.update(twin_uuid, metadata=updated_metadata)
+            detached += 1
+        except Exception:
+            failed += 1
+
+    return detached, failed
+
+
 def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
     """Select workspace + environment and save /etc/cyberwave/environment.json."""
     creds = load_credentials()
@@ -830,6 +870,20 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
         )
 
         edge_fingerprint = _load_or_generate_edge_fingerprint()
+        detached_count, detach_failed_count = _detach_edge_fingerprint_from_other_twins(
+            client,
+            selected_twin_uuids,
+            edge_fingerprint,
+        )
+        if detached_count:
+            console.print(
+                f"[dim]Removed stale edge fingerprint from twins: {detached_count}[/dim]"
+            )
+        if detach_failed_count:
+            console.print(
+                f"[yellow]Failed to clear stale edge fingerprint from "
+                f"{detach_failed_count} twin(s).[/yellow]"
+            )
         if selected_twin_uuids:
             updated_count, failed_count = _attach_edge_fingerprint_to_twins(
                 client,
