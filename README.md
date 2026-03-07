@@ -1,17 +1,21 @@
-```ansi
- ██████╗██╗   ██╗██████╗ ███████╗██████╗ ██╗    ██╗ █████╗ ██╗   ██╗███████╗
-██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██║    ██║██╔══██╗██║   ██║██╔════╝
-██║      ╚████╔╝ ██████╔╝█████╗  ██████╔╝██║ █╗ ██║███████║██║   ██║█████╗
-██║       ╚██╔╝  ██╔══██╗██╔══╝  ██╔══██╗██║███╗██║██╔══██║╚██╗ ██╔╝██╔══╝
-╚██████╗   ██║   ██████╔╝███████╗██║  ██║╚███╔███╔╝██║  ██║ ╚████╔╝ ███████╗
- ╚═════╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝  ╚═══╝  ╚══════╝
-```
+<p align="center">
+  <a href="https://cyberwave.com">
+    <img src="https://cyberwave.com/cyberwave-logo-black.svg" alt="Cyberwave logo" width="240" />
+  </a>
+</p>
 
 # Cyberwave CLI
 
+This module is part of **Cyberwave: Making the physical world programmable**.
+
 The official command-line interface for Cyberwave. Authenticate and bootstrap robotics projects from your terminal.
 
-Licensed under the [MIT License](LICENSE).
+[![License](https://img.shields.io/badge/License-MIT-orange.svg)](https://github.com/cyberwave-os/cyberwave-cli/blob/main/LICENSE)
+[![Documentation](https://img.shields.io/badge/Documentation-docs.cyberwave.com-orange)](https://docs.cyberwave.com)
+[![Discord](https://badgen.net/badge/icon/discord?icon=discord&label&color=orange)](https://discord.gg/dfGhNrawyF)
+[![PyPI version](https://img.shields.io/pypi/v/cyberwave-cli.svg)](https://pypi.org/project/cyberwave-cli/)
+[![PyPI Python versions](https://img.shields.io/pypi/pyversions/cyberwave-cli.svg)](https://pypi.org/project/cyberwave-cli/)
+[![Release to PyPI](https://github.com/cyberwave-os/cyberwave-cli/actions/workflows/release-pypi.yml/badge.svg)](https://github.com/cyberwave-os/cyberwave-cli/actions/workflows/release-pypi.yml)
 
 ## Installation
 
@@ -291,6 +295,10 @@ pyinstaller --onefile --name cyberwave-cli cyberwave_cli/main.py
 ### Debian Package
 
 See `debian/` directory for packaging scripts.
+
+## Contributing
+
+Contributions are welcome. Please open an issue for bugs or feature requests, and submit a pull request for improvements.
 
 ## Support
 
