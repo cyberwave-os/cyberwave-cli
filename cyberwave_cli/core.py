@@ -464,34 +464,42 @@ def _workspace_environments(client: Any, workspace_uuid: str) -> list[Any]:
     """
     environments: list[Any] = []
     seen_uuids: set[str] = set()
-    projects = _workspace_projects(client, workspace_uuid)
 
-    for project in projects:
-        envs = client.environments.list(project_id=str(project.uuid))
-        for env in envs:
-            env_uuid = str(getattr(env, "uuid", ""))
-            if env_uuid and env_uuid not in seen_uuids:
-                environments.append(env)
-                seen_uuids.add(env_uuid)
-
-    # Also include standalone environments that are not inside a project.
-    # We use the global listing because standalone environments cannot be
-    # discovered via project_id queries.
+    # Primary: fetch all environments visible to the user. The backend already
+    # scopes results to the caller's workspaces/ownership, so this includes
+    # both project-scoped and standalone environments.
     try:
         all_environments = client.environments.list()
     except Exception:
-        return environments
-
-    if not all_environments:
-        return environments
+        all_environments = []
 
     for env in all_environments:
-        if _environment_workspace_uuid(env) != workspace_uuid:
+        env_ws = _environment_workspace_uuid(env)
+        # Include the environment when it belongs to the selected workspace OR
+        # when its workspace could not be resolved (standalone environments
+        # without a _workspace_uuid setting). The backend already restricts
+        # the listing to environments the user has access to, so unresolved
+        # environments are safe to show.
+        if env_ws and env_ws != workspace_uuid:
             continue
         env_uuid = str(getattr(env, "uuid", ""))
         if env_uuid and env_uuid not in seen_uuids:
             environments.append(env)
             seen_uuids.add(env_uuid)
+
+    # Supplement with project-scoped discovery so we never miss environments
+    # that the global listing might have filtered differently.
+    projects = _workspace_projects(client, workspace_uuid)
+    for project in projects:
+        try:
+            envs = client.environments.list(project_id=str(project.uuid))
+        except Exception:
+            continue
+        for env in envs:
+            env_uuid = str(getattr(env, "uuid", ""))
+            if env_uuid and env_uuid not in seen_uuids:
+                environments.append(env)
+                seen_uuids.add(env_uuid)
 
     return environments
 
