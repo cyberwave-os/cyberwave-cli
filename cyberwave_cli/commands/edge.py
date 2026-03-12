@@ -41,6 +41,67 @@ console = Console()
 DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
 
 
+def _delete_registered_edges_for_fingerprint(
+    *,
+    fingerprint: str | None,
+    token: str | None,
+    base_url: str | None,
+    workspace_uuid: str | None = None,
+) -> tuple[int, int]:
+    """Delete backend Edge registrations that match a device fingerprint.
+
+    Returns:
+        (deleted_count, failed_count)
+    """
+    if not fingerprint or not token:
+        return 0, 0
+
+    try:
+        from cyberwave import Cyberwave
+    except ImportError:
+        console.print(
+            "[yellow]SDK not available — skipping backend edge registration cleanup.[/yellow]"
+        )
+        return 0, 1
+
+    try:
+        from ..config import get_api_url
+
+        client = Cyberwave(base_url=base_url or get_api_url(), token=token)
+        edges = client.edges.list()
+    except Exception as exc:
+        console.print(f"[yellow]Could not list edges from backend: {exc}[/yellow]")
+        return 0, 1
+
+    matching_edges: list[str] = []
+    for edge in edges:
+        edge_fingerprint = str(getattr(edge, "fingerprint", "") or "")
+        if edge_fingerprint != fingerprint:
+            continue
+
+        if workspace_uuid:
+            edge_workspace_uuid = str(
+                getattr(edge, "workspace_uuid", "") or getattr(edge, "workspace_id", "") or ""
+            )
+            if edge_workspace_uuid and edge_workspace_uuid != workspace_uuid:
+                continue
+
+        edge_uuid = str(getattr(edge, "uuid", "") or "")
+        if edge_uuid:
+            matching_edges.append(edge_uuid)
+
+    deleted_count = 0
+    failed_count = 0
+    for edge_uuid in matching_edges:
+        try:
+            client.edges.delete(edge_uuid)
+            deleted_count += 1
+        except Exception:
+            failed_count += 1
+
+    return deleted_count, failed_count
+
+
 def _is_legacy_edge_configs_map(edge_configs: dict) -> bool:
     if not isinstance(edge_configs, dict) or not edge_configs:
         return False
@@ -153,7 +214,21 @@ def uninstall_edge(yes):
         sudo cyberwave edge uninstall -y
     """
     from ..config import CONFIG_DIR
-    from ..core import PACKAGE_NAME, SYSTEMD_UNIT_NAME, SYSTEMD_UNIT_PATH, _run
+    from ..core import (
+        PACKAGE_NAME,
+        SYSTEMD_UNIT_NAME,
+        SYSTEMD_UNIT_PATH,
+        _load_or_generate_edge_fingerprint,
+        _run,
+    )
+    from ..credentials import load_credentials
+
+    # Capture auth + identity before deleting local config files.
+    creds = load_credentials()
+    edge_fingerprint = _load_or_generate_edge_fingerprint()
+    token = creds.token if creds else None
+    workspace_uuid = str(getattr(creds, "workspace_uuid", "") or "") if creds else None
+    base_url = str(getattr(creds, "cyberwave_base_url", "") or "") if creds else None
 
     if not yes:
         from rich.prompt import Confirm as RichConfirm
@@ -215,6 +290,28 @@ def uninstall_edge(yes):
                 _run(["apt-get", "remove", "-y", PACKAGE_NAME], check=False)
             except FileNotFoundError:
                 console.print("[yellow]apt-get not found — remove manually with pip.[/yellow]")
+
+    deleted_count, failed_count = _delete_registered_edges_for_fingerprint(
+        fingerprint=edge_fingerprint,
+        token=token,
+        base_url=base_url,
+        workspace_uuid=workspace_uuid,
+    )
+    if deleted_count:
+        console.print(
+            "[green]Removed backend edge registration(s): "
+            f"{deleted_count} (fingerprint: {edge_fingerprint}).[/green]"
+        )
+    elif token and failed_count == 0:
+        console.print(
+            "[dim]No backend edge registration found for this fingerprint "
+            f"({edge_fingerprint}).[/dim]"
+        )
+
+    if failed_count:
+        console.print(
+            f"[yellow]Failed to remove {failed_count} backend edge registration(s).[/yellow]"
+        )
 
     console.print("[green]Edge core service removed.[/green]")
 
