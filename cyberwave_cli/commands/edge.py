@@ -839,7 +839,13 @@ def show_logs(follow, lines):
         if result.returncode != 0:
             console.print("[dim]Tip: run with sudo if you see no output.[/dim]")
     except FileNotFoundError:
-        console.print("[red]journalctl not found. Is systemd available on this host?[/red]")
+        if sys.platform == "darwin":
+            console.print(
+                "[yellow]journalctl is not available on macOS.[/yellow]\n"
+                "[dim]Run edge-core in a terminal to see logs: cyberwave-edge-core[/dim]"
+            )
+        else:
+            console.print("[red]journalctl not found. Is systemd available on this host?[/red]")
     except KeyboardInterrupt:
         pass
 
