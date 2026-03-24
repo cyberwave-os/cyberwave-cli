@@ -1,7 +1,6 @@
 import os
 from pathlib import Path
 
-import pytest
 from click.testing import CliRunner
 
 from cyberwave_cli.main import cli
@@ -26,7 +25,8 @@ def test_completion_generate_bash_contains_click_hook():
     result = runner.invoke(cli, ["completion", "generate", "--shell", "bash"])
 
     assert result.exit_code == 0
-    assert "_CYBERWAVE_COMPLETE=bash_source cyberwave" in result.output
+    assert "_cyberwave_completion()" in result.output
+    assert "complete -o nosort -F _cyberwave_completion cyberwave" in result.output
 
 
 def test_completion_install_uses_detected_shell(tmp_path: Path):
@@ -96,6 +96,7 @@ def test_click_completion_outputs_nested_subcommands_and_flags():
             comp_words="cyberwave edge dr",
             comp_cword="2",
         ),
+        prog_name="cyberwave",
     )
     assert subcommand_result.exit_code == 0
     assert "plain,driver" in subcommand_result.output
@@ -109,6 +110,7 @@ def test_click_completion_outputs_nested_subcommands_and_flags():
             comp_words="cyberwave edge logs --f",
             comp_cword="3",
         ),
+        prog_name="cyberwave",
     )
     assert flag_result.exit_code == 0
     assert "plain,--follow" in flag_result.output
