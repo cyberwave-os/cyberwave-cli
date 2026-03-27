@@ -44,8 +44,8 @@ def so101(path: str) -> None:
 
     \b
     Examples:
-        cyberwave-cli so101
-        cyberwave-cli so101 ~/projects/my-robot
+        cyberwave so101
+        cyberwave so101 ~/projects/my-robot
     """
     target_path = Path(path).expanduser().resolve()
 
@@ -53,7 +53,7 @@ def so101(path: str) -> None:
     creds = load_credentials()
     if not creds or not creds.token:
         console.print(
-            "\n[yellow]⚠[/yellow] Not logged in. Run [bold]cyberwave-cli login[/bold] first "
+            "\n[yellow]⚠[/yellow] Not logged in. Run [bold]cyberwave login[/bold] first "
             "to enable full functionality."
         )
         console.print()

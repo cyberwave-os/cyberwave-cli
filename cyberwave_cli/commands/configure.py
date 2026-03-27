@@ -39,9 +39,9 @@ def configure(token: str | None, base_url: str | None, show: bool) -> None:
 
     \b
     Examples:
-        cyberwave-cli configure --token YOUR_TOKEN
-        cyberwave-cli configure --show
-        cyberwave-cli configure -t YOUR_TOKEN -u http://localhost:8000
+        cyberwave configure --token YOUR_TOKEN
+        cyberwave configure --show
+        cyberwave configure -t YOUR_TOKEN -u http://localhost:8000
     """
     if show:
         creds = load_credentials()

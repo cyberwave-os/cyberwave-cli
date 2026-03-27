@@ -62,7 +62,7 @@ def require_client(func: Callable[..., T]) -> Callable[..., T]:
         client = get_sdk_client()
         if not client:
             console.print("[red]✗[/red] Not logged in or SDK not installed.")
-            console.print("[dim]Run: cyberwave-cli configure --token YOUR_TOKEN[/dim]")
+            console.print("[dim]Run: cyberwave configure --token YOUR_TOKEN[/dim]")
             raise click.Abort()
         return func(client, *args, **kwargs)
     

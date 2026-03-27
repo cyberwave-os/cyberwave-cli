@@ -22,7 +22,7 @@ BANNER = """
 
 
 @click.group(invoke_without_command=True)
-@click.version_option(version=__version__, prog_name="cyberwave-cli")
+@click.version_option(version=__version__, prog_name="cyberwave")
 @click.pass_context
 def cli(ctx: click.Context) -> None:
     """Cyberwave CLI - Manage digital twins and edge ML.

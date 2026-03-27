@@ -1270,7 +1270,7 @@ def setup_edge_core(*, skip_confirm: bool = False) -> bool:
     if not service_setup_supported:
         console.print(
             "[yellow]Edge core service setup is only supported on Linux. "
-            "You will to start the core manually upon restart[/yellow]"
+            "You will need to start the core manually upon restart[/yellow]"
         )
 
     if service_setup_supported and os.geteuid() != 0:

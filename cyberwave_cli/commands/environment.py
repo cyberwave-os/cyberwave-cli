@@ -35,7 +35,7 @@ def list_environments(as_json: bool):
     client = get_sdk_client()
     if not client:
         console.print("[red]✗[/red] Not logged in or SDK not installed.")
-        console.print("[dim]Run: cyberwave-cli configure --token YOUR_TOKEN[/dim]")
+        console.print("[dim]Run: cyberwave configure --token YOUR_TOKEN[/dim]")
         raise click.Abort()
 
     try:
@@ -56,7 +56,7 @@ def list_environments(as_json: bool):
 
         if not envs:
             console.print("[dim]No environments found.[/dim]")
-            console.print("[dim]Create one with: cyberwave-cli camera[/dim]")
+            console.print("[dim]Create one with: cyberwave camera[/dim]")
             return
 
         table = Table(title="Environments")

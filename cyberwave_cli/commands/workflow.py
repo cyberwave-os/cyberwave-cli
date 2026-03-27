@@ -73,7 +73,7 @@ def list_workflows(as_json: bool):
 
         if not workflows:
             console.print("[dim]No workflows found.[/dim]")
-            console.print("[dim]Create one with: cyberwave-cli workflow create[/dim]")
+            console.print("[dim]Create one with: cyberwave workflow create[/dim]")
             return
 
         table = Table(title="Workflows")
@@ -116,7 +116,7 @@ def list_templates():
         )
 
     console.print(table)
-    console.print("\n[dim]Use: cyberwave-cli workflow create --template <id>[/dim]")
+    console.print("\n[dim]Use: cyberwave workflow create --template <id>[/dim]")
 
 
 @workflow.command("create")
@@ -128,10 +128,10 @@ def create_workflow(name: str | None, template: str | None):
     Examples:
     
         # Create from template
-        cyberwave-cli workflow create --template motion-detection
+        cyberwave workflow create --template motion-detection
         
         # Create with custom name
-        cyberwave-cli workflow create -n "My Workflow"
+        cyberwave workflow create -n "My Workflow"
     """
     client = get_sdk_client()
     if not client:
@@ -140,7 +140,7 @@ def create_workflow(name: str | None, template: str | None):
 
     if not template and not name:
         console.print("[red]✗[/red] Either --name or --template is required.")
-        console.print("[dim]Use: cyberwave-cli workflow templates[/dim]")
+        console.print("[dim]Use: cyberwave workflow templates[/dim]")
         raise click.Abort()
 
     try:

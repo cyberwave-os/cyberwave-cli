@@ -79,10 +79,10 @@ def scan(
 
     \b
     Examples:
-        cyberwave-cli scan
-        cyberwave-cli scan -s 10.0.0
-        cyberwave-cli scan --json
-        cyberwave-cli scan --no-ports  # Only use discovery protocols
+        cyberwave scan
+        cyberwave scan -s 10.0.0
+        cyberwave scan --json
+        cyberwave scan --no-ports  # Only use discovery protocols
     """
     scanner = NetworkScanner(subnet=subnet, timeout=timeout)
 
@@ -179,10 +179,10 @@ def scan(
     # Show example with first RTSP device
     rtsp_device = next((d for d in devices if d.protocol == "rtsp"), None)
     if rtsp_device:
-        console.print(f"  [dim]cyberwave-cli camera -u \"{rtsp_device.url}\"[/dim]")
+        console.print(f"  [dim]cyberwave camera -u \"{rtsp_device.url}\"[/dim]")
     else:
         http_device = next((d for d in devices if d.protocol == "http"), None)
         if http_device:
             console.print(
-                f"  [dim]cyberwave-cli camera -u \"http://{http_device.ip}/snapshot.jpg\"[/dim]"
+                f"  [dim]cyberwave camera -u \"http://{http_device.ip}/snapshot.jpg\"[/dim]"
             )

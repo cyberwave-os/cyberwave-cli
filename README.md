@@ -289,7 +289,7 @@ When credentials are written, the CLI also persists these `CYBERWAVE_*` values i
 
 ```bash
 pip install -e ".[build]"
-pyinstaller --onefile --name cyberwave-cli cyberwave_cli/main.py
+pyinstaller --onefile --name cyberwave cyberwave_cli/main.py
 ```
 
 ### Debian Package
