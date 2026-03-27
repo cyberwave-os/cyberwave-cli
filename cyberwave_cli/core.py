@@ -165,7 +165,7 @@ def _select_with_arrows(title: str, options: list[str]) -> int:
 
         _tty_write("\x1b[2J\x1b[H")
         _tty_write(f"{title}\n")
-        _tty_write("Use \u2191/\u2193 and press Enter\n\n")
+        _tty_write("Use \u2191/\u2193 and press Enter, q/Ctrl-C to abort\n\n")
 
         visible_end = min(scroll_offset + max_visible, len(options))
 
@@ -190,7 +190,7 @@ def _select_with_arrows(title: str, options: list[str]) -> int:
             char = sys.stdin.read(1)
             if char in ("\r", "\n"):
                 return selected
-            if char == "\x03":  # Ctrl+C — restore terminal then abort
+            if char in ("\x03", "q", "Q"):
                 raise KeyboardInterrupt
             if char == "\x1b":
                 nxt = sys.stdin.read(1)
@@ -645,7 +645,7 @@ def _select_multiple_with_arrows(title: str, options: list[str]) -> list[int]:
 
         _tty_write("\x1b[2J\x1b[H")
         _tty_write(f"{title}\n")
-        _tty_write("Use \u2191/\u2193 to move, Space to toggle, Enter to confirm\n\n")
+        _tty_write("Use \u2191/\u2193 to move, Space to toggle, Enter to confirm, q/Ctrl-C to abort\n\n")
 
         visible_end = min(scroll_offset + max_visible, len(options))
 
@@ -669,6 +669,8 @@ def _select_multiple_with_arrows(title: str, options: list[str]) -> list[int]:
         _render()
         while True:
             char = sys.stdin.read(1)
+            if char in ("\x03", "q", "Q"):
+                raise KeyboardInterrupt
             if char in ("\r", "\n"):
                 return sorted(selected)
             if char == " ":
