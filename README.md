@@ -65,6 +65,41 @@ This command will guide you to your first-time setup of your edge device.
 | `logout`     | Remove stored credentials                |
 | `config-dir` | Print the active configuration directory |
 | `core`       | Visualize the core commands              |
+| `completion` | Generate/install shell autocomplete      |
+
+## Shell Autocompletion
+
+Enable persistent autocompletion in one step:
+
+```bash
+cyberwave completion install
+```
+
+This auto-detects your shell (`bash` or `zsh`), writes an idempotent completion block
+into your shell RC file, and tells you which file to source.
+
+### Explicit shell setup
+
+```bash
+# Bash
+cyberwave completion install --shell bash
+
+# Zsh
+cyberwave completion install --shell zsh
+```
+
+### Generate scripts manually
+
+```bash
+cyberwave completion generate --shell bash
+cyberwave completion generate --shell zsh
+```
+
+### Troubleshooting
+
+- **Shell not detected**: run `cyberwave completion install --shell bash` or `--shell zsh`.
+- **Permission denied writing RC file**: re-run with a writable `--rc-file` path, then source it.
+- **Already installed**: the installer is idempotent and will report when completion is already configured.
 
 ### `cyberwave login`
 
