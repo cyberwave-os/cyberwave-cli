@@ -1,3 +1,5 @@
 """Cyberwave CLI - The official command-line interface for Cyberwave."""
 
-__version__ = "0.11.43"
+from ._version import get_version
+
+__version__ = get_version()
