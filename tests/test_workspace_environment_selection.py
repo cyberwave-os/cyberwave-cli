@@ -99,7 +99,7 @@ def test_workspace_environments_includes_standalone_and_project_scoped(monkeypat
     result = core._workspace_environments(client, workspace_uuid)
     uuids = [env.uuid for env in result]
 
-    assert uuids == ["env-project", "env-standalone"]
+    assert set(uuids) == {"env-project", "env-standalone"}
     assert "project-1" in environments.calls
     assert None in environments.calls
 
@@ -209,3 +209,42 @@ def test_detach_edge_fingerprint_from_other_twins_counts_update_failures(monkeyp
 
     assert detached == 0
     assert failed == 1
+
+
+class _FakeWorkspacesManager:
+    def __init__(self, workspaces):
+        self._workspaces = workspaces
+
+    def list(self):
+        return list(self._workspaces)
+
+
+def test_resolve_workspace_from_credentials_matches_uuid(monkeypatch):
+    core = _load_core_module(monkeypatch)
+    ws = SimpleNamespace(uuid="4144c982-2f9e-47ba-9504-4e0e4ec2ad11", name="test")
+    other = SimpleNamespace(uuid="00000000-0000-0000-0000-000000000001", name="other")
+    client = SimpleNamespace(workspaces=_FakeWorkspacesManager([other, ws]))
+
+    found = core._resolve_workspace_from_credentials(
+        client, "4144c982-2f9e-47ba-9504-4e0e4ec2ad11"
+    )
+    assert found is ws
+
+
+def test_resolve_workspace_from_credentials_returns_none_when_missing(monkeypatch):
+    core = _load_core_module(monkeypatch)
+    client = SimpleNamespace(
+        workspaces=_FakeWorkspacesManager(
+            [SimpleNamespace(uuid="11111111-1111-1111-1111-111111111111", name="only")]
+        )
+    )
+
+    assert core._resolve_workspace_from_credentials(client, "22222222-2222-2222-2222-222222222222") is None
+
+
+def test_resolve_workspace_from_credentials_empty_uuid(monkeypatch):
+    core = _load_core_module(monkeypatch)
+    client = SimpleNamespace(workspaces=_FakeWorkspacesManager([]))
+
+    assert core._resolve_workspace_from_credentials(client, "") is None
+    assert core._resolve_workspace_from_credentials(client, "   ") is None

@@ -18,6 +18,9 @@ from ..credentials import (
 
 console = Console()
 
+MAX_LOGIN_ATTEMPTS = 3
+MAX_API_TOKEN_RETRIES = 3
+
 
 def select_workspace(workspaces: list[Workspace]) -> Workspace:
     """Prompt user to select a workspace if multiple are available."""
@@ -99,7 +102,8 @@ def login(email: str | None, password: str | None) -> None:
                 try:
                     from cyberwave import Cyberwave
 
-                    client = Cyberwave(base_url=_stored_api_url(existing_creds), token=validate_token)
+                    stored_url = _stored_api_url(existing_creds)
+                    client = Cyberwave(base_url=stored_url, token=validate_token)
                     client.workspaces.list()
                     is_valid = True
                 except Exception:
@@ -119,88 +123,93 @@ def login(email: str | None, password: str | None) -> None:
                 if not click.confirm("Do you want to log in with a different account?"):
                     return
 
-    # Prompt for credentials if not provided
-    if not email:
-        email = Prompt.ask("\n[bold]Email[/bold]")
+    email_from_cli = email
+    password_from_cli = password
+    # Without a TTY we cannot re-prompt; a single attempt avoids hanging on Prompt.ask.
+    max_attempts = MAX_LOGIN_ATTEMPTS if sys.stdin.isatty() else 1
 
-    if not password:
-        password = Prompt.ask("[bold]Password[/bold]", password=True)
+    for attempt in range(1, max_attempts + 1):
+        login_email = email_from_cli if email_from_cli else Prompt.ask("\n[bold]Email[/bold]")
+        login_password = password_from_cli if password_from_cli else Prompt.ask(
+            "[bold]Password[/bold]", password=True
+        )
 
-    try:
-        runtime_overrides = collect_runtime_env_overrides()
-        with AuthClient() as client:
-            with console.status("[dim]Authenticating...[/dim]"):
-                # First, get a session token via OAuth
-                session_token = client.login(email, password)
+        try:
+            runtime_overrides = collect_runtime_env_overrides()
+            with AuthClient() as client:
+                with console.status("[dim]Authenticating...[/dim]"):
+                    session_token = client.login(login_email, login_password)
+                    user = client.get_current_user(session_token)
+                    workspaces = client.get_workspaces(session_token)
 
-                # Get user info to confirm login
-                user = client.get_current_user(session_token)
+                if not workspaces:
+                    console.print(
+                        f"\n[yellow][WARN][/yellow] Logged in as [bold]{user.email}[/bold] "
+                        "but no workspaces found."
+                    )
+                    console.print(
+                        "[dim]Please create a workspace at https://cyberwave.com "
+                        "to use the CLI.[/dim]"
+                    )
+                    raise click.Abort()
 
-                # Get user's workspaces to create a permanent API token
-                workspaces = client.get_workspaces(session_token)
+                workspace = select_workspace(workspaces)
+                api_token = None
 
-            if not workspaces:
+                for token_attempt in range(1, MAX_API_TOKEN_RETRIES + 1):
+                    status_msg = (
+                        f"[dim]Creating API token for workspace '{workspace.name}'...[/dim]"
+                        if token_attempt == 1
+                        else (
+                            f"[dim]Retrying API token creation for workspace "
+                            f"'{workspace.name}' ({token_attempt}/{MAX_API_TOKEN_RETRIES})...[/dim]"
+                        )
+                    )
+                    with console.status(status_msg):
+                        try:
+                            api_token = client.create_api_token(session_token, workspace.uuid)
+                            break
+                        except AuthenticationError as exc:
+                            retryable = _is_retryable_workspace_token_error(exc)
+                            if token_attempt == MAX_API_TOKEN_RETRIES or not retryable:
+                                raise
+                    wait_seconds = 2 * token_attempt
+                    console.print(
+                        f"[yellow][WARN][/yellow] Temporary token creation failure. "
+                        f"Retrying in {wait_seconds}s..."
+                    )
+                    time.sleep(wait_seconds)
+
+                if api_token is None:
+                    raise AuthenticationError("Failed to create API token")
+
+                save_credentials(
+                    Credentials(
+                        token=api_token.token,
+                        email=user.email,
+                        workspace_uuid=workspace.uuid,
+                        workspace_name=workspace.name,
+                        cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
+                        cyberwave_edge_log_level=runtime_overrides.get("CYBERWAVE_EDGE_LOG_LEVEL"),
+                        cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
+                        cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
+                    )
+                )
+
                 console.print(
-                    f"\n[yellow][WARN][/yellow] Logged in as [bold]{user.email}[/bold] "
-                    "but no workspaces found."
+                    f"\n[green][OK][/green] Successfully logged in as [bold]{user.email}[/bold]"
                 )
-                console.print(
-                    "[dim]Please create a workspace at https://cyberwave.com to use the CLI.[/dim]"
-                )
-                raise click.Abort()
+                console.print(f"[dim]Workspace: {workspace.name}[/dim]")
+                from ..config import CREDENTIALS_FILE
 
-            # Let user select a workspace if multiple are available.
-            # If API token creation hits transient backend 500s, retry the
-            # same workspace with a short backoff.
-            workspace = select_workspace(workspaces)
-            max_attempts = 3
-            api_token = None
+                console.print(f"[dim]API token saved to {CREDENTIALS_FILE}[/dim]", highlight=False)
+            return
 
-            for attempt in range(1, max_attempts + 1):
-                status_msg = (
-                    f"[dim]Creating API token for workspace '{workspace.name}'...[/dim]"
-                    if attempt == 1
-                    else f"[dim]Retrying API token creation for workspace '{workspace.name}' ({attempt}/{max_attempts})...[/dim]"
-                )
-                with console.status(status_msg):
-                    try:
-                        api_token = client.create_api_token(session_token, workspace.uuid)
-                        break
-                    except AuthenticationError as exc:
-                        if attempt == max_attempts or not _is_retryable_workspace_token_error(exc):
-                            raise
-                wait_seconds = 2 * attempt
-                console.print(
-                    f"[yellow][WARN][/yellow] Temporary token creation failure. "
-                    f"Retrying in {wait_seconds}s..."
-                )
-                time.sleep(wait_seconds)
-
-            if api_token is None:
-                raise AuthenticationError("Failed to create API token")
-
-            # Save the permanent API token (not the session token which expires)
-            save_credentials(
-                Credentials(
-                    token=api_token.token,
-                    email=user.email,
-                    workspace_uuid=workspace.uuid,
-                    workspace_name=workspace.name,
-                    cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
-                    cyberwave_edge_log_level=runtime_overrides.get("CYBERWAVE_EDGE_LOG_LEVEL"),
-                    cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
-                    cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
-                )
-            )
-
-            console.print(
-                f"\n[green][OK][/green] Successfully logged in as [bold]{user.email}[/bold]"
-            )
-            console.print(f"[dim]Workspace: {workspace.name}[/dim]")
-            from ..config import CREDENTIALS_FILE
-
-            console.print(f"[dim]API token saved to {CREDENTIALS_FILE}[/dim]", highlight=False)
-
-    except AuthenticationError as e:
-        console.print(f"\n[red][ERROR][/red] Login failed: {e}")
-        raise click.Abort()
+        except AuthenticationError as e:
+            console.print(f"\n[red][ERROR][/red] Login failed: {e}")
+            password_from_cli = None
+            if not email_from_cli:
+                email_from_cli = None
+            if attempt >= max_attempts:
+                raise click.Abort() from None
+            console.print("[yellow]Please try again.[/yellow]")

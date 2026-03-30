@@ -410,6 +410,23 @@ def _select_workspace(client: Any, *, skip_confirm: bool) -> Any:
     return ws
 
 
+def _resolve_workspace_from_credentials(client: Any, workspace_uuid: str) -> Any | None:
+    """Return the SDK workspace matching ``workspace_uuid``, or None if not listed."""
+    raw = str(workspace_uuid).strip()
+    if not raw:
+        return None
+    target = raw.lower()
+    try:
+        workspaces = client.workspaces.list()
+    except Exception:
+        return None
+    for ws in workspaces:
+        ws_id = str(getattr(ws, "uuid", "") or "").strip().lower()
+        if ws_id == target:
+            return ws
+    return None
+
+
 def _workspace_projects(client: Any, workspace_uuid: str) -> list[Any]:
     """Return projects that belong to the selected workspace."""
     projects = client.projects.list()
@@ -862,8 +879,22 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
         return False
 
     try:
-        client = _get_sdk_client(creds.token)
-        workspace = _select_workspace(client, skip_confirm=skip_confirm)
+        creds_base_url = creds.cyberwave_base_url
+        client = _get_sdk_client(creds.token, base_url=creds_base_url)
+
+        workspace = None
+        if creds.workspace_uuid:
+            workspace = _resolve_workspace_from_credentials(client, creds.workspace_uuid)
+            if workspace:
+                console.print(f"[green]Using workspace from credentials:[/green] {workspace.name}")
+
+        if workspace is None:
+            if creds.workspace_uuid:
+                console.print(
+                    "[yellow]Stored workspace is not available for this account. "
+                    "Select a workspace.[/yellow]"
+                )
+            workspace = _select_workspace(client, skip_confirm=skip_confirm)
         environment = _select_or_create_environment(
             client,
             str(workspace.uuid),
