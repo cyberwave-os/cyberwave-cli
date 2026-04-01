@@ -31,6 +31,8 @@ pip install cyberwave-cli
 curl -fsSL https://cyberwave.com/install.sh | bash
 ```
 
+The same Buildkite apt registry also carries **`cyberwave-cli-dev`** and **`cyberwave-cli-staging`** for CI builds from `dev` / `staging`. Use those package names explicitly when you want those channels; default `cyberwave-cli` is tagged releases. The packages conflict because they ship the same `/usr/bin/cyberwave`.
+
 ### From Source
 
 ```bash
