@@ -37,6 +37,11 @@ console = Console()
 # ---- constants ---------------------------------------------------------------
 
 PACKAGE_NAME = "cyberwave-edge-core"
+EDGE_CORE_PACKAGE_CHANNELS = {
+    "stable": PACKAGE_NAME,
+    "dev": "cyberwave-edge-core-dev",
+    "staging": "cyberwave-edge-core-staging",
+}
 BINARY_PATH = Path("/usr/bin/cyberwave-edge-core")
 SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
 SYSTEMD_UNIT_PATH = Path(f"/etc/systemd/system/{SYSTEMD_UNIT_NAME}")
@@ -962,7 +967,16 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
 # ---- apt-get installation ----------------------------------------------------
 
 
-def _apt_get_install() -> bool:
+def _resolve_edge_core_package_name(channel: str | None) -> str:
+    """Resolve the Debian package name for the requested edge-core channel."""
+    normalized_channel = (channel or "stable").lower()
+    try:
+        return EDGE_CORE_PACKAGE_CHANNELS[normalized_channel]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported edge-core channel: {normalized_channel}") from exc
+
+
+def _apt_get_install(*, package_name: str = PACKAGE_NAME, package_version: str | None = None) -> bool:
     """Install cyberwave-edge-core via apt-get.
 
     Adds the Buildkite package registry GPG key and source if not already
@@ -1048,7 +1062,8 @@ def _apt_get_install() -> bool:
             return False
 
     # Update and install the latest version
-    console.print(f"[cyan]Installing {PACKAGE_NAME} via apt-get...[/cyan]")
+    install_target = f"{package_name}={package_version}" if package_version else package_name
+    console.print(f"[cyan]Installing {install_target} via apt-get...[/cyan]")
     try:
         # Retry apt-get update to handle transient CDN mirror sync failures.
         # After all attempts, warn and continue — apt will use its cached index
@@ -1073,7 +1088,7 @@ def _apt_get_install() -> bool:
                         "one or more sources may be temporarily unavailable. "
                         "Proceeding with cached package index...[/yellow]"
                     )
-        _run(["apt-get", "install", "-y", "-qq", PACKAGE_NAME])
+        _run(["apt-get", "install", "-y", "-qq", install_target])
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]apt-get failed (exit {exc.returncode}).[/red]")
         return False
@@ -1086,30 +1101,38 @@ def _apt_get_install() -> bool:
     return False
 
 
-def _pip_install() -> bool:
+def _pip_install(*, package_version: str | None = None, channel: str = "stable") -> bool:
     """Fallback: install cyberwave-edge-core via pip.
 
     Used on non-Debian systems (macOS, other Linux flavors).
     Returns True on success.
     """
-    console.print(f"[cyan]Installing {PACKAGE_NAME} via pip...[/cyan]")
+    if channel != "stable":
+        console.print(
+            "[red]Non-stable edge-core channels are only supported via apt-get on Debian/Ubuntu.[/red]"
+        )
+        return False
+
+    pip_target = f"{PACKAGE_NAME}=={package_version}" if package_version else PACKAGE_NAME
+    console.print(f"[cyan]Installing {pip_target} via pip...[/cyan]")
     try:
-        _run([sys.executable, "-m", "pip", "install", PACKAGE_NAME])
+        _run([sys.executable, "-m", "pip", "install", pip_target])
         return True
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]pip install failed (exit {exc.returncode}).[/red]")
         return False
 
 
-def install_edge_core() -> bool:
+def install_edge_core(*, channel: str = "stable", version: str | None = None) -> bool:
     """Install the cyberwave-edge-core package.
 
     Prefers apt-get on Debian/Ubuntu, falls back to pip otherwise.
     Returns True on success.
     """
     if _is_linux() and shutil.which("apt-get"):
-        return _apt_get_install()
-    return _pip_install()
+        package_name = _resolve_edge_core_package_name(channel)
+        return _apt_get_install(package_name=package_name, package_version=version)
+    return _pip_install(package_version=version, channel=channel)
 
 
 # ---- docker installation -----------------------------------------------------
@@ -1294,7 +1317,12 @@ def stop_service() -> bool:
 # ---- orchestrator ------------------------------------------------------------
 
 
-def setup_edge_core(*, skip_confirm: bool = False) -> bool:
+def setup_edge_core(
+    *,
+    skip_confirm: bool = False,
+    edge_core_channel: str = "stable",
+    edge_core_version: str | None = None,
+) -> bool:
     """Full setup: install the package, create the service, enable on boot.
 
     Returns True if everything succeeded.
@@ -1305,6 +1333,11 @@ def setup_edge_core(*, skip_confirm: bool = False) -> bool:
             "[yellow]Edge core service setup is only supported on Linux. "
             "You will need to start the core manually upon restart[/yellow]"
         )
+        if edge_core_channel != "stable":
+            console.print(
+                "[red]Non-stable edge-core channels are only supported via apt-get on Debian/Ubuntu.[/red]"
+            )
+            return False
 
     if service_setup_supported and os.geteuid() != 0:
         console.print(
@@ -1319,16 +1352,21 @@ def setup_edge_core(*, skip_confirm: bool = False) -> bool:
 
     if not skip_confirm:
         if service_setup_supported:
+            selected_package = _resolve_edge_core_package_name(edge_core_channel)
+            selected_target = (
+                f"{selected_package}={edge_core_version}" if edge_core_version else selected_package
+            )
             console.print(
                 f"\nThis will:\n"
-                f"  1. Install [bold]{PACKAGE_NAME}[/bold] via apt-get\n"
+                f"  1. Install [bold]{selected_target}[/bold] via apt-get\n"
                 f"  2. Create a systemd service ([bold]{SYSTEMD_UNIT_NAME}[/bold])\n"
                 f"  3. Enable it to start on boot\n"
             )
         else:
+            pip_target = f"{PACKAGE_NAME}=={edge_core_version}" if edge_core_version else PACKAGE_NAME
             console.print(
                 f"\nThis will:\n"
-                f"  1. Install [bold]{PACKAGE_NAME}[/bold] via pip\n"
+                f"  1. Install [bold]{pip_target}[/bold] via pip\n"
                 f"  2. Configure edge credentials and environment\n"
                 f"  3. Skip service setup (manual startup required)\n"
             )
@@ -1337,7 +1375,7 @@ def setup_edge_core(*, skip_confirm: bool = False) -> bool:
             return False
 
     # Step 1 — install edge core
-    if not install_edge_core():
+    if not install_edge_core(channel=edge_core_channel, version=edge_core_version):
         return False
 
     # Linux-only service setup.

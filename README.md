@@ -174,6 +174,8 @@ Installs the `cyberwave-edge-core` package (via apt-get on Debian/Ubuntu) and cr
 ```bash
 sudo cyberwave edge install
 sudo cyberwave edge install -y   # skip prompts
+sudo cyberwave edge install --edge-core-channel dev
+sudo cyberwave edge install --edge-core-channel staging --edge-core-version 0.0.42.595
 ```
 
 ### `cyberwave edge uninstall`
