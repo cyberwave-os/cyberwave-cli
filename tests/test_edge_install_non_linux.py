@@ -46,7 +46,6 @@ def _load_core_module(monkeypatch):
     auth_module.AuthenticationError = Exception
 
     cli_config_module = ModuleType("cyberwave_cli.config")
-    cli_config_module.CONFIG_DIR = ModuleType("dummy").__class__("dummy")  # placeholder
     cli_config_module.CONFIG_DIR = __import__("pathlib").Path("/tmp/cyberwave-config")
     cli_config_module.clean_subprocess_env = lambda: {}
     cli_config_module.get_api_url = lambda: "https://api.example.test"
@@ -106,7 +105,7 @@ def test_setup_edge_core_non_linux_continues_without_service_setup(monkeypatch):
     assert calls == [("credentials", True), ("install", ("stable", None)), ("configure", True)]
     assert any(
         "Edge core service setup is only supported on Linux. "
-        "You will to start the core manually upon restart" in message
+        "You will need to start the core manually upon restart" in message
         for message in messages
     )
 
