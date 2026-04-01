@@ -106,6 +106,8 @@ jobs:
           Architecture: ${ARCH}
           Maintainer: Cyberwave <info@cyberwave.com>
           Homepage: https://cyberwave.com
+          Conflicts: cyberwave-cli-dev, cyberwave-cli-staging
+          Replaces: cyberwave-cli-dev, cyberwave-cli-staging
           Description: The official command-line interface for Cyberwave
            Authenticate and bootstrap robotics projects from your terminal.
            .

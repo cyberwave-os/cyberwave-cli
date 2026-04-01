@@ -31,6 +31,8 @@ pip install cyberwave-cli
 curl -fsSL https://cyberwave.com/install.sh | bash
 ```
 
+The same Buildkite apt registry also carries **`cyberwave-cli-dev`** and **`cyberwave-cli-staging`** for CI builds from `dev` / `staging`. Use those package names explicitly when you want those channels; default `cyberwave-cli` is tagged releases. The packages conflict because they ship the same `/usr/bin/cyberwave`.
+
 ### From Source
 
 ```bash
@@ -256,6 +258,8 @@ Installs the `cyberwave-edge-core` package (via apt-get on Debian/Ubuntu) and cr
 ```bash
 sudo cyberwave edge install
 sudo cyberwave edge install -y   # skip prompts
+sudo cyberwave edge install --edge-core-channel dev
+sudo cyberwave edge install --edge-core-channel staging --edge-core-version 0.0.42.595
 ```
 
 ### `cyberwave edge uninstall`

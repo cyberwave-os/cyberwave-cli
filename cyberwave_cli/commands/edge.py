@@ -179,7 +179,20 @@ def edge():
 
 @edge.command("install")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
-def install_edge(yes):
+@click.option(
+    "--edge-core-channel",
+    type=click.Choice(["stable", "dev", "staging"], case_sensitive=False),
+    default="stable",
+    show_default=True,
+    help="Which edge-core package channel to install",
+)
+@click.option(
+    "--edge-core-version",
+    type=str,
+    default=None,
+    help="Exact edge-core version to install from the selected channel",
+)
+def install_edge(yes, edge_core_channel, edge_core_version):
     """Install cyberwave-edge-core and register it as a boot service.
 
     Downloads the cyberwave-edge-core package (via apt-get on Debian/Ubuntu)
@@ -189,11 +202,17 @@ def install_edge(yes):
     Examples:
         sudo cyberwave edge install
         sudo cyberwave edge install -y
+        sudo cyberwave edge install --edge-core-channel dev
+        sudo cyberwave edge install --edge-core-channel staging --edge-core-version 0.0.42.595
     """
     from ..core import setup_edge_core
 
     try:
-        if not setup_edge_core(skip_confirm=yes):
+        if not setup_edge_core(
+            skip_confirm=yes,
+            edge_core_channel=edge_core_channel.lower(),
+            edge_core_version=edge_core_version,
+        ):
             raise SystemExit(1)
     except KeyboardInterrupt:
         console.print("\n[dim]Aborted.[/dim]")
@@ -215,10 +234,10 @@ def uninstall_edge(yes):
     """
     from ..config import CONFIG_DIR
     from ..core import (
-        PACKAGE_NAME,
         SYSTEMD_UNIT_NAME,
         SYSTEMD_UNIT_PATH,
         _load_or_generate_edge_fingerprint,
+        _resolve_installed_edge_core_package_name,
         _run,
     )
     from ..credentials import load_credentials
@@ -285,9 +304,12 @@ def uninstall_edge(yes):
     if not yes:
         from rich.prompt import Confirm as RichConfirm
 
-        if RichConfirm.ask(f"Also uninstall {PACKAGE_NAME} package?", default=False):
+        installed_package_name = _resolve_installed_edge_core_package_name()
+        if RichConfirm.ask(
+            f"Also uninstall {installed_package_name} package?", default=False
+        ):
             try:
-                _run(["apt-get", "remove", "-y", PACKAGE_NAME], check=False)
+                _run(["apt-get", "remove", "-y", installed_package_name], check=False)
             except FileNotFoundError:
                 console.print("[yellow]apt-get not found — remove manually with pip.[/yellow]")
 
