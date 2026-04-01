@@ -52,22 +52,23 @@ def _worker_origin(filename: str) -> str:
     return "custom"
 
 
-def _find_worker_container() -> str | None:
-    """Return the running worker container name, or None if not found."""
+def _find_worker_container(*, include_stopped: bool = False) -> str | None:
+    """Return a worker container name, or None if none exists.
+
+    When *include_stopped* is True, stopped and exited containers are also
+    considered (useful for ``status`` where we want to show crash/exit info).
+    """
+    cmd = ["docker", "ps"]
+    if include_stopped:
+        cmd.append("-a")
+    cmd += [
+        "--filter",
+        f"name={WORKER_CONTAINER_PREFIX}",
+        "--format",
+        "{{.Names}}",
+    ]
     try:
-        result = subprocess.run(
-            [
-                "docker",
-                "ps",
-                "--filter",
-                f"name={WORKER_CONTAINER_PREFIX}",
-                "--format",
-                "{{.Names}}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
             names = [n.strip() for n in result.stdout.strip().splitlines() if n.strip()]
             return names[0] if names else None
@@ -210,9 +211,9 @@ def add_worker(source: str, name: str | None, force: bool) -> None:
     console.print(f"[green]✓[/green] Worker installed: [bold]{dest_name}[/bold]")
     console.print(f"  Path: {dest}")
     console.print(
-        "\n[dim]Restart the edge worker container to load the new worker:[/dim]"
+        "\n[dim]Edge-core will detect the change and restart the worker container automatically.[/dim]"
     )
-    console.print("[dim]  cyberwave-edge-core worker restart[/dim]")
+    console.print("[dim]Run 'cyberwave worker status' to check the container state.[/dim]")
 
 
 @worker.command("remove")
@@ -262,9 +263,9 @@ def remove_worker(name: str, yes: bool) -> None:
 
     console.print(f"[green]✓[/green] Removed: [bold]{filename}[/bold]")
     console.print(
-        "\n[dim]Restart the edge worker container to apply the change:[/dim]"
+        "\n[dim]Edge-core will detect the change and restart the worker container automatically.[/dim]"
     )
-    console.print("[dim]  cyberwave-edge-core worker restart[/dim]")
+    console.print("[dim]Run 'cyberwave worker status' to check the container state.[/dim]")
 
 
 @worker.command("logs")
@@ -361,13 +362,14 @@ def worker_status(container: str | None) -> None:
 
     # --- Container section ---
     console.print("\n[bold]Worker Container[/bold]\n")
-    container_name = container or _find_worker_container()
+    container_name = container or _find_worker_container(include_stopped=True)
 
     if not container_name:
-        console.print("  [yellow]⚠[/yellow] Worker container not running.")
+        console.print("  [yellow]⚠[/yellow] No worker container found.")
         console.print(
             "  [dim]Start with: cyberwave-edge-core worker start[/dim]"
         )
+        console.print()
         return
 
     try:
@@ -376,7 +378,7 @@ def worker_status(container: str | None) -> None:
                 "docker",
                 "inspect",
                 "--format",
-                "{{.State.Status}} | {{.State.StartedAt}}",
+                "{{.State.Status}} | {{.State.StartedAt}} | {{.State.FinishedAt}} | {{.State.ExitCode}}",
                 container_name,
             ],
             capture_output=True,
@@ -384,18 +386,31 @@ def worker_status(container: str | None) -> None:
             timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
-            parts = result.stdout.strip().split(" | ", 1)
-            status = parts[0]
+            parts = result.stdout.strip().split(" | ")
+            status = parts[0] if parts else "unknown"
             started = parts[1] if len(parts) > 1 else ""
-            status_fmt = (
-                f"[green]{status}[/green]"
-                if status == "running"
-                else f"[yellow]{status}[/yellow]"
-            )
+            finished = parts[2] if len(parts) > 2 else ""
+            exit_code = parts[3] if len(parts) > 3 else ""
+
+            if status == "running":
+                status_fmt = f"[green]{status}[/green]"
+            elif status in {"exited", "dead"}:
+                status_fmt = f"[red]{status}[/red]"
+            else:
+                status_fmt = f"[yellow]{status}[/yellow]"
+
             console.print(f"  Container: [bold]{container_name}[/bold]")
-            console.print(f"  Status: {status_fmt}")
-            if started:
-                console.print(f"  Started: [dim]{started[:19]}[/dim]")
+            console.print(f"  Status:    {status_fmt}")
+            if started and not started.startswith("0001"):
+                console.print(f"  Started:   [dim]{started[:19]}[/dim]")
+            if status in {"exited", "dead"}:
+                if finished and not finished.startswith("0001"):
+                    console.print(f"  Stopped:   [dim]{finished[:19]}[/dim]")
+                if exit_code and exit_code != "0":
+                    console.print(f"  Exit code: [red]{exit_code}[/red]")
+                console.print(
+                    "\n  [dim]View logs with: cyberwave worker logs --no-follow[/dim]"
+                )
         else:
             console.print(f"  [yellow]⚠[/yellow] Could not inspect container {container_name}.")
     except (subprocess.TimeoutExpired, FileNotFoundError):

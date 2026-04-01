@@ -56,7 +56,7 @@ def test_setup_edge_core_non_linux_continues_without_service_setup(monkeypatch):
     assert calls == [("credentials", True), ("install", None), ("configure", True)]
     assert any(
         "Edge core service setup is only supported on Linux. "
-        "You will to start the core manually upon restart" in message
+            "You will need to start the core manually upon restart" in message
         for message in messages
     )
 
