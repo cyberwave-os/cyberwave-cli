@@ -14,6 +14,7 @@ from .scan import scan
 from .so101 import so101
 from .twin import twin
 from .workflow import workflow
+from .worker import worker
 
 __all__ = [
     "camera",
@@ -30,4 +31,5 @@ __all__ = [
     "so101",
     "twin",
     "workflow",
+    "worker",
 ]

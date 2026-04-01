@@ -19,6 +19,7 @@ from .commands import (
     so101,
     twin,
     workflow,
+    worker,
 )
 
 console = Console()
@@ -69,6 +70,10 @@ def cli(ctx: click.Context) -> None:
       workflow    Create and manage automation workflows
 
     \b
+    Worker Management:
+      worker      Manage local worker files for edge inference
+
+    \b
     Documentation: https://docs.cyberwave.com
     """
     if ctx.invoked_subcommand is None:
@@ -91,6 +96,7 @@ cli.add_command(scan)
 cli.add_command(so101)
 cli.add_command(twin)
 cli.add_command(workflow)
+cli.add_command(worker)
 
 
 def main() -> None:
