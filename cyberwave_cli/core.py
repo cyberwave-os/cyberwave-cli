@@ -944,6 +944,10 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
             if failed_count:
                 console.print(f"[yellow]Failed to update {failed_count} twin(s).[/yellow]")
 
+            written = _download_twin_json_files(client, selected_twin_uuids)
+            if written:
+                console.print(f"[dim]Pre-cached twin JSON files: {written}[/dim]")
+
         _save_environment_file(
             workspace_uuid=str(workspace.uuid),
             workspace_name=workspace.name,
