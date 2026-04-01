@@ -234,10 +234,10 @@ def uninstall_edge(yes):
     """
     from ..config import CONFIG_DIR
     from ..core import (
-        PACKAGE_NAME,
         SYSTEMD_UNIT_NAME,
         SYSTEMD_UNIT_PATH,
         _load_or_generate_edge_fingerprint,
+        _resolve_installed_edge_core_package_name,
         _run,
     )
     from ..credentials import load_credentials
@@ -304,9 +304,12 @@ def uninstall_edge(yes):
     if not yes:
         from rich.prompt import Confirm as RichConfirm
 
-        if RichConfirm.ask(f"Also uninstall {PACKAGE_NAME} package?", default=False):
+        installed_package_name = _resolve_installed_edge_core_package_name()
+        if RichConfirm.ask(
+            f"Also uninstall {installed_package_name} package?", default=False
+        ):
             try:
-                _run(["apt-get", "remove", "-y", PACKAGE_NAME], check=False)
+                _run(["apt-get", "remove", "-y", installed_package_name], check=False)
             except FileNotFoundError:
                 console.print("[yellow]apt-get not found — remove manually with pip.[/yellow]")
 

@@ -976,6 +976,26 @@ def _resolve_edge_core_package_name(channel: str | None) -> str:
         raise ValueError(f"Unsupported edge-core channel: {normalized_channel}") from exc
 
 
+def _resolve_installed_edge_core_package_name() -> str:
+    """Best-effort detect which edge-core Debian package is currently installed."""
+    for package_name in EDGE_CORE_PACKAGE_CHANNELS.values():
+        try:
+            result = subprocess.run(
+                ["dpkg-query", "-W", "-f=${db:Status-Status}", package_name],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=clean_subprocess_env(),
+            )
+        except FileNotFoundError:
+            break
+
+        if result.returncode == 0 and result.stdout.strip() == "installed":
+            return package_name
+
+    return PACKAGE_NAME
+
+
 def _apt_get_install(*, package_name: str = PACKAGE_NAME, package_version: str | None = None) -> bool:
     """Install cyberwave-edge-core via apt-get.
 
