@@ -13,6 +13,7 @@ from .commands import (
     environment,
     login,
     logout,
+    manifest,
     model,
     plugin,
     scan,
@@ -90,6 +91,7 @@ cli.add_command(edge)
 cli.add_command(environment)
 cli.add_command(login)
 cli.add_command(logout)
+cli.add_command(manifest)
 cli.add_command(model)
 cli.add_command(plugin)
 cli.add_command(scan)

@@ -8,6 +8,7 @@ from .edge import edge
 from .environment import environment
 from .login import login
 from .logout import logout
+from .manifest import manifest
 from .model import model
 from .plugin import plugin
 from .scan import scan
@@ -25,6 +26,7 @@ __all__ = [
     "environment",
     "login",
     "logout",
+    "manifest",
     "model",
     "plugin",
     "scan",
