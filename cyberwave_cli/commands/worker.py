@@ -19,6 +19,7 @@ Example usage:
     cyberwave worker status                 # Show worker container status
 """
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -52,6 +53,28 @@ def _worker_origin(filename: str) -> str:
     return "custom"
 
 
+_CW_MODELS_LOAD_RE = re.compile(
+    r"""cw\.models\.load\s*\(\s*['"]([^'"]+)['"]\s*""",
+    re.MULTILINE,
+)
+
+
+def _scan_model_ids(filepath: Path) -> list[str]:
+    """Return deduplicated model IDs referenced by ``cw.models.load(...)`` in *filepath*."""
+    try:
+        source = filepath.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for match in _CW_MODELS_LOAD_RE.finditer(source):
+        model_id = match.group(1)
+        if model_id not in seen:
+            seen.add(model_id)
+            result.append(model_id)
+    return result
+
+
 def _find_worker_container(*, include_stopped: bool = False) -> str | None:
     """Return a worker container name, or None if none exists.
 
@@ -63,7 +86,7 @@ def _find_worker_container(*, include_stopped: bool = False) -> str | None:
         cmd.append("-a")
     cmd += [
         "--filter",
-        f"name={WORKER_CONTAINER_PREFIX}",
+        f"name=^{WORKER_CONTAINER_PREFIX}",
         "--format",
         "{{.Names}}",
     ]
@@ -115,6 +138,7 @@ def list_workers(as_json: bool) -> None:
                 "filename": f.name,
                 "origin": _worker_origin(f.name),
                 "size_bytes": f.stat().st_size,
+                "model_ids": _scan_model_ids(f),
             }
             for f in files
         ]
@@ -130,6 +154,7 @@ def list_workers(as_json: bool) -> None:
     table = Table(title=f"Installed Workers ({workers_dir})")
     table.add_column("Name", style="cyan")
     table.add_column("Origin", style="yellow")
+    table.add_column("Models", style="green")
     table.add_column("File")
     table.add_column("Size")
 
@@ -138,7 +163,9 @@ def list_workers(as_json: bool) -> None:
         size = f"{stat.st_size:,} B"
         origin = _worker_origin(f.name)
         origin_fmt = f"[dim]{origin}[/dim]" if origin == "workflow" else origin
-        table.add_row(f.stem, origin_fmt, f.name, size)
+        model_ids = _scan_model_ids(f)
+        models_fmt = ", ".join(model_ids) if model_ids else "[dim]-[/dim]"
+        table.add_row(f.stem, origin_fmt, models_fmt, f.name, size)
 
     console.print(table)
     console.print(f"\n[dim]{len(files)} worker(s) installed.[/dim]")
