@@ -63,7 +63,19 @@ def compute():
     default=None,
     help="Exact version to install from the selected channel",
 )
-def install_cloud_node(yes: bool, channel: str, version: Optional[str]) -> None:
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(),
+    default=None,
+    help="Path to cyberwave.yml to use when the service starts",
+)
+def install_cloud_node(
+    yes: bool,
+    channel: str,
+    version: Optional[str],
+    config_path: Optional[str],
+) -> None:
     """Install cyberwave-cloud-node and register it as a boot service.
 
     Downloads the cyberwave-cloud-node package (via apt-get on Debian/Ubuntu,
@@ -75,8 +87,15 @@ def install_cloud_node(yes: bool, channel: str, version: Optional[str]) -> None:
         sudo cyberwave compute install
         sudo cyberwave compute install -y
         sudo cyberwave compute install --channel dev
+        sudo cyberwave compute install --config /home/user/cyberwave.yml
     """
-    from ..core import CLOUD_NODE_SPEC, setup_service
+    from ..core import CLOUD_NODE_SPEC, setup_service, write_service_override
+
+    # Write the override before setup so daemon-reload inside enable_and_start_service
+    # picks it up together with the base unit on first start.
+    if config_path:
+        if not write_service_override(CLOUD_NODE_SPEC, config_path=config_path):
+            raise SystemExit(1)
 
     try:
         if not setup_service(
@@ -104,7 +123,12 @@ def uninstall_cloud_node(yes: bool) -> None:
         sudo cyberwave compute uninstall
         sudo cyberwave compute uninstall -y
     """
-    from ..core import CLOUD_NODE_SPEC, _resolve_installed_service_package_name, _run
+    from ..core import (
+        CLOUD_NODE_SPEC,
+        _resolve_installed_service_package_name,
+        _run,
+        clear_service_override,
+    )
 
     spec = CLOUD_NODE_SPEC
 
@@ -121,6 +145,9 @@ def uninstall_cloud_node(yes: bool) -> None:
         _run(["systemctl", "disable", spec.unit_name], check=False)
     except FileNotFoundError:
         console.print("[yellow]systemctl not found — skipping service cleanup.[/yellow]")
+
+    # Remove any drop-in override
+    clear_service_override(spec)
 
     # Remove the unit file
     if spec.unit_path.exists():
@@ -156,19 +183,11 @@ def uninstall_cloud_node(yes: bool) -> None:
     "config_path",
     type=click.Path(),
     default=None,
-    help="Path to a config file",
-)
-@click.option("--slug", default=None, help="Override the node slug")
-@click.option(
-    "--profile",
-    default=None,
-    help="Hardware profile to activate (e.g. gpu-a100)",
+    help="Path to cyberwave.yml (persisted in the service override)",
 )
 @click.option("--foreground", "-f", is_flag=True, help="Run in foreground (don't daemonize)")
 def start_cloud_node(
     config_path: Optional[str],
-    slug: Optional[str],
-    profile: Optional[str],
     foreground: bool,
 ) -> None:
     """Start the cloud node service.
@@ -176,17 +195,23 @@ def start_cloud_node(
     Uses systemctl when the service unit is installed; otherwise spawns the
     binary directly in the background.
 
+    When --config is provided under systemd, it is written to a drop-in
+    override so it persists across reboots.
+
     \b
     Examples:
         cyberwave compute start
-        cyberwave compute start --slug my-gpu-node --profile gpu-a100
+        cyberwave compute start --config /home/user/cyberwave.yml
         cyberwave compute start -f   # run in foreground
     """
-    from ..core import CLOUD_NODE_SPEC, _has_systemd, start_service
+    from ..core import CLOUD_NODE_SPEC, _has_systemd, start_service, write_service_override
 
     spec = CLOUD_NODE_SPEC
 
     if _has_systemd() and spec.unit_path.exists():
+        if config_path:
+            if not write_service_override(spec, config_path=config_path):
+                raise SystemExit(1)
         if not start_service(spec):
             raise SystemExit(1)
         return
@@ -204,10 +229,6 @@ def start_cloud_node(
     cmd: list[str] = [binary]
     if config_path:
         cmd += ["--config", str(config_path)]
-    if slug:
-        cmd += ["--slug", slug]
-    if profile:
-        cmd += ["--profile", profile]
 
     env = clean_subprocess_env()
 
@@ -267,34 +288,30 @@ def stop_cloud_node() -> None:
     "config_path",
     type=click.Path(),
     default=None,
-    help="Path to a config file",
+    help="Path to cyberwave.yml (persisted in the service override)",
 )
-@click.option("--slug", default=None, help="Override the node slug")
-@click.option(
-    "--profile",
-    default=None,
-    help="Hardware profile to activate (e.g. gpu-a100)",
-)
-def restart_cloud_node(
-    config_path: Optional[str],
-    slug: Optional[str],
-    profile: Optional[str],
-) -> None:
+def restart_cloud_node(config_path: Optional[str]) -> None:
     """Restart the cloud node service.
 
     If the node was installed as a systemd service, restarts it via systemctl.
     Otherwise falls back to stopping and re-starting the background process.
 
+    When --config is provided under systemd, it is written to a drop-in
+    override so it persists across reboots.
+
     \b
     Examples:
         sudo cyberwave compute restart
-        cyberwave compute restart --slug my-gpu-node --profile gpu-a100
+        sudo cyberwave compute restart --config /home/user/cyberwave.yml
     """
-    from ..core import CLOUD_NODE_SPEC, _has_systemd, restart_service
+    from ..core import CLOUD_NODE_SPEC, _has_systemd, restart_service, write_service_override
 
     spec = CLOUD_NODE_SPEC
 
     if _has_systemd() and spec.unit_path.exists():
+        if config_path:
+            if not write_service_override(spec, config_path=config_path):
+                raise SystemExit(1)
         restart_service(spec)
         return
 
@@ -327,10 +344,6 @@ def restart_cloud_node(
     cmd: list[str] = [binary]
     if config_path:
         cmd += ["--config", str(config_path)]
-    if slug:
-        cmd += ["--slug", slug]
-    if profile:
-        cmd += ["--profile", profile]
 
     try:
         process = subprocess.Popen(
