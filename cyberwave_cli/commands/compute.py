@@ -1,0 +1,422 @@
+"""
+CLI commands for managing the cloud node service.
+
+Example usage:
+    # Install the cloud node
+    sudo cyberwave compute install
+
+    # Start with a specific hardware profile
+    cyberwave compute start --slug my-gpu-node --profile gpu-a100
+
+    # Check status
+    cyberwave compute status
+
+    # Follow logs
+    cyberwave compute logs -f
+"""
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+import click
+from rich.console import Console
+from rich.prompt import Confirm
+
+console = Console()
+
+CLOUD_NODE_IDENTITY_FILE = Path.home() / ".cyberwave" / "instance_identity.json"
+
+
+def _find_cloud_node_binary() -> Optional[str]:
+    """Locate the cyberwave-cloud-node binary."""
+    from ..core import CLOUD_NODE_SPEC
+
+    if CLOUD_NODE_SPEC.binary_path.exists():
+        return str(CLOUD_NODE_SPEC.binary_path)
+    return shutil.which(CLOUD_NODE_SPEC.package_name)
+
+
+@click.group()
+def compute():
+    """Manage the cloud node service."""
+    pass
+
+
+@compute.command("install")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
+@click.option(
+    "--channel",
+    type=click.Choice(["stable", "dev", "staging"], case_sensitive=False),
+    default="stable",
+    show_default=True,
+    help="Which cloud-node package channel to install",
+)
+@click.option(
+    "--version",
+    type=str,
+    default=None,
+    help="Exact version to install from the selected channel",
+)
+def install_cloud_node(yes: bool, channel: str, version: Optional[str]) -> None:
+    """Install cyberwave-cloud-node and register it as a boot service.
+
+    Downloads the cyberwave-cloud-node package (via apt-get on Debian/Ubuntu,
+    pip elsewhere) and creates a systemd service so it starts automatically
+    on boot.
+
+    \b
+    Examples:
+        sudo cyberwave compute install
+        sudo cyberwave compute install -y
+        sudo cyberwave compute install --channel dev
+    """
+    from ..core import CLOUD_NODE_SPEC, setup_service
+
+    try:
+        if not setup_service(
+            CLOUD_NODE_SPEC,
+            skip_confirm=yes,
+            channel=channel.lower(),
+            version=version,
+        ):
+            raise SystemExit(1)
+    except KeyboardInterrupt:
+        console.print("\n[dim]Aborted.[/dim]")
+        raise SystemExit(1)
+
+
+@compute.command("uninstall")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
+def uninstall_cloud_node(yes: bool) -> None:
+    """Stop and remove the cyberwave-cloud-node service.
+
+    Disables the systemd service, removes the unit file, and optionally
+    uninstalls the package.  Node credentials in ~/.cyberwave/ are preserved.
+
+    \b
+    Examples:
+        sudo cyberwave compute uninstall
+        sudo cyberwave compute uninstall -y
+    """
+    from ..core import CLOUD_NODE_SPEC, _resolve_installed_service_package_name, _run
+
+    spec = CLOUD_NODE_SPEC
+
+    if not yes:
+        if not Confirm.ask(
+            f"Remove {spec.unit_name} and disable boot service?", default=False
+        ):
+            console.print("[dim]Aborted.[/dim]")
+            return
+
+    # Stop and disable the service
+    try:
+        _run(["systemctl", "stop", spec.unit_name], check=False)
+        _run(["systemctl", "disable", spec.unit_name], check=False)
+    except FileNotFoundError:
+        console.print("[yellow]systemctl not found — skipping service cleanup.[/yellow]")
+
+    # Remove the unit file
+    if spec.unit_path.exists():
+        try:
+            spec.unit_path.unlink()
+            console.print(f"[green]Removed:[/green] {spec.unit_path}")
+            try:
+                _run(["systemctl", "daemon-reload"], check=False)
+            except FileNotFoundError:
+                pass
+        except PermissionError:
+            console.print(
+                "[red]Permission denied removing systemd unit file.[/red]\n"
+                f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
+            )
+
+    # Remove the package: --yes answers this prompt automatically; otherwise ask.
+    installed_pkg = _resolve_installed_service_package_name(spec)
+    remove_pkg = yes or Confirm.ask(f"Also uninstall {installed_pkg} package?", default=False)
+    if remove_pkg:
+        try:
+            _run(["apt-get", "remove", "-y", installed_pkg], check=False)
+        except FileNotFoundError:
+            console.print("[yellow]apt-get not found — remove manually with pip.[/yellow]")
+
+    console.print("[green]Cloud node service removed.[/green]")
+    console.print("[dim]Node credentials in ~/.cyberwave/ were preserved.[/dim]")
+
+
+@compute.command("start")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(),
+    default=None,
+    help="Path to a config file",
+)
+@click.option("--slug", default=None, help="Override the node slug")
+@click.option(
+    "--profile",
+    default=None,
+    help="Hardware profile to activate (e.g. gpu-a100)",
+)
+@click.option("--foreground", "-f", is_flag=True, help="Run in foreground (don't daemonize)")
+def start_cloud_node(
+    config_path: Optional[str],
+    slug: Optional[str],
+    profile: Optional[str],
+    foreground: bool,
+) -> None:
+    """Start the cloud node service.
+
+    Uses systemctl when the service unit is installed; otherwise spawns the
+    binary directly in the background.
+
+    \b
+    Examples:
+        cyberwave compute start
+        cyberwave compute start --slug my-gpu-node --profile gpu-a100
+        cyberwave compute start -f   # run in foreground
+    """
+    from ..core import CLOUD_NODE_SPEC, _has_systemd, start_service
+
+    spec = CLOUD_NODE_SPEC
+
+    if _has_systemd() and spec.unit_path.exists():
+        if not start_service(spec):
+            raise SystemExit(1)
+        return
+
+    binary = _find_cloud_node_binary()
+    if not binary:
+        console.print(
+            "[red]cyberwave-cloud-node binary not found.[/red]\n"
+            f"[dim]Run: {spec.sudo_command_hint}[/dim]"
+        )
+        return
+
+    from ..config import clean_subprocess_env
+
+    cmd: list[str] = [binary]
+    if config_path:
+        cmd += ["--config", str(config_path)]
+    if slug:
+        cmd += ["--slug", slug]
+    if profile:
+        cmd += ["--profile", profile]
+
+    env = clean_subprocess_env()
+
+    try:
+        if foreground:
+            console.print("[green]Running cloud node in foreground (Ctrl+C to stop)...[/green]")
+            subprocess.run(cmd, env=env, check=False)
+        else:
+            process = subprocess.Popen(
+                cmd,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            console.print(f"[green]✓ Cloud node started (PID: {process.pid})[/green]")
+    except FileNotFoundError:
+        console.print(f"[red]Binary not found: {binary}[/red]")
+
+
+@compute.command("stop")
+def stop_cloud_node() -> None:
+    """Stop the cloud node service."""
+    from ..core import CLOUD_NODE_SPEC, _has_systemd, stop_service
+
+    spec = CLOUD_NODE_SPEC
+
+    if _has_systemd() and spec.unit_path.exists():
+        stop_service(spec)
+        return
+
+    # Fallback: find and send SIGTERM to background process
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", spec.process_match],
+            capture_output=True,
+            text=True,
+        )
+        own_pid = str(os.getpid())
+        pids = [p for p in result.stdout.strip().split("\n") if p and p != own_pid]
+
+        if not pids:
+            console.print("[yellow]No running cloud node process found.[/yellow]")
+            return
+
+        for pid in pids:
+            os.kill(int(pid), signal.SIGTERM)
+            console.print(f"[green]✓ Stopped cloud node (PID: {pid})[/green]")
+
+    except Exception as exc:
+        console.print(f"[red]Error stopping cloud node: {exc}[/red]")
+
+
+@compute.command("restart")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(),
+    default=None,
+    help="Path to a config file",
+)
+@click.option("--slug", default=None, help="Override the node slug")
+@click.option(
+    "--profile",
+    default=None,
+    help="Hardware profile to activate (e.g. gpu-a100)",
+)
+def restart_cloud_node(
+    config_path: Optional[str],
+    slug: Optional[str],
+    profile: Optional[str],
+) -> None:
+    """Restart the cloud node service.
+
+    If the node was installed as a systemd service, restarts it via systemctl.
+    Otherwise falls back to stopping and re-starting the background process.
+
+    \b
+    Examples:
+        sudo cyberwave compute restart
+        cyberwave compute restart --slug my-gpu-node --profile gpu-a100
+    """
+    from ..core import CLOUD_NODE_SPEC, _has_systemd, restart_service
+
+    spec = CLOUD_NODE_SPEC
+
+    if _has_systemd() and spec.unit_path.exists():
+        restart_service(spec)
+        return
+
+    console.print("[cyan]Restarting cloud node process...[/cyan]")
+
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", spec.process_match],
+            capture_output=True,
+            text=True,
+        )
+        own_pid = str(os.getpid())
+        pids = [p for p in result.stdout.strip().split("\n") if p and p != own_pid]
+        for pid in pids:
+            os.kill(int(pid), signal.SIGTERM)
+            console.print(f"[dim]Stopped PID {pid}[/dim]")
+    except Exception as exc:
+        console.print(f"[yellow]Could not stop existing process: {exc}[/yellow]")
+
+    binary = _find_cloud_node_binary()
+    if not binary:
+        console.print(
+            "[red]cyberwave-cloud-node binary not found.[/red]\n"
+            f"[dim]Run: {spec.sudo_command_hint}[/dim]"
+        )
+        return
+
+    from ..config import clean_subprocess_env
+
+    cmd: list[str] = [binary]
+    if config_path:
+        cmd += ["--config", str(config_path)]
+    if slug:
+        cmd += ["--slug", slug]
+    if profile:
+        cmd += ["--profile", profile]
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            env=clean_subprocess_env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        console.print(f"[green]✓ Cloud node restarted (PID: {process.pid})[/green]")
+    except FileNotFoundError:
+        console.print(f"[red]Binary not found: {binary}[/red]")
+
+
+@compute.command("status")
+def status_cloud_node() -> None:
+    """Check cloud node status."""
+    from ..core import CLOUD_NODE_SPEC
+
+    spec = CLOUD_NODE_SPEC
+
+    # --- systemd service state ---
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", spec.unit_name],
+            capture_output=True,
+            text=True,
+        )
+        service_state = result.stdout.strip()
+        if service_state == "active":
+            console.print(f"[green]✓ Service {spec.unit_name}:[/green] active")
+        elif service_state == "failed":
+            console.print(f"[red]✗ Service {spec.unit_name}:[/red] failed")
+        else:
+            console.print(
+                f"[yellow]  Service {spec.unit_name}:[/yellow] "
+                f"{service_state or 'not installed'}"
+            )
+    except FileNotFoundError:
+        console.print("[dim]  systemctl not found — skipping service check.[/dim]")
+
+    # --- node identity ---
+    if CLOUD_NODE_IDENTITY_FILE.exists():
+        try:
+            identity = json.loads(CLOUD_NODE_IDENTITY_FILE.read_text(encoding="utf-8"))
+            node_uuid = identity.get("uuid", "unknown")
+            node_slug = identity.get("slug", "unknown")
+            console.print(f"  Node UUID: [cyan]{node_uuid}[/cyan]")
+            console.print(f"  Node slug: [cyan]{node_slug}[/cyan]")
+        except (json.JSONDecodeError, OSError) as exc:
+            console.print(f"[yellow]  Could not read identity file: {exc}[/yellow]")
+    else:
+        console.print("[dim]  Node not yet registered (identity file missing).[/dim]")
+
+
+@compute.command("logs")
+@click.option("--follow", "-f", is_flag=True, help="Follow log output")
+@click.option("--lines", "-n", default=50, show_default=True, help="Number of lines to show")
+def logs_cloud_node(follow: bool, lines: int) -> None:
+    """Show cloud node logs."""
+    from ..config import clean_subprocess_env
+    from ..core import CLOUD_NODE_SPEC
+
+    spec = CLOUD_NODE_SPEC
+    service_name = spec.unit_name.removesuffix(".service")
+    cmd = [
+        "journalctl",
+        "-u", service_name,
+        f"-n{lines}",
+        "--no-pager",
+        "--output=cat",
+    ]
+    if follow:
+        cmd.append("-f")
+
+    try:
+        result = subprocess.run(cmd, env=clean_subprocess_env(), check=False)
+        if result.returncode != 0:
+            console.print("[dim]Tip: run with sudo if you see no output.[/dim]")
+    except FileNotFoundError:
+        if sys.platform == "darwin":
+            console.print(
+                "[yellow]journalctl is not available on macOS.[/yellow]\n"
+                f"[dim]Run the node in a terminal to see logs: {spec.package_name}[/dim]"
+            )
+        else:
+            console.print("[red]journalctl not found. Is systemd available on this host?[/red]")
+    except KeyboardInterrupt:
+        pass
