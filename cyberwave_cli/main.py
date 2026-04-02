@@ -6,6 +6,7 @@ from rich.console import Console
 from . import __version__
 from .commands import (
     camera,
+    compute,
     completion,
     config_dir,
     configure,
@@ -58,8 +59,9 @@ def cli(ctx: click.Context) -> None:
       twin delete     Delete a digital twin
 
     \b
-    Edge & Discovery:
+    Edge & Cloud:
       edge        Manage edge node (start, stop, pull config)
+      compute     Manage cloud node (install, start, stop, status)
       scan        Discover IP cameras on the network
       completion  Generate/install shell completion
 
@@ -78,6 +80,7 @@ def cli(ctx: click.Context) -> None:
 
 # Register commands
 cli.add_command(camera)
+cli.add_command(compute)
 cli.add_command(completion)
 cli.add_command(config_dir)
 cli.add_command(configure)

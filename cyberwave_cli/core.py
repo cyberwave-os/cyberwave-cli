@@ -6,7 +6,6 @@ This module provides the logic for:
   3. Enabling and starting the service
 """
 
-import importlib
 import json
 import os
 import platform
@@ -16,9 +15,11 @@ import sys
 import tempfile
 import textwrap
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from cyberwave.fingerprint import generate_fingerprint
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
@@ -30,7 +31,6 @@ from .credentials import (
     load_credentials,
     save_credentials,
 )
-from cyberwave.fingerprint import generate_fingerprint
 
 console = Console()
 
@@ -74,6 +74,85 @@ SYSTEMD_UNIT_TEMPLATE = textwrap.dedent("""\
 """)
 
 
+@dataclass
+class ServiceSpec:
+    package_name: str
+    binary_path: Path
+    unit_name: str
+    unit_path: Path
+    package_channels: dict[str, str]
+    deb_repo_url: str
+    gpg_key_url: str
+    keyring_path: Path
+    sources_list_path: Path
+    process_match: str
+    sudo_command_hint: str
+    unit_template: str
+    requires_docker: bool
+
+
+EDGE_CORE_SPEC = ServiceSpec(
+    package_name=PACKAGE_NAME,
+    binary_path=BINARY_PATH,
+    unit_name=SYSTEMD_UNIT_NAME,
+    unit_path=SYSTEMD_UNIT_PATH,
+    package_channels=EDGE_CORE_PACKAGE_CHANNELS,
+    deb_repo_url=BUILDKITE_DEB_REPO_URL,
+    gpg_key_url=BUILDKITE_GPG_KEY_URL,
+    keyring_path=BUILDKITE_KEYRING_PATH,
+    sources_list_path=Path("/etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-edge-core.list"),
+    process_match="cyberwave_edge.service",
+    sudo_command_hint="sudo cyberwave edge install",
+    unit_template=SYSTEMD_UNIT_TEMPLATE,
+    requires_docker=True,
+)
+
+# ---- cloud node service constants -------------------------------------------
+
+_CLOUD_NODE_PACKAGE_NAME = "cyberwave-cloud-node"
+_CLOUD_NODE_UNIT_NAME = "cyberwave-cloud-node.service"
+_CLOUD_NODE_UNIT_PATH = Path(f"/etc/systemd/system/{_CLOUD_NODE_UNIT_NAME}")
+
+_CLOUD_NODE_UNIT_TEMPLATE = textwrap.dedent("""\
+    [Unit]
+    Description=Cyberwave Cloud Node
+    After=network-online.target
+    Wants=network-online.target
+
+    [Service]
+    Type=simple
+    ExecStart={binary_path} start
+    Restart=on-failure
+    RestartSec=5
+    StandardOutput=journal
+    StandardError=journal
+    SyslogIdentifier=cyberwave-cloud-node
+
+    [Install]
+    WantedBy=multi-user.target
+""")
+
+CLOUD_NODE_SPEC = ServiceSpec(
+    package_name=_CLOUD_NODE_PACKAGE_NAME,
+    binary_path=Path("/usr/bin/cyberwave-cloud-node"),
+    unit_name=_CLOUD_NODE_UNIT_NAME,
+    unit_path=_CLOUD_NODE_UNIT_PATH,
+    package_channels={
+        "stable": "cyberwave-cloud-node",
+        "dev": "cyberwave-cloud-node-dev",
+        "staging": "cyberwave-cloud-node-staging",
+    },
+    deb_repo_url="https://packages.buildkite.com/cyberwave/cyberwave-cloud-node/any/",
+    gpg_key_url="https://packages.buildkite.com/cyberwave/cyberwave-cloud-node/gpgkey",
+    keyring_path=Path("/etc/apt/keyrings/cyberwave_cyberwave-cloud-node-archive-keyring.gpg"),
+    sources_list_path=Path("/etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-cloud-node.list"),
+    process_match="cyberwave-cloud-node start",
+    sudo_command_hint="sudo cyberwave compute install",
+    unit_template=_CLOUD_NODE_UNIT_TEMPLATE,
+    requires_docker=False,
+)
+
+
 # ---- helpers -----------------------------------------------------------------
 
 
@@ -85,13 +164,13 @@ def _has_systemd() -> bool:
     return Path("/run/systemd/system").is_dir()
 
 
-def is_service_active() -> bool:
-    """Return True if the cyberwave-edge-core systemd service is currently active."""
+def is_service_active(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
+    """Return True if the systemd service described by ``spec`` is currently active."""
     if not _has_systemd():
         return False
     try:
         result = subprocess.run(
-            ["systemctl", "is-active", SYSTEMD_UNIT_NAME],
+            ["systemctl", "is-active", spec.unit_name],
             capture_output=True,
             text=True,
         )
@@ -802,7 +881,7 @@ def _download_twin_json_files(client: Any, twin_uuids: list[str]) -> int:
             written += 1
         except Exception as exc:
             console.print(f"[yellow]Failed to download twin JSON for {twin_uuid[:8]}…: {exc}[/yellow]")
-            
+
     return written
 
 
@@ -967,6 +1046,13 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
 # ---- apt-get installation ----------------------------------------------------
 
 
+def _resolve_service_package_name(
+    channel: str = "stable", spec: ServiceSpec = EDGE_CORE_SPEC
+) -> str:
+    """Resolve the Debian package name for the requested channel and service spec."""
+    return spec.package_channels.get(channel.lower(), spec.package_name)
+
+
 def _resolve_edge_core_package_name(channel: str | None) -> str:
     """Resolve the Debian package name for the requested edge-core channel."""
     normalized_channel = (channel or "stable").lower()
@@ -976,9 +1062,9 @@ def _resolve_edge_core_package_name(channel: str | None) -> str:
         raise ValueError(f"Unsupported edge-core channel: {normalized_channel}") from exc
 
 
-def _resolve_installed_edge_core_package_name() -> str:
-    """Best-effort detect which edge-core Debian package is currently installed."""
-    for package_name in EDGE_CORE_PACKAGE_CHANNELS.values():
+def _resolve_installed_service_package_name(spec: ServiceSpec = EDGE_CORE_SPEC) -> str:
+    """Best-effort detect which Debian package for the given service is currently installed."""
+    for package_name in spec.package_channels.values():
         try:
             result = subprocess.run(
                 ["dpkg-query", "-W", "-f=${db:Status-Status}", package_name],
@@ -993,24 +1079,35 @@ def _resolve_installed_edge_core_package_name() -> str:
         if result.returncode == 0 and result.stdout.strip() == "installed":
             return package_name
 
-    return PACKAGE_NAME
+    return spec.package_name
 
 
-def _apt_get_install(*, package_name: str = PACKAGE_NAME, package_version: str | None = None) -> bool:
-    """Install cyberwave-edge-core via apt-get.
+def _resolve_installed_edge_core_package_name() -> str:
+    """Best-effort detect which edge-core Debian package is currently installed."""
+    return _resolve_installed_service_package_name(EDGE_CORE_SPEC)
+
+
+def _apt_get_install(
+    spec: ServiceSpec = EDGE_CORE_SPEC,
+    *,
+    package_name: str | None = None,
+    package_version: str | None = None,
+) -> bool:
+    """Install a service package via apt-get.
 
     Adds the Buildkite package registry GPG key and source if not already
-    configured, then installs (or upgrades) the latest version of the package.
+    configured, then installs (or upgrades) the requested version of the package.
 
     Returns True on success.
     """
-    sources_list = Path("/etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-edge-core.list")
+    resolved_name = package_name or spec.package_name
+    sources_list = spec.sources_list_path
 
     # Install the GPG signing key if missing
-    if not BUILDKITE_KEYRING_PATH.exists():
+    if not spec.keyring_path.exists():
         console.print("[cyan]Installing Cyberwave package signing key...[/cyan]")
         try:
-            BUILDKITE_KEYRING_PATH.parent.mkdir(parents=True, exist_ok=True)
+            spec.keyring_path.parent.mkdir(parents=True, exist_ok=True)
 
             child_env = clean_subprocess_env()
             ld_library_path = child_env.get("LD_LIBRARY_PATH", "(unset)")
@@ -1018,19 +1115,19 @@ def _apt_get_install(*, package_name: str = PACKAGE_NAME, package_version: str |
 
             # Download the armored GPG key
             curl = subprocess.run(
-                ["curl", "-fsSL", BUILDKITE_GPG_KEY_URL],
+                ["curl", "-fsSL", spec.gpg_key_url],
                 capture_output=True,
                 check=True,
                 env=child_env,
             )
             if not curl.stdout:
                 console.print("[red]Downloaded GPG key is empty.[/red]")
-                console.print(f"[dim]URL: {BUILDKITE_GPG_KEY_URL}[/dim]")
+                console.print(f"[dim]URL: {spec.gpg_key_url}[/dim]")
                 return False
 
             # Dearmor into the keyring file
             gpg = subprocess.run(
-                ["gpg", "--batch", "--yes", "--dearmor", "-o", str(BUILDKITE_KEYRING_PATH)],
+                ["gpg", "--batch", "--yes", "--dearmor", "-o", str(spec.keyring_path)],
                 input=curl.stdout,
                 capture_output=True,
                 env=child_env,
@@ -1049,7 +1146,7 @@ def _apt_get_install(*, package_name: str = PACKAGE_NAME, package_version: str |
             console.print(f"[red]Failed to download GPG key (exit {exc.returncode}).[/red]")
             if stderr_msg:
                 console.print(f"[dim]{stderr_msg}[/dim]")
-            console.print(f"[dim]URL: {BUILDKITE_GPG_KEY_URL}[/dim]")
+            console.print(f"[dim]URL: {spec.gpg_key_url}[/dim]")
             return False
         except FileNotFoundError as exc:
             console.print(f"[red]Required command not found: {exc.filename}[/red]")
@@ -1060,29 +1157,29 @@ def _apt_get_install(*, package_name: str = PACKAGE_NAME, package_version: str |
         except PermissionError:
             console.print(
                 "[red]Permission denied installing GPG key.[/red]\n"
-                "[dim]Re-run with sudo: sudo cyberwave edge install[/dim]"
+                f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
             )
             return False
 
     # Add the repository if missing
     if not sources_list.exists():
         console.print("[cyan]Adding Cyberwave package repository...[/cyan]")
-        signed_by = f"signed-by={BUILDKITE_KEYRING_PATH}"
+        signed_by = f"signed-by={spec.keyring_path}"
         source_lines = (
-            f"deb [{signed_by}] {BUILDKITE_DEB_REPO_URL} any main\n"
-            f"deb-src [{signed_by}] {BUILDKITE_DEB_REPO_URL} any main\n"
+            f"deb [{signed_by}] {spec.deb_repo_url} any main\n"
+            f"deb-src [{signed_by}] {spec.deb_repo_url} any main\n"
         )
         try:
             sources_list.write_text(source_lines)
         except PermissionError:
             console.print(
                 "[red]Permission denied writing apt sources.[/red]\n"
-                "[dim]Re-run with sudo: sudo cyberwave edge install[/dim]"
+                f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
             )
             return False
 
     # Update and install the latest version
-    install_target = f"{package_name}={package_version}" if package_version else package_name
+    install_target = f"{resolved_name}={package_version}" if package_version else resolved_name
     console.print(f"[cyan]Installing {install_target} via apt-get...[/cyan]")
     try:
         # Retry apt-get update to handle transient CDN mirror sync failures.
@@ -1113,27 +1210,33 @@ def _apt_get_install(*, package_name: str = PACKAGE_NAME, package_version: str |
         console.print(f"[red]apt-get failed (exit {exc.returncode}).[/red]")
         return False
 
-    if BINARY_PATH.exists():
-        console.print(f"[green]Installed:[/green] {BINARY_PATH}")
+    if spec.binary_path.exists():
+        console.print(f"[green]Installed:[/green] {spec.binary_path}")
         return True
 
     console.print("[red]Binary not found after installation.[/red]")
     return False
 
 
-def _pip_install(*, package_version: str | None = None, channel: str = "stable") -> bool:
-    """Fallback: install cyberwave-edge-core via pip.
+def _pip_install(
+    spec: ServiceSpec = EDGE_CORE_SPEC,
+    *,
+    package_version: str | None = None,
+    channel: str = "stable",
+) -> bool:
+    """Fallback: install a service package via pip.
 
     Used on non-Debian systems (macOS, other Linux flavors).
     Returns True on success.
     """
     if channel != "stable":
         console.print(
-            "[red]Non-stable edge-core channels are only supported via apt-get on Debian/Ubuntu.[/red]"
+            f"[red]Non-stable {spec.package_name} channels are only supported"
+            " via apt-get on Debian/Ubuntu.[/red]"
         )
         return False
 
-    pip_target = f"{PACKAGE_NAME}=={package_version}" if package_version else PACKAGE_NAME
+    pip_target = f"{spec.package_name}=={package_version}" if package_version else spec.package_name
     console.print(f"[cyan]Installing {pip_target} via pip...[/cyan]")
     try:
         _run([sys.executable, "-m", "pip", "install", pip_target])
@@ -1143,16 +1246,30 @@ def _pip_install(*, package_version: str | None = None, channel: str = "stable")
         return False
 
 
+def install_service_package(
+    spec: ServiceSpec = EDGE_CORE_SPEC,
+    *,
+    channel: str = "stable",
+    version: str | None = None,
+) -> bool:
+    """Install the package described by *spec*.
+
+    Prefers apt-get on Debian/Ubuntu, falls back to pip otherwise.
+    Returns True on success.
+    """
+    if _is_linux() and shutil.which("apt-get"):
+        package_name = _resolve_service_package_name(channel, spec)
+        return _apt_get_install(spec, package_name=package_name, package_version=version)
+    return _pip_install(spec, package_version=version, channel=channel)
+
+
 def install_edge_core(*, channel: str = "stable", version: str | None = None) -> bool:
     """Install the cyberwave-edge-core package.
 
     Prefers apt-get on Debian/Ubuntu, falls back to pip otherwise.
     Returns True on success.
     """
-    if _is_linux() and shutil.which("apt-get"):
-        package_name = _resolve_edge_core_package_name(channel)
-        return _apt_get_install(package_name=package_name, package_version=version)
-    return _pip_install(package_version=version, channel=channel)
+    return install_service_package(EDGE_CORE_SPEC, channel=channel, version=version)
 
 
 # ---- docker installation -----------------------------------------------------
@@ -1240,8 +1357,8 @@ def _get_docker_installer_script_path() -> Path:
 # ---- systemd service ---------------------------------------------------------
 
 
-def create_systemd_service() -> bool:
-    """Write the systemd unit file for cyberwave-edge-core.
+def create_systemd_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
+    """Write the systemd unit file described by ``spec``.
 
     Returns True on success.
     """
@@ -1250,46 +1367,48 @@ def create_systemd_service() -> bool:
         return False
 
     binary = (
-        str(BINARY_PATH) if BINARY_PATH.exists() else shutil.which(PACKAGE_NAME) or str(BINARY_PATH)
+        str(spec.binary_path)
+        if spec.binary_path.exists()
+        else shutil.which(spec.package_name) or str(spec.binary_path)
     )
-    unit_contents = SYSTEMD_UNIT_TEMPLATE.format(binary_path=binary)
+    unit_contents = spec.unit_template.format(binary_path=binary)
 
     try:
-        SYSTEMD_UNIT_PATH.write_text(unit_contents)
+        spec.unit_path.write_text(unit_contents)
     except PermissionError:
         console.print(
-            "[red]Permission denied writing systemd unit.[/red]\n"
-            "[dim]Re-run with sudo: sudo cyberwave edge install[/dim]"
+            f"[red]Permission denied writing systemd unit.[/red]\n"
+            f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
         )
         return False
 
-    console.print(f"[green]Created:[/green] {SYSTEMD_UNIT_PATH}")
+    console.print(f"[green]Created:[/green] {spec.unit_path}")
     return True
 
 
-def enable_and_start_service() -> bool:
-    """Enable the service to start on boot, then start it now.
+def enable_and_start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
+    """Enable the service described by ``spec`` to start on boot, then start it now.
 
     Returns True on success.
     """
-    if not SYSTEMD_UNIT_PATH.exists():
+    if not spec.unit_path.exists():
         console.print("[red]Service unit not found — run install first.[/red]")
         return False
 
     try:
         _run(["systemctl", "daemon-reload"])
-        _run(["systemctl", "enable", SYSTEMD_UNIT_NAME])
-        _run(["systemctl", "start", SYSTEMD_UNIT_NAME])
+        _run(["systemctl", "enable", spec.unit_name])
+        _run(["systemctl", "start", spec.unit_name])
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]systemctl command failed (exit {exc.returncode}).[/red]")
         return False
 
-    console.print(f"[green]Service enabled and started:[/green] {SYSTEMD_UNIT_NAME}")
+    console.print(f"[green]Service enabled and started:[/green] {spec.unit_name}")
     return True
 
 
-def restart_service() -> bool:
-    """Restart the cyberwave-edge-core systemd service.
+def restart_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
+    """Restart the systemd service described by ``spec``.
 
     Returns True on success.
     """
@@ -1297,22 +1416,22 @@ def restart_service() -> bool:
         console.print("[yellow]systemd not detected — cannot restart via systemd.[/yellow]")
         return False
 
-    if not SYSTEMD_UNIT_PATH.exists():
-        console.print("[red]Service unit not found — run 'cyberwave edge install' first.[/red]")
+    if not spec.unit_path.exists():
+        console.print(f"[red]Service unit not found — run '{spec.sudo_command_hint}' first.[/red]")
         return False
 
     try:
-        _run(["systemctl", "restart", SYSTEMD_UNIT_NAME])
+        _run(["systemctl", "restart", spec.unit_name])
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]systemctl restart failed (exit {exc.returncode}).[/red]")
         return False
 
-    console.print(f"[green]Service restarted:[/green] {SYSTEMD_UNIT_NAME}")
+    console.print(f"[green]Service restarted:[/green] {spec.unit_name}")
     return True
 
 
-def stop_service() -> bool:
-    """Stop the cyberwave-edge-core systemd service.
+def stop_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
+    """Stop the systemd service described by ``spec``.
 
     Returns True on success.
     """
@@ -1320,21 +1439,125 @@ def stop_service() -> bool:
         console.print("[yellow]systemd not detected — cannot stop via systemd.[/yellow]")
         return False
 
-    if not SYSTEMD_UNIT_PATH.exists():
-        console.print("[red]Service unit not found — run 'cyberwave edge install' first.[/red]")
+    if not spec.unit_path.exists():
+        console.print(f"[red]Service unit not found — run '{spec.sudo_command_hint}' first.[/red]")
         return False
 
     try:
-        _run(["systemctl", "stop", SYSTEMD_UNIT_NAME])
+        _run(["systemctl", "stop", spec.unit_name])
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]systemctl stop failed (exit {exc.returncode}).[/red]")
         return False
 
-    console.print(f"[green]Service stopped:[/green] {SYSTEMD_UNIT_NAME}")
+    console.print(f"[green]Service stopped:[/green] {spec.unit_name}")
     return True
 
 
+def start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
+    """Start the service without re-enabling it (user-initiated start).
+
+    Returns True on success.
+    """
+    if not _has_systemd():
+        return False
+    if not spec.unit_path.exists():
+        console.print(f"[red]Service unit not found — run '{spec.sudo_command_hint}' first.[/red]")
+        return False
+    result = _run(["systemctl", "start", spec.unit_name], check=False)
+    if result.returncode == 0:
+        console.print(f"[green]✓ Started {spec.unit_name}[/green]")
+        return True
+    console.print(
+        f"[yellow]systemctl start failed (exit {result.returncode}). "
+        f"Check status with: systemctl status {spec.unit_name}[/yellow]"
+    )
+    return False
+
+
 # ---- orchestrator ------------------------------------------------------------
+
+
+def setup_service(
+    spec: ServiceSpec,
+    *,
+    skip_confirm: bool = False,
+    channel: str = "stable",
+    version: str | None = None,
+    post_install_hook: Any = None,
+) -> bool:
+    """Generic install orchestrator: install package, optionally set up Docker + systemd.
+
+    Returns True if everything succeeded.
+    """
+    service_setup_supported = _is_linux()
+
+    if service_setup_supported and os.geteuid() != 0:
+        console.print(
+            "[red]Root privileges required.[/red]\n"
+            f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
+        )
+        return False
+
+    if not service_setup_supported:
+        console.print(
+            f"[yellow]{spec.package_name} service setup is only supported on Linux. "
+            "You will need to start it manually upon restart.[/yellow]"
+        )
+        if channel != "stable":
+            console.print(
+                f"[red]Non-stable {spec.package_name} channels are only supported"
+                " via apt-get on Debian/Ubuntu.[/red]"
+            )
+            return False
+
+    if not _ensure_credentials(skip_confirm=skip_confirm):
+        return False
+
+    if not skip_confirm:
+        if service_setup_supported:
+            selected_pkg = _resolve_service_package_name(channel, spec)
+            selected_target = f"{selected_pkg}={version}" if version else selected_pkg
+            console.print(
+                f"\nThis will:\n"
+                f"  1. Install [bold]{selected_target}[/bold] via apt-get\n"
+                f"  2. Create a systemd service ([bold]{spec.unit_name}[/bold])\n"
+                f"  3. Enable it to start on boot\n"
+            )
+        else:
+            pip_target = f"{spec.package_name}=={version}" if version else spec.package_name
+            console.print(
+                f"\nThis will:\n"
+                f"  1. Install [bold]{pip_target}[/bold] via pip\n"
+                f"  2. Configure service credentials\n"
+                f"  3. Skip service setup (manual startup required)\n"
+            )
+        if not Confirm.ask("Continue?", default=True):
+            console.print("[dim]Aborted.[/dim]")
+            return False
+
+    if not install_service_package(spec, channel=channel, version=version):
+        return False
+
+    if service_setup_supported and spec.requires_docker:
+        if not _install_docker():
+            return False
+
+    if post_install_hook is not None:
+        if not post_install_hook():
+            return False
+
+    if service_setup_supported:
+        if not create_systemd_service(spec):
+            return False
+        if not enable_and_start_service(spec):
+            return False
+        console.print(f"\n[green]{spec.package_name} is installed and running.[/green]")
+        console.print(f"[dim]Check status: systemctl status {spec.unit_name}[/dim]")
+    else:
+        console.print(f"\n[green]{spec.package_name} is installed.[/green]")
+        console.print(f"[dim]Start manually: {spec.package_name}[/dim]")
+
+    return True
 
 
 def setup_edge_core(
@@ -1343,84 +1566,14 @@ def setup_edge_core(
     edge_core_channel: str = "stable",
     edge_core_version: str | None = None,
 ) -> bool:
-    """Full setup: install the package, create the service, enable on boot.
+    """Full setup for edge core: install the package, create the service, enable on boot.
 
     Returns True if everything succeeded.
     """
-    service_setup_supported = _is_linux()
-    if not service_setup_supported:
-        console.print(
-            "[yellow]Edge core service setup is only supported on Linux. "
-            "You will need to start the core manually upon restart[/yellow]"
-        )
-        if edge_core_channel != "stable":
-            console.print(
-                "[red]Non-stable edge-core channels are only supported via apt-get on Debian/Ubuntu.[/red]"
-            )
-            return False
-
-    if service_setup_supported and os.geteuid() != 0:
-        console.print(
-            "[red]Root privileges required.[/red]\n"
-            "[dim]Re-run with sudo: sudo cyberwave edge install[/dim]"
-        )
-        return False
-
-    # Ensure the user is logged in before starting the installation.
-    if not _ensure_credentials(skip_confirm=skip_confirm):
-        return False
-
-    if not skip_confirm:
-        if service_setup_supported:
-            selected_package = _resolve_edge_core_package_name(edge_core_channel)
-            selected_target = (
-                f"{selected_package}={edge_core_version}" if edge_core_version else selected_package
-            )
-            console.print(
-                f"\nThis will:\n"
-                f"  1. Install [bold]{selected_target}[/bold] via apt-get\n"
-                f"  2. Create a systemd service ([bold]{SYSTEMD_UNIT_NAME}[/bold])\n"
-                f"  3. Enable it to start on boot\n"
-            )
-        else:
-            pip_target = f"{PACKAGE_NAME}=={edge_core_version}" if edge_core_version else PACKAGE_NAME
-            console.print(
-                f"\nThis will:\n"
-                f"  1. Install [bold]{pip_target}[/bold] via pip\n"
-                f"  2. Configure edge credentials and environment\n"
-                f"  3. Skip service setup (manual startup required)\n"
-            )
-        if not Confirm.ask("Continue?", default=True):
-            console.print("[dim]Aborted.[/dim]")
-            return False
-
-    # Step 1 — install edge core
-    if not install_edge_core(channel=edge_core_channel, version=edge_core_version):
-        return False
-
-    # Linux-only service setup.
-    if service_setup_supported:
-        if not _install_docker():
-            return False
-
-        if not create_systemd_service():
-            return False
-
-    # Step 2 (or 3 on Linux) — pick workspace/environment and persist config
-    if not configure_edge_environment(skip_confirm=skip_confirm):
-        return False
-
-    if service_setup_supported:
-        # Final Linux-only step — enable & start after environment.json is finalized.
-        if not enable_and_start_service():
-            return False
-
-        console.print("\n[green]Edge core is installed and running.[/green]")
-        console.print("[dim]Check status: systemctl status cyberwave-edge-core[/dim]")
-        console.print("[dim]View logs:    cyberwave edge logs -f[/dim]")
-    else:
-        console.print("\n[green]Edge core is installed.[/green]")
-        console.print("[dim]Start manually: cyberwave-edge-core[/dim]")
-        console.print("[dim]After restart, start the core manually again.[/dim]")
-
-    return True
+    return setup_service(
+        EDGE_CORE_SPEC,
+        skip_confirm=skip_confirm,
+        channel=edge_core_channel,
+        version=edge_core_version,
+        post_install_hook=lambda: configure_edge_environment(skip_confirm=skip_confirm),
+    )

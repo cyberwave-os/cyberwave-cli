@@ -1,6 +1,7 @@
 """CLI commands for Cyberwave."""
 
 from .camera import camera
+from .compute import compute
 from .completion import completion
 from .config_dir import config_dir
 from .configure import configure
@@ -17,6 +18,7 @@ from .workflow import workflow
 
 __all__ = [
     "camera",
+    "compute",
     "completion",
     "config_dir",
     "configure",
