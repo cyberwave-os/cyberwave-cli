@@ -63,7 +63,7 @@ def _find_worker_container(*, include_stopped: bool = False) -> str | None:
         cmd.append("-a")
     cmd += [
         "--filter",
-        f"name={WORKER_CONTAINER_PREFIX}",
+        f"name=^{WORKER_CONTAINER_PREFIX}",
         "--format",
         "{{.Names}}",
     ]
