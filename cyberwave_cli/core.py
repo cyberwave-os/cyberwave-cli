@@ -1361,6 +1361,84 @@ def _get_docker_installer_script_path() -> Path:
 # ---- systemd service ---------------------------------------------------------
 
 
+def _service_override_path(spec: ServiceSpec) -> Path:
+    """Return the path to the drop-in override file for ``spec``."""
+    return spec.unit_path.parent / f"{spec.unit_name}.d" / "override.conf"
+
+
+def write_service_override(
+    spec: ServiceSpec,
+    *,
+    config_path: str | None = None,
+) -> bool:
+    """Write a systemd drop-in override that sets --config on ExecStart.
+
+    Creates ``<unit>.d/override.conf`` with a blank ``ExecStart=`` followed by
+    the full command so systemd replaces (not appends) the base ExecStart.
+    Calls ``daemon-reload`` automatically so the change takes effect.
+
+    Returns True on success.  If no config_path is provided, returns True
+    immediately without touching anything.
+    """
+    if not config_path:
+        return True
+
+    extra: list[str] = ["--config", config_path]
+
+    binary = (
+        str(spec.binary_path)
+        if spec.binary_path.exists()
+        else shutil.which(spec.package_name) or str(spec.binary_path)
+    )
+    exec_start = " ".join([binary, "start"] + extra)
+    contents = textwrap.dedent(f"""\
+        [Service]
+        ExecStart=
+        ExecStart={exec_start}
+    """)
+
+    override_file = _service_override_path(spec)
+    try:
+        override_file.parent.mkdir(parents=True, exist_ok=True)
+        override_file.write_text(contents)
+    except PermissionError:
+        console.print(
+            f"[red]Permission denied writing service override.[/red]\n"
+            f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
+        )
+        return False
+
+    console.print(f"[green]Created:[/green] {override_file}")
+
+    if _has_systemd():
+        try:
+            _run(["systemctl", "daemon-reload"])
+        except subprocess.CalledProcessError:
+            pass
+
+    return True
+
+
+def clear_service_override(spec: ServiceSpec) -> None:
+    """Remove the drop-in override file if it exists."""
+    override_file = _service_override_path(spec)
+    if not override_file.exists():
+        return
+    try:
+        override_file.unlink()
+        override_dir = override_file.parent
+        if override_dir.exists() and not any(override_dir.iterdir()):
+            override_dir.rmdir()
+        console.print(f"[dim]Removed override: {override_file}[/dim]")
+        if _has_systemd():
+            try:
+                _run(["systemctl", "daemon-reload"])
+            except subprocess.CalledProcessError:
+                pass
+    except PermissionError:
+        console.print(f"[yellow]Could not remove override file: {override_file}[/yellow]")
+
+
 def create_systemd_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
     """Write the systemd unit file described by ``spec``.
 
