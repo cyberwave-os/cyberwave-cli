@@ -9,6 +9,7 @@ This module provides the logic for:
 import json
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1390,7 +1391,7 @@ def write_service_override(
         if spec.binary_path.exists()
         else shutil.which(spec.package_name) or str(spec.binary_path)
     )
-    exec_start = " ".join([binary, "start"] + extra)
+    exec_start = shlex.join([binary, "start", *extra])
     contents = textwrap.dedent(f"""\
         [Service]
         ExecStart=
