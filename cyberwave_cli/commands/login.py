@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.prompt import Prompt
 
 from ..auth import AuthClient, AuthenticationError, Workspace
-from ..config import get_api_url
+from ..config import CREDENTIALS_FILE, get_api_url
 from ..credentials import (
     Credentials,
     collect_runtime_env_overrides,
@@ -72,6 +72,48 @@ def _stored_api_url(credentials: Credentials) -> str | None:
     return credentials.cyberwave_base_url
 
 
+def _abort_for_missing_workspaces(user_email: str) -> None:
+    """Show the shared no-workspaces guidance and abort."""
+    console.print(
+        f"\n[yellow][WARN][/yellow] Logged in as [bold]{user_email}[/bold] "
+        "but no workspaces found."
+    )
+    console.print(
+        "[dim]Please create a workspace at https://cyberwave.com "
+        "to use the CLI.[/dim]"
+    )
+    raise click.Abort()
+
+
+def _save_login_credentials(
+    *,
+    token: str,
+    user_email: str,
+    workspace: Workspace,
+    runtime_overrides: dict[str, str],
+) -> None:
+    """Persist login credentials using the standard CLI schema."""
+    save_credentials(
+        Credentials(
+            token=token,
+            email=user_email,
+            workspace_uuid=workspace.uuid,
+            workspace_name=workspace.name,
+            cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
+            cyberwave_edge_log_level=runtime_overrides.get("CYBERWAVE_EDGE_LOG_LEVEL"),
+            cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
+            cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
+        )
+    )
+
+
+def _print_login_success(user_email: str, workspace_name: str) -> None:
+    """Show the standard post-login success output."""
+    console.print(f"\n[green][OK][/green] Successfully logged in as [bold]{user_email}[/bold]")
+    console.print(f"[dim]Workspace: {workspace_name}[/dim]")
+    console.print(f"[dim]API token saved to {CREDENTIALS_FILE}[/dim]", highlight=False)
+
+
 @click.command()
 @click.option(
     "--email",
@@ -84,16 +126,27 @@ def _stored_api_url(credentials: Credentials) -> str | None:
     help="Password (will prompt if not provided)",
     hide_input=True,
 )
-def login(email: str | None, password: str | None) -> None:
+@click.option(
+    "--token",
+    help="API token for login",
+)
+def login(email: str | None, password: str | None, token: str | None) -> None:
     """Authenticate with Cyberwave.
 
     Logs you in to Cyberwave and stores your credentials locally for future CLI operations.
 
     If email and password are not provided as options, you will be prompted to enter them.
+    You can also authenticate directly with an existing API token.
     """
+    auth_token = token.strip() if token is not None else None
+    if token is not None and not auth_token:
+        raise click.UsageError("--token cannot be empty")
+    if auth_token and (email or password):
+        raise click.UsageError("--token is mutually exclusive with --email/--password")
+
     # Check if already logged in by validating the stored API token via the SDK
     existing_creds = load_credentials()
-    if existing_creds and existing_creds.token:
+    if existing_creds and existing_creds.token and not auth_token:
         # Validate against stored API URL first when present (edge/dev setups),
         # then fall back to the current process URL resolution.
         validate_token = existing_creds.token
@@ -123,6 +176,30 @@ def login(email: str | None, password: str | None) -> None:
                 if not click.confirm("Do you want to log in with a different account?"):
                     return
 
+    if auth_token:
+        try:
+            runtime_overrides = collect_runtime_env_overrides()
+            with AuthClient() as client:
+                with console.status("[dim]Authenticating with API token...[/dim]"):
+                    token_context = client.get_api_token_context(auth_token)
+
+            workspace = Workspace(
+                uuid=token_context.workspace_uuid,
+                name=token_context.workspace_name,
+                slug="",
+            )
+            _save_login_credentials(
+                token=auth_token,
+                user_email=token_context.email,
+                workspace=workspace,
+                runtime_overrides=runtime_overrides,
+            )
+            _print_login_success(token_context.email, workspace.name)
+            return
+        except AuthenticationError as e:
+            console.print(f"\n[red][ERROR][/red] Login failed: {e}")
+            raise click.Abort() from None
+
     email_from_cli = email
     password_from_cli = password
     # Without a TTY we cannot re-prompt; a single attempt avoids hanging on Prompt.ask.
@@ -143,15 +220,7 @@ def login(email: str | None, password: str | None) -> None:
                     workspaces = client.get_workspaces(session_token)
 
                 if not workspaces:
-                    console.print(
-                        f"\n[yellow][WARN][/yellow] Logged in as [bold]{user.email}[/bold] "
-                        "but no workspaces found."
-                    )
-                    console.print(
-                        "[dim]Please create a workspace at https://cyberwave.com "
-                        "to use the CLI.[/dim]"
-                    )
-                    raise click.Abort()
+                    _abort_for_missing_workspaces(user.email)
 
                 workspace = select_workspace(workspaces)
                 api_token = None
@@ -183,26 +252,13 @@ def login(email: str | None, password: str | None) -> None:
                 if api_token is None:
                     raise AuthenticationError("Failed to create API token")
 
-                save_credentials(
-                    Credentials(
-                        token=api_token.token,
-                        email=user.email,
-                        workspace_uuid=workspace.uuid,
-                        workspace_name=workspace.name,
-                        cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
-                        cyberwave_edge_log_level=runtime_overrides.get("CYBERWAVE_EDGE_LOG_LEVEL"),
-                        cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
-                        cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
-                    )
+                _save_login_credentials(
+                    token=api_token.token,
+                    user_email=user.email,
+                    workspace=workspace,
+                    runtime_overrides=runtime_overrides,
                 )
-
-                console.print(
-                    f"\n[green][OK][/green] Successfully logged in as [bold]{user.email}[/bold]"
-                )
-                console.print(f"[dim]Workspace: {workspace.name}[/dim]")
-                from ..config import CREDENTIALS_FILE
-
-                console.print(f"[dim]API token saved to {CREDENTIALS_FILE}[/dim]", highlight=False)
+                _print_login_success(user.email, workspace.name)
             return
 
         except AuthenticationError as e:

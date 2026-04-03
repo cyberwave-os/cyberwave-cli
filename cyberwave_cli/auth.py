@@ -18,6 +18,7 @@ AUTH_LOGIN_ENDPOINT = "/dj-rest-auth/login/"
 AUTH_USER_ENDPOINT = "/dj-rest-auth/user/"
 API_TOKENS_ENDPOINT = "/api-tokens/"
 WORKSPACES_ENDPOINT = "/api/v1/users/workspaces"
+API_TOKEN_CONTEXT_ENDPOINT = "/api/v1/users/@me/apitoken/"
 
 
 class AuthenticationError(Exception):
@@ -81,6 +82,24 @@ class APIToken:
             token=data.get("token", ""),
             workspace_uuid=data.get("workspace_uuid"),
             workspace_name=data.get("workspace_name"),
+        )
+
+
+@dataclass
+class APITokenContext:
+    """Context resolved from an authenticated API token."""
+
+    email: str
+    workspace_uuid: str
+    workspace_name: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "APITokenContext":
+        """Create an APITokenContext from API response data."""
+        return cls(
+            email=data.get("email", ""),
+            workspace_uuid=data.get("workspace_uuid", ""),
+            workspace_name=data.get("workspace_name", ""),
         )
 
 
@@ -229,6 +248,45 @@ class AuthClient:
             raise AuthenticationError(f"Connection error: {e}") from e
 
         raise AuthenticationError("Failed to get workspaces")
+
+    def get_api_token_context(self, token: str) -> APITokenContext:
+        """
+        Get the current API token context.
+
+        Args:
+            token: API token
+
+        Returns:
+            API token context with email and workspace details
+
+        Raises:
+            AuthenticationError: If the token is invalid or unsupported
+        """
+        try:
+            response = self._client.get(
+                API_TOKEN_CONTEXT_ENDPOINT,
+                headers={"Authorization": f"Token {token}"},
+            )
+
+            if response.status_code == 200:
+                return APITokenContext.from_dict(response.json())
+
+            if response.status_code == 401:
+                raise AuthenticationError("Invalid or expired token")
+
+            if response.status_code == 403:
+                data = response.json()
+                detail = data.get("detail") if isinstance(data, dict) else None
+                raise AuthenticationError(detail or "API token context unavailable", details=data)
+
+            response.raise_for_status()
+
+        except httpx.HTTPStatusError as e:
+            raise AuthenticationError(f"HTTP error: {e.response.status_code}") from e
+        except httpx.RequestError as e:
+            raise AuthenticationError(f"Connection error: {e}") from e
+
+        raise AuthenticationError("Failed to get API token context")
 
     def create_api_token(self, token: str, workspace_uuid: str) -> APIToken:
         """
