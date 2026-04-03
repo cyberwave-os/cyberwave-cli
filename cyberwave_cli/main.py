@@ -14,12 +14,14 @@ from .commands import (
     environment,
     login,
     logout,
+    manifest,
     model,
     plugin,
     scan,
     so101,
     twin,
     workflow,
+    worker,
 )
 
 console = Console()
@@ -71,6 +73,10 @@ def cli(ctx: click.Context) -> None:
       workflow    Create and manage automation workflows
 
     \b
+    Worker Management:
+      worker      Manage local worker files for edge inference
+
+    \b
     Documentation: https://docs.cyberwave.com
     """
     if ctx.invoked_subcommand is None:
@@ -88,12 +94,14 @@ cli.add_command(edge)
 cli.add_command(environment)
 cli.add_command(login)
 cli.add_command(logout)
+cli.add_command(manifest)
 cli.add_command(model)
 cli.add_command(plugin)
 cli.add_command(scan)
 cli.add_command(so101)
 cli.add_command(twin)
 cli.add_command(workflow)
+cli.add_command(worker)
 
 
 def main() -> None:

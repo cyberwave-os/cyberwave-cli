@@ -68,6 +68,90 @@ This command will guide you to your first-time setup of your edge device.
 | `config-dir` | Print the active configuration directory |
 | `core`       | Visualize the core commands              |
 | `completion` | Generate/install shell autocomplete      |
+| `worker`     | Manage local worker files for edge inference |
+
+## Worker Management
+
+Edge workers are Python modules that run inside the edge worker container and
+process sensor data using the Cyberwave SDK hooks API.
+
+There are two kinds of workers:
+- **Custom** workers: handwritten files you manage directly.
+- **Generated** (`wf_*`) workers: auto-generated from backend workflow definitions,
+  synced by edge-core. Do not edit these directly — [eject](#eject-a-workflow-worker) them first.
+
+### `cyberwave worker list`
+
+```bash
+cyberwave worker list           # table view
+cyberwave worker list --json    # JSON output
+```
+
+Lists all installed workers with their origin (`custom` or `workflow`).
+
+### `cyberwave worker add`
+
+```bash
+cyberwave worker add ./detect_people.py
+cyberwave worker add ~/workers/my_model.py --name renamed.py
+```
+
+Copies a Python worker file into `{CONFIG_DIR}/workers/`. After adding a worker,
+restart the edge worker container:
+
+```bash
+cyberwave-edge-core worker restart
+```
+
+### `cyberwave worker remove`
+
+```bash
+cyberwave worker remove detect_people        # without .py extension
+cyberwave worker remove detect_people.py    # with .py extension
+cyberwave worker remove wf_abc123 --yes     # skip confirmation
+```
+
+Removes a worker file. Generated (`wf_*`) workers warn you that they will be
+re-created on the next edge sync unless the originating workflow is deactivated.
+
+### `cyberwave worker status`
+
+```bash
+cyberwave worker status
+```
+
+Shows the list of installed worker files (with origin labels) and the status of
+the edge worker container (requires Docker).
+
+### `cyberwave worker logs`
+
+```bash
+cyberwave worker logs             # follow logs (default)
+cyberwave worker logs --tail 100  # show last 100 lines
+cyberwave worker logs --no-follow # print and exit
+```
+
+Streams logs from the edge worker container (requires Docker).
+
+### Eject a Workflow Worker
+
+Workflow-generated workers (`wf_*.py`) can be **ejected** into custom workers
+when you need to customise their logic:
+
+```bash
+# 1. Copy the generated worker to a custom name
+cp /etc/cyberwave/workers/wf_a1b2c3d4.py \
+   /etc/cyberwave/workers/my_detector.py
+
+# 2. Edit your copy
+nano /etc/cyberwave/workers/my_detector.py
+
+# 3. Deactivate the originating workflow in the UI
+#    The wf_a1b2c3d4.py file will be removed on the next edge sync.
+```
+
+After ejection, `my_detector.py` is yours to edit freely. Edge sync never
+touches files that do not start with `wf_`.
 
 ## Shell Autocompletion
 
