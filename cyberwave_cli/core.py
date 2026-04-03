@@ -9,6 +9,7 @@ This module provides the logic for:
 import json
 import os
 import platform
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -158,6 +159,10 @@ CLOUD_NODE_SPEC = ServiceSpec(
 
 def _is_linux() -> bool:
     return platform.system() == "Linux"
+
+
+def _is_macos() -> bool:
+    return platform.system() == "Darwin"
 
 
 def _has_systemd() -> bool:
@@ -414,6 +419,39 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
             console.print(e)  # print the error for debugging purposes
 
     console.print("[yellow]No valid credentials found.[/yellow]")
+    env_token = os.getenv("CYBERWAVE_API_KEY", "").strip()
+    if env_token:
+        try:
+            runtime_overrides = collect_runtime_env_overrides()
+            sdk_client = _get_sdk_client(
+                env_token,
+                base_url=runtime_overrides.get("CYBERWAVE_BASE_URL") or None,
+            )
+            with console.status("[dim]Checking CYBERWAVE_API_KEY...[/dim]"):
+                workspace = _select_workspace_from_env_or_default(
+                    sdk_client,
+                    skip_confirm=skip_confirm,
+                )
+
+            save_credentials(
+                Credentials(
+                    token=env_token,
+                    workspace_uuid=str(getattr(workspace, "uuid", "") or ""),
+                    workspace_name=str(getattr(workspace, "name", "") or ""),
+                    cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
+                    cyberwave_edge_log_level=_resolved_edge_log_level(runtime_overrides),
+                    cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
+                    cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
+                )
+            )
+            console.print("[green]✓[/green] Using CYBERWAVE_API_KEY from environment")
+            console.print(f"[dim]Workspace: {workspace.name}[/dim]")
+            console.print(f"[dim]Credentials saved to {CONFIG_DIR}/[/dim]\n")
+            return True
+        except Exception as e:
+            console.print("[yellow]CYBERWAVE_API_KEY is invalid or incomplete.[/yellow]")
+            console.print(e)
+
     console.print("[cyan]Please log in to continue.[/cyan]\n")
 
     email = Prompt.ask("[bold]Email[/bold]")
@@ -471,27 +509,41 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
         return False
 
 
-def _select_workspace(client: Any, *, skip_confirm: bool) -> Any:
-    """Get workspaces via SDK and let user select one."""
+def _select_workspace_from_env_or_default(client: Any, *, skip_confirm: bool) -> Any:
+    """Pick a workspace, honoring ``CYBERWAVE_WORKSPACE_SLUG`` when provided."""
     workspaces = client.workspaces.list()
-
     if not workspaces:
         raise RuntimeError("No workspaces available for this account.")
 
+    workspace_slug = os.getenv("CYBERWAVE_WORKSPACE_SLUG", "").strip().lower()
+    if workspace_slug:
+        for workspace in workspaces:
+            candidate_slug = str(getattr(workspace, "slug", "") or "").strip().lower()
+            if candidate_slug == workspace_slug:
+                console.print(f"[green]Workspace:[/green] {workspace.name}")
+                return workspace
+        raise RuntimeError(
+            f"Workspace slug '{workspace_slug}' was not found for the provided token."
+        )
+
     if len(workspaces) == 1:
-        ws = workspaces[0]
-        console.print(f"[green]Workspace:[/green] {ws.name}")
-        return ws
+        workspace = workspaces[0]
+        console.print(f"[green]Workspace:[/green] {workspace.name}")
+        return workspace
 
     if skip_confirm:
-        ws = workspaces[0]
-        console.print(f"[yellow]Auto-selecting workspace:[/yellow] {ws.name}")
-        return ws
+        workspace = workspaces[0]
+        console.print(f"[yellow]Auto-selecting workspace:[/yellow] {workspace.name}")
+        return workspace
 
-    labels = [f"{ws.name} ({str(ws.uuid)[:8]}...)" for ws in workspaces]
+    labels = [f"{workspace.name} ({str(workspace.uuid)[:8]}...)" for workspace in workspaces]
     idx = _select_with_arrows("Select a workspace", labels)
-    ws = workspaces[idx]
-    return ws
+    return workspaces[idx]
+
+
+def _select_workspace(client: Any, *, skip_confirm: bool) -> Any:
+    """Get workspaces via SDK and let user select one."""
+    return _select_workspace_from_env_or_default(client, skip_confirm=skip_confirm)
 
 
 def _resolve_workspace_from_credentials(client: Any, workspace_uuid: str) -> Any | None:
@@ -1362,6 +1414,111 @@ def _service_override_path(spec: ServiceSpec) -> Path:
     return spec.unit_path.parent / f"{spec.unit_name}.d" / "override.conf"
 
 
+def _resolve_service_binary(spec: ServiceSpec) -> str:
+    """Resolve the absolute path used to launch the service.
+
+    Resolution order:
+    1. spec.binary_path if it exists (Linux apt install)
+    2. Venv-local bin used by install-local-cli-mac.sh
+    3. PATH lookup via shutil.which
+    4. spec.binary_path as a fallback (may not exist)
+    """
+    if spec.binary_path.exists():
+        return str(spec.binary_path)
+    venv_bin = Path.home() / ".cyberwave-cli" / "venv-local" / "bin" / spec.package_name
+    if venv_bin.exists():
+        return str(venv_bin)
+    return shutil.which(spec.package_name) or str(spec.binary_path)
+
+
+def _launchagent_label(spec: ServiceSpec) -> str:
+    """Return the launchd label for a macOS service."""
+    if spec.package_name == CLOUD_NODE_SPEC.package_name:
+        return "com.cyberwave.cloud-node"
+    package_suffix = spec.package_name.removeprefix("cyberwave-").replace("-", ".")
+    return f"com.cyberwave.{package_suffix}"
+
+
+def _launchagent_plist_path(spec: ServiceSpec) -> Path:
+    """Return the LaunchAgent plist path for the current user."""
+    return Path.home() / "Library" / "LaunchAgents" / f"{_launchagent_label(spec)}.plist"
+
+
+def create_launchagent_service(
+    spec: ServiceSpec = CLOUD_NODE_SPEC,
+    *,
+    config_path: str | None = None,
+) -> bool:
+    """Write a LaunchAgent plist for the service on macOS."""
+    program_arguments = [_resolve_service_binary(spec), "start"]
+    if config_path:
+        # launchd launches from /, so config paths must be absolute.
+        abs_config = str(Path(config_path).resolve())
+        program_arguments.extend(["--config", abs_config])
+
+    log_dir = Path.home() / "Library" / "Logs" / "Cyberwave"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    label = _launchagent_label(spec)
+    plist_data = {
+        "Label": label,
+        "ProgramArguments": program_arguments,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(log_dir / f"{label}.log"),
+        "StandardErrorPath": str(log_dir / f"{label}.log"),
+    }
+
+    plist_path = _launchagent_plist_path(spec)
+    try:
+        plist_path.parent.mkdir(parents=True, exist_ok=True)
+        plist_path.write_bytes(plistlib.dumps(plist_data))
+    except PermissionError:
+        console.print(
+            "[red]Permission denied writing LaunchAgent plist.[/red]\n"
+            "[dim]Run 'cyberwave compute install' without sudo on macOS.[/dim]"
+        )
+        return False
+
+    console.print(f"[green]Created:[/green] {plist_path}")
+    return True
+
+
+def load_launchagent_service(spec: ServiceSpec = CLOUD_NODE_SPEC) -> bool:
+    """Load or reload the LaunchAgent for the current macOS user session."""
+    plist_path = _launchagent_plist_path(spec)
+    if not plist_path.exists():
+        console.print("[red]LaunchAgent plist not found — run install first.[/red]")
+        return False
+
+    label = _launchagent_label(spec)
+    domain = f"gui/{os.getuid()}"
+    bootout_target = f"{domain}/{label}"
+
+    try:
+        result = subprocess.run(
+            ["launchctl", "bootout", bootout_target],
+            env=clean_subprocess_env(),
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            # Give launchd a moment to fully unload the previous instance before
+            # bootstrapping the new plist to avoid transient I/O errors (exit 5).
+            time.sleep(1)
+        _run(["launchctl", "bootstrap", domain, str(plist_path)])
+    except FileNotFoundError:
+        console.print("[red]launchctl not found on this system.[/red]")
+        return False
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]launchctl failed (exit {exc.returncode}).[/red]")
+        console.print(
+            "[dim]LaunchAgent loading requires an active macOS GUI login session.[/dim]"
+        )
+        return False
+
+    console.print(f"[green]LaunchAgent loaded:[/green] {label}")
+    return True
+
+
 def write_service_override(
     spec: ServiceSpec,
     *,
@@ -1381,11 +1538,7 @@ def write_service_override(
 
     extra: list[str] = ["--config", config_path]
 
-    binary = (
-        str(spec.binary_path)
-        if spec.binary_path.exists()
-        else shutil.which(spec.package_name) or str(spec.binary_path)
-    )
+    binary = _resolve_service_binary(spec)
     exec_start = " ".join([binary, "start"] + extra)
     contents = textwrap.dedent(f"""\
         [Service]
@@ -1444,11 +1597,7 @@ def create_systemd_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
         console.print("[yellow]systemd not detected — skipping service creation.[/yellow]")
         return False
 
-    binary = (
-        str(spec.binary_path)
-        if spec.binary_path.exists()
-        else shutil.which(spec.package_name) or str(spec.binary_path)
-    )
+    binary = _resolve_service_binary(spec)
     unit_contents = spec.unit_template.format(binary_path=binary)
 
     try:
@@ -1561,22 +1710,31 @@ def setup_service(
     skip_confirm: bool = False,
     channel: str = "stable",
     version: str | None = None,
+    config_path: str | None = None,
     post_install_hook: Any = None,
 ) -> bool:
     """Generic install orchestrator: install package, optionally set up Docker + systemd.
 
     Returns True if everything succeeded.
     """
-    service_setup_supported = _is_linux()
+    linux_service_setup = _is_linux()
+    macos_launchagent_supported = _is_macos() and spec.package_name == CLOUD_NODE_SPEC.package_name
 
-    if service_setup_supported and os.geteuid() != 0:
+    if linux_service_setup and os.geteuid() != 0:
         console.print(
             "[red]Root privileges required.[/red]\n"
             f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
         )
         return False
 
-    if not service_setup_supported:
+    if macos_launchagent_supported and os.geteuid() == 0:
+        console.print(
+            "[red]macOS LaunchAgent installs must be run without sudo.[/red]\n"
+            "[dim]Re-run as your regular user: cyberwave compute install[/dim]"
+        )
+        return False
+
+    if not linux_service_setup and not macos_launchagent_supported:
         console.print(
             f"[yellow]{spec.package_name} service setup is only supported on Linux. "
             "You will need to start it manually upon restart.[/yellow]"
@@ -1592,7 +1750,7 @@ def setup_service(
         return False
 
     if not skip_confirm:
-        if service_setup_supported:
+        if linux_service_setup:
             selected_pkg = _resolve_service_package_name(channel, spec)
             selected_target = f"{selected_pkg}={version}" if version else selected_pkg
             console.print(
@@ -1600,6 +1758,14 @@ def setup_service(
                 f"  1. Install [bold]{selected_target}[/bold] via apt-get\n"
                 f"  2. Create a systemd service ([bold]{spec.unit_name}[/bold])\n"
                 f"  3. Enable it to start on boot\n"
+            )
+        elif macos_launchagent_supported:
+            pip_target = f"{spec.package_name}=={version}" if version else spec.package_name
+            console.print(
+                f"\nThis will:\n"
+                f"  1. Install [bold]{pip_target}[/bold] via pip\n"
+                "  2. Configure service credentials\n"
+                "  3. Create and load a LaunchAgent for your macOS user session\n"
             )
         else:
             pip_target = f"{spec.package_name}=={version}" if version else spec.package_name
@@ -1616,7 +1782,7 @@ def setup_service(
     if not install_service_package(spec, channel=channel, version=version):
         return False
 
-    if service_setup_supported and spec.requires_docker:
+    if linux_service_setup and spec.requires_docker:
         if not _install_docker():
             return False
 
@@ -1624,13 +1790,21 @@ def setup_service(
         if not post_install_hook():
             return False
 
-    if service_setup_supported:
+    if linux_service_setup:
         if not create_systemd_service(spec):
             return False
         if not enable_and_start_service(spec):
             return False
         console.print(f"\n[green]{spec.package_name} is installed and running.[/green]")
         console.print(f"[dim]Check status: systemctl status {spec.unit_name}[/dim]")
+    elif macos_launchagent_supported:
+        if not create_launchagent_service(spec, config_path=config_path):
+            return False
+        if not load_launchagent_service(spec):
+            return False
+        console.print(f"\n[green]{spec.package_name} is installed and running.[/green]")
+        console.print(f"[dim]LaunchAgent: {_launchagent_label(spec)}[/dim]")
+        console.print(f"[dim]Plist: {_launchagent_plist_path(spec)}[/dim]")
     else:
         console.print(f"\n[green]{spec.package_name} is installed.[/green]")
         console.print(f"[dim]Start manually: {spec.package_name}[/dim]")

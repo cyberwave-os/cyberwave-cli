@@ -10,6 +10,7 @@ rich_module = ModuleType("rich")
 rich_console_module = ModuleType("rich.console")
 rich_prompt_module = ModuleType("rich.prompt")
 rich_table_module = ModuleType("rich.table")
+click_module = ModuleType("click")
 
 
 class _Console:
@@ -48,10 +49,48 @@ rich_module.console = rich_console_module
 rich_module.prompt = rich_prompt_module
 rich_module.table = rich_table_module
 
+
+class _Choice:
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+
+def _path_type(*_args, **_kwargs):
+    return str
+
+
+def _option(*_args, **_kwargs):
+    def decorator(func):
+        return func
+
+    return decorator
+
+
+def _group(*_args, **_kwargs):
+    def decorator(func):
+        def command(*_cmd_args, **_cmd_kwargs):
+            def inner(cmd_func):
+                cmd_func.callback = cmd_func
+                return cmd_func
+
+            return inner
+
+        func.command = command
+        return func
+
+    return decorator
+
+
+click_module.Choice = _Choice
+click_module.Path = _path_type
+click_module.option = _option
+click_module.group = _group
+
 sys.modules.setdefault("rich", rich_module)
 sys.modules.setdefault("rich.console", rich_console_module)
 sys.modules.setdefault("rich.prompt", rich_prompt_module)
 sys.modules.setdefault("rich.table", rich_table_module)
+sys.modules.setdefault("click", click_module)
 
 # --- load compute module ---
 commands_dir = Path(__file__).resolve().parents[1] / "cyberwave_cli" / "commands"
@@ -64,6 +103,8 @@ def _load_compute_module(monkeypatch, fake_core=None, fake_config=None):
     fake_core = fake_core or ModuleType("cyberwave_cli.core")
     fake_config = fake_config or ModuleType("cyberwave_cli.config")
     fake_config.clean_subprocess_env = lambda: {}
+    if not hasattr(fake_core, "_has_systemd"):
+        fake_core._has_systemd = lambda: True
     monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
     sys.modules.pop("cyberwave_cli.commands.compute", None)
@@ -90,15 +131,18 @@ def test_install_calls_setup_service(monkeypatch):
 
     fake_core = ModuleType("cyberwave_cli.core")
     fake_core.CLOUD_NODE_SPEC = FakeSpec()
-    fake_core.setup_service = lambda spec, *, skip_confirm, channel, version: calls.append(
-        (skip_confirm, channel, version)
-    ) or True
+    fake_core.setup_service = (
+        lambda spec, *, skip_confirm, channel, version, config_path=None: calls.append(
+            (skip_confirm, channel, version, config_path)
+        )
+        or True
+    )
     fake_core.write_service_override = lambda spec, config_path: True
 
     compute = _load_compute_module(monkeypatch, fake_core)
     compute.install_cloud_node.callback(yes=True, channel="stable", version=None, config_path=None)
 
-    assert calls == [(True, "stable", None)]
+    assert calls == [(True, "stable", None, None)]
 
 
 def test_uninstall_skips_config_dir_removal(monkeypatch, tmp_path):
@@ -184,6 +228,40 @@ def test_stop_without_systemd_sends_sigterm(monkeypatch):
     compute.stop_cloud_node.callback()
 
     assert (12345, signal.SIGTERM) in killed
+
+
+def test_stop_macos_treats_bootout_exit_3_as_not_loaded(monkeypatch, tmp_path):
+    printed: list[str] = []
+    plist_path = tmp_path / "com.cyberwave.cloud-node.plist"
+    plist_path.write_text("plist", encoding="utf-8")
+
+    class FakeSpec:
+        package_name = "cyberwave-cloud-node"
+        unit_name = "cyberwave-cloud-node.service"
+        unit_path = Path("/nonexistent/unit")
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.CLOUD_NODE_SPEC = FakeSpec()
+    fake_core._has_systemd = lambda: False
+    fake_core._is_macos = lambda: True
+    fake_core.stop_service = lambda spec: None
+    fake_core._launchagent_plist_path = lambda spec: plist_path
+    fake_core._launchagent_label = lambda spec: "com.cyberwave.cloud-node"
+
+    fake_config = ModuleType("cyberwave_cli.config")
+    fake_config.clean_subprocess_env = lambda: {}
+
+    compute = _load_compute_module(monkeypatch, fake_core, fake_config)
+    monkeypatch.setattr(
+        compute.subprocess,
+        "run",
+        lambda cmd, **_kw: type("R", (), {"returncode": 3})(),
+    )
+    monkeypatch.setattr(compute.console, "print", lambda msg="", *a, **kw: printed.append(str(msg)))
+
+    compute.stop_cloud_node.callback()
+
+    assert any("not loaded" in message.lower() for message in printed)
 
 
 def test_start_non_systemd_spawns_binary(monkeypatch):
@@ -278,6 +356,110 @@ def test_status_handles_missing_identity_file(monkeypatch, tmp_path):
     compute.status_cloud_node.callback()  # must not raise
 
     assert any("not yet registered" in p for p in printed)
+
+
+def test_logs_macos_shows_missing_log_file_message(monkeypatch, tmp_path):
+    printed: list[str] = []
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+
+    class FakeSpec:
+        package_name = "cyberwave-cloud-node"
+        unit_name = "cyberwave-cloud-node.service"
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.CLOUD_NODE_SPEC = FakeSpec()
+    fake_core._launchagent_label = lambda spec: "com.cyberwave.cloud-node"
+
+    fake_config = ModuleType("cyberwave_cli.config")
+    fake_config.clean_subprocess_env = lambda: {}
+
+    compute = _load_compute_module(monkeypatch, fake_core, fake_config)
+    monkeypatch.setattr(compute.Path, "home", staticmethod(lambda: home_dir))
+    monkeypatch.setattr(compute.sys, "platform", "darwin")
+    monkeypatch.setattr(compute.console, "print", lambda msg="", *a, **kw: printed.append(str(msg)))
+
+    compute.logs_cloud_node.callback(follow=False, lines=5)
+
+    assert any("log file" in message.lower() and "not found" in message.lower() for message in printed)
+
+
+def test_logs_macos_prints_last_n_lines(monkeypatch, tmp_path):
+    printed: list[str] = []
+    home_dir = tmp_path / "home"
+    log_dir = home_dir / "Library" / "Logs" / "Cyberwave"
+    log_dir.mkdir(parents=True)
+    (log_dir / "com.cyberwave.cloud-node.log").write_text(
+        "line1\nline2\nline3\nline4\n",
+        encoding="utf-8",
+    )
+
+    class FakeSpec:
+        package_name = "cyberwave-cloud-node"
+        unit_name = "cyberwave-cloud-node.service"
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.CLOUD_NODE_SPEC = FakeSpec()
+    fake_core._launchagent_label = lambda spec: "com.cyberwave.cloud-node"
+
+    fake_config = ModuleType("cyberwave_cli.config")
+    fake_config.clean_subprocess_env = lambda: {}
+
+    compute = _load_compute_module(monkeypatch, fake_core, fake_config)
+    monkeypatch.setattr(compute.Path, "home", staticmethod(lambda: home_dir))
+    monkeypatch.setattr(compute.sys, "platform", "darwin")
+    monkeypatch.setattr(compute.console, "print", lambda msg="", *a, **kw: printed.append(str(msg)))
+
+    compute.logs_cloud_node.callback(follow=False, lines=2)
+
+    output = "\n".join(printed)
+    assert "line3" in output
+    assert "line4" in output
+    assert "line1" not in output
+
+
+def test_logs_macos_follow_streams_new_lines(monkeypatch, tmp_path):
+    printed: list[str] = []
+    home_dir = tmp_path / "home"
+    log_dir = home_dir / "Library" / "Logs" / "Cyberwave"
+    log_dir.mkdir(parents=True)
+    log_file = log_dir / "com.cyberwave.cloud-node.log"
+    log_file.write_text("existing\n", encoding="utf-8")
+
+    class FakeSpec:
+        package_name = "cyberwave-cloud-node"
+        unit_name = "cyberwave-cloud-node.service"
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.CLOUD_NODE_SPEC = FakeSpec()
+    fake_core._launchagent_label = lambda spec: "com.cyberwave.cloud-node"
+
+    fake_config = ModuleType("cyberwave_cli.config")
+    fake_config.clean_subprocess_env = lambda: {}
+
+    compute = _load_compute_module(monkeypatch, fake_core, fake_config)
+    monkeypatch.setattr(compute.Path, "home", staticmethod(lambda: home_dir))
+    monkeypatch.setattr(compute.sys, "platform", "darwin")
+    monkeypatch.setattr(compute.console, "print", lambda msg="", *a, **kw: printed.append(str(msg)))
+
+    sleep_calls = {"count": 0}
+
+    def fake_sleep(_seconds):
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] == 1:
+            with log_file.open("a", encoding="utf-8") as handle:
+                handle.write("new line\n")
+                handle.flush()
+            return
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(compute.time, "sleep", fake_sleep)
+
+    compute.logs_cloud_node.callback(follow=True, lines=1)
+
+    output = "\n".join(printed)
+    assert "existing" in output
+    assert "new line" in output
 
 
 # ---- uninstall --yes removes package ----
@@ -478,7 +660,9 @@ def test_start_systemd_with_config_path_calls_write_service_override(monkeypatch
     fake_core.CLOUD_NODE_SPEC = FakeSpec()
     fake_core._has_systemd = lambda: True
     fake_core.start_service = lambda spec: True
-    fake_core.write_service_override = lambda spec, config_path: override_calls.append(config_path) or True
+    fake_core.write_service_override = (
+        lambda spec, config_path: override_calls.append(config_path) or True
+    )
 
     compute = _load_compute_module(monkeypatch, fake_core)
 
@@ -579,7 +763,9 @@ def test_install_with_config_path_calls_write_service_override(monkeypatch, tmp_
         lambda spec, config_path: call_order.append("override") or True
     )
     fake_core.setup_service = (
-        lambda spec, *, skip_confirm, channel, version: call_order.append("setup") or True
+        lambda spec, *, skip_confirm, channel, version, config_path=None: call_order.append(
+            f"setup:{config_path}"
+        ) or True
     )
 
     compute = _load_compute_module(monkeypatch, fake_core)
@@ -588,9 +774,42 @@ def test_install_with_config_path_calls_write_service_override(monkeypatch, tmp_
         yes=True, channel="stable", version=None, config_path=str(config_file)
     )
 
-    assert call_order == ["override", "setup"], (
+    assert call_order == ["override", f"setup:{config_file}"], (
         "write_service_override must be called before setup_service"
     )
+
+
+def test_install_non_systemd_with_config_path_skips_write_service_override(
+    monkeypatch, tmp_path
+):
+    """Non-systemd installs must not try to write a systemd override."""
+    calls: list[str] = []
+    config_file = tmp_path / "cyberwave.yml"
+    config_file.write_text("cyberwave-cloud-node:\n  profile_slug: default\n")
+
+    class FakeSpec:
+        package_name = "cyberwave-cloud-node"
+        unit_name = "cyberwave-cloud-node.service"
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.CLOUD_NODE_SPEC = FakeSpec()
+    fake_core._has_systemd = lambda: False
+    fake_core.write_service_override = (
+        lambda spec, config_path: calls.append("override") or True
+    )
+    fake_core.setup_service = (
+        lambda spec, *, skip_confirm, channel, version, config_path=None: calls.append(
+            f"setup:{config_path}"
+        ) or True
+    )
+
+    compute = _load_compute_module(monkeypatch, fake_core)
+
+    compute.install_cloud_node.callback(
+        yes=True, channel="stable", version=None, config_path=str(config_file)
+    )
+
+    assert calls == [f"setup:{config_file}"]
 
 
 # ---- pgrep self-PID filter ----
@@ -598,8 +817,6 @@ def test_install_with_config_path_calls_write_service_override(monkeypatch, tmp_
 
 def test_stop_filters_own_pid(monkeypatch):
     """stop_cloud_node must not attempt to kill the CLI process itself."""
-    import signal
-
     killed: list[tuple[int, int]] = []
     own_pid = os.getpid()
 

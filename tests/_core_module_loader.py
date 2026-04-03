@@ -25,6 +25,16 @@ def load_core_module(monkeypatch):
         def print(self, *_args, **_kwargs):
             return None
 
+        def status(self, *_args, **_kwargs):
+            class _Status:
+                def __enter__(self_inner):
+                    return self_inner
+
+                def __exit__(self_inner, exc_type, exc, tb):
+                    return False
+
+            return _Status()
+
     class _Confirm:
         @staticmethod
         def ask(*_args, **_kwargs):

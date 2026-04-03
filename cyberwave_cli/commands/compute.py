@@ -21,6 +21,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +41,72 @@ def _find_cloud_node_binary() -> Optional[str]:
     if CLOUD_NODE_SPEC.binary_path.exists():
         return str(CLOUD_NODE_SPEC.binary_path)
     return shutil.which(CLOUD_NODE_SPEC.package_name)
+
+
+def _macos_launchagent_target() -> tuple[str, str]:
+    """Return the launchctl domain/label target for the cloud node LaunchAgent."""
+    from ..core import CLOUD_NODE_SPEC, _launchagent_label
+
+    domain = f"gui/{os.getuid()}"
+    return domain, f"{domain}/{_launchagent_label(CLOUD_NODE_SPEC)}"
+
+
+def _ensure_macos_launchagent_installed() -> bool:
+    """Ensure the macOS LaunchAgent plist exists before controlling it."""
+    from ..core import CLOUD_NODE_SPEC, _launchagent_plist_path
+
+    plist_path = _launchagent_plist_path(CLOUD_NODE_SPEC)
+    if plist_path.exists():
+        return True
+    console.print(
+        "[red]LaunchAgent plist not found.[/red]\n"
+        "[dim]Run 'cyberwave compute install' first.[/dim]"
+    )
+    return False
+
+
+def _macos_launchagent_plist_path() -> Path:
+    """Return the cloud node LaunchAgent plist path for the current user."""
+    from ..core import CLOUD_NODE_SPEC, _launchagent_plist_path
+
+    return _launchagent_plist_path(CLOUD_NODE_SPEC)
+
+
+def _macos_launchagent_log_path() -> Path:
+    """Return the cloud node LaunchAgent log file path for the current user."""
+    from ..core import CLOUD_NODE_SPEC, _launchagent_label
+
+    label = _launchagent_label(CLOUD_NODE_SPEC)
+    return Path.home() / "Library" / "Logs" / "Cyberwave" / f"{label}.log"
+
+
+def _show_macos_launchagent_logs(*, follow: bool, lines: int) -> None:
+    """Show logs from the macOS LaunchAgent log file."""
+    log_path = _macos_launchagent_log_path()
+    if not log_path.exists():
+        console.print(
+            "[yellow]Cloud node log file not found.[/yellow]\n"
+            f"[dim]Expected: {log_path}[/dim]\n"
+            "[dim]Run 'cyberwave compute install' and start the node to create it.[/dim]"
+        )
+        return
+
+    lines_to_show = max(0, int(lines))
+    existing_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in existing_lines[-lines_to_show:]:
+        console.print(line)
+
+    if not follow:
+        return
+
+    with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+        handle.seek(0, os.SEEK_END)
+        while True:
+            line = handle.readline()
+            if line:
+                console.print(line.rstrip("\n"))
+                continue
+            time.sleep(0.5)
 
 
 @click.group()
@@ -79,21 +146,21 @@ def install_cloud_node(
     """Install cyberwave-cloud-node and register it as a boot service.
 
     Downloads the cyberwave-cloud-node package (via apt-get on Debian/Ubuntu,
-    pip elsewhere) and creates a systemd service so it starts automatically
-    on boot.
+    pip elsewhere) and creates the platform-appropriate boot service
+    automatically.
 
     \b
     Examples:
-        sudo cyberwave compute install
-        sudo cyberwave compute install -y
+        cyberwave compute install
+        cyberwave compute install -y
         sudo cyberwave compute install --channel dev
-        sudo cyberwave compute install --config /home/user/cyberwave.yml
+        cyberwave compute install --config /path/to/cyberwave.yml
     """
-    from ..core import CLOUD_NODE_SPEC, setup_service, write_service_override
+    from ..core import CLOUD_NODE_SPEC, _has_systemd, setup_service, write_service_override
 
     # Write the override before setup so daemon-reload inside enable_and_start_service
     # picks it up together with the base unit on first start.
-    if config_path:
+    if config_path and _has_systemd():
         if not write_service_override(CLOUD_NODE_SPEC, config_path=config_path):
             raise SystemExit(1)
 
@@ -103,6 +170,7 @@ def install_cloud_node(
             skip_confirm=yes,
             channel=channel.lower(),
             version=version,
+            config_path=config_path,
         ):
             raise SystemExit(1)
     except KeyboardInterrupt:
@@ -192,11 +260,13 @@ def start_cloud_node(
 ) -> None:
     """Start the cloud node service.
 
-    Uses systemctl when the service unit is installed; otherwise spawns the
-    binary directly in the background.
+    Uses systemctl when the service unit is installed, launchctl on macOS when
+    the LaunchAgent is installed, and otherwise spawns the binary directly in
+    the background.
 
     When --config is provided under systemd, it is written to a drop-in
-    override so it persists across reboots.
+    override so it persists across reboots. On macOS it rewrites and reloads
+    the LaunchAgent plist.
 
     \b
     Examples:
@@ -204,7 +274,15 @@ def start_cloud_node(
         cyberwave compute start --config /home/user/cyberwave.yml
         cyberwave compute start -f   # run in foreground
     """
-    from ..core import CLOUD_NODE_SPEC, _has_systemd, start_service, write_service_override
+    from ..core import (
+        CLOUD_NODE_SPEC,
+        _has_systemd,
+        _is_macos,
+        create_launchagent_service,
+        load_launchagent_service,
+        start_service,
+        write_service_override,
+    )
 
     spec = CLOUD_NODE_SPEC
 
@@ -215,6 +293,65 @@ def start_cloud_node(
         if not start_service(spec):
             raise SystemExit(1)
         return
+
+    if foreground:
+        binary = _find_cloud_node_binary()
+        if not binary:
+            console.print(
+                "[red]cyberwave-cloud-node binary not found.[/red]\n"
+                f"[dim]Run: {spec.sudo_command_hint}[/dim]"
+            )
+            return
+
+        from ..config import clean_subprocess_env
+
+        cmd: list[str] = [binary]
+        if config_path:
+            cmd += ["--config", str(config_path)]
+
+        try:
+            console.print("[green]Running cloud node in foreground (Ctrl+C to stop)...[/green]")
+            subprocess.run(cmd, env=clean_subprocess_env(), check=False)
+        except FileNotFoundError:
+            console.print(f"[red]Binary not found: {binary}[/red]")
+        return
+
+    if _is_macos():
+        if not _ensure_macos_launchagent_installed():
+            raise SystemExit(1)
+        if config_path and not create_launchagent_service(spec, config_path=config_path):
+            raise SystemExit(1)
+        if config_path:
+            if not load_launchagent_service(spec):
+                raise SystemExit(1)
+            return
+
+        from ..config import clean_subprocess_env
+
+        domain, target = _macos_launchagent_target()
+        try:
+            result = subprocess.run(
+                ["launchctl", "kickstart", "-k", target],
+                env=clean_subprocess_env(),
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                console.print(f"[green]✓ LaunchAgent started:[/green] {target}")
+                return
+            result = subprocess.run(
+                ["launchctl", "bootstrap", domain, str(_macos_launchagent_plist_path())],
+                env=clean_subprocess_env(),
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                console.print(f"[green]✓ LaunchAgent started:[/green] {target}")
+                return
+            if not load_launchagent_service(spec):
+                raise SystemExit(1)
+            return
+        except FileNotFoundError:
+            console.print("[red]launchctl not found on this system.[/red]")
+            raise SystemExit(1)
 
     binary = _find_cloud_node_binary()
     if not binary:
@@ -233,18 +370,14 @@ def start_cloud_node(
     env = clean_subprocess_env()
 
     try:
-        if foreground:
-            console.print("[green]Running cloud node in foreground (Ctrl+C to stop)...[/green]")
-            subprocess.run(cmd, env=env, check=False)
-        else:
-            process = subprocess.Popen(
-                cmd,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            console.print(f"[green]✓ Cloud node started (PID: {process.pid})[/green]")
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        console.print(f"[green]✓ Cloud node started (PID: {process.pid})[/green]")
     except FileNotFoundError:
         console.print(f"[red]Binary not found: {binary}[/red]")
 
@@ -252,13 +385,41 @@ def start_cloud_node(
 @compute.command("stop")
 def stop_cloud_node() -> None:
     """Stop the cloud node service."""
-    from ..core import CLOUD_NODE_SPEC, _has_systemd, stop_service
+    from ..core import CLOUD_NODE_SPEC, _has_systemd, _is_macos, stop_service
 
     spec = CLOUD_NODE_SPEC
 
     if _has_systemd() and spec.unit_path.exists():
         stop_service(spec)
         return
+
+    if _is_macos():
+        if not _ensure_macos_launchagent_installed():
+            raise SystemExit(1)
+
+        from ..config import clean_subprocess_env
+
+        _domain, target = _macos_launchagent_target()
+        try:
+            result = subprocess.run(
+                ["launchctl", "bootout", target],
+                env=clean_subprocess_env(),
+                capture_output=True,
+            )
+        except FileNotFoundError:
+            console.print("[red]launchctl not found on this system.[/red]")
+            raise SystemExit(1)
+
+        if result.returncode == 0:
+            console.print(f"[green]✓ LaunchAgent stopped:[/green] {target}")
+            return
+
+        if result.returncode in {3, 36}:
+            console.print("[yellow]Cloud node LaunchAgent is not loaded.[/yellow]")
+            return
+
+        console.print(f"[red]launchctl bootout failed (exit {result.returncode}).[/red]")
+        raise SystemExit(1)
 
     # Fallback: find and send SIGTERM to background process
     try:
@@ -294,17 +455,27 @@ def restart_cloud_node(config_path: Optional[str]) -> None:
     """Restart the cloud node service.
 
     If the node was installed as a systemd service, restarts it via systemctl.
-    Otherwise falls back to stopping and re-starting the background process.
+    On macOS it reloads the installed LaunchAgent. Otherwise it falls back to
+    stopping and re-starting the background process.
 
     When --config is provided under systemd, it is written to a drop-in
-    override so it persists across reboots.
+    override so it persists across reboots. On macOS it rewrites and reloads
+    the LaunchAgent plist.
 
     \b
     Examples:
         sudo cyberwave compute restart
         sudo cyberwave compute restart --config /home/user/cyberwave.yml
     """
-    from ..core import CLOUD_NODE_SPEC, _has_systemd, restart_service, write_service_override
+    from ..core import (
+        CLOUD_NODE_SPEC,
+        _has_systemd,
+        _is_macos,
+        create_launchagent_service,
+        load_launchagent_service,
+        restart_service,
+        write_service_override,
+    )
 
     spec = CLOUD_NODE_SPEC
 
@@ -313,6 +484,16 @@ def restart_cloud_node(config_path: Optional[str]) -> None:
             if not write_service_override(spec, config_path=config_path):
                 raise SystemExit(1)
         restart_service(spec)
+        return
+
+    if _is_macos():
+        if not _ensure_macos_launchagent_installed():
+            raise SystemExit(1)
+        if config_path and not create_launchagent_service(spec, config_path=config_path):
+            raise SystemExit(1)
+        console.print("[cyan]Restarting cloud node LaunchAgent...[/cyan]")
+        if not load_launchagent_service(spec):
+            raise SystemExit(1)
         return
 
     console.print("[cyan]Restarting cloud node process...[/cyan]")
@@ -404,10 +585,18 @@ def status_cloud_node() -> None:
 @click.option("--lines", "-n", default=50, show_default=True, help="Number of lines to show")
 def logs_cloud_node(follow: bool, lines: int) -> None:
     """Show cloud node logs."""
-    from ..config import clean_subprocess_env
     from ..core import CLOUD_NODE_SPEC
 
     spec = CLOUD_NODE_SPEC
+    if sys.platform == "darwin":
+        try:
+            _show_macos_launchagent_logs(follow=follow, lines=lines)
+        except KeyboardInterrupt:
+            pass
+        return
+
+    from ..config import clean_subprocess_env
+
     service_name = spec.unit_name.removesuffix(".service")
     cmd = [
         "journalctl",
@@ -424,12 +613,6 @@ def logs_cloud_node(follow: bool, lines: int) -> None:
         if result.returncode != 0:
             console.print("[dim]Tip: run with sudo if you see no output.[/dim]")
     except FileNotFoundError:
-        if sys.platform == "darwin":
-            console.print(
-                "[yellow]journalctl is not available on macOS.[/yellow]\n"
-                f"[dim]Run the node in a terminal to see logs: {spec.package_name}[/dim]"
-            )
-        else:
-            console.print("[red]journalctl not found. Is systemd available on this host?[/red]")
+        console.print("[red]journalctl not found. Is systemd available on this host?[/red]")
     except KeyboardInterrupt:
         pass

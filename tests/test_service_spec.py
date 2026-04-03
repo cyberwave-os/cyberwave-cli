@@ -1,4 +1,5 @@
 # tests/test_service_spec.py
+import plistlib
 from pathlib import Path
 
 from tests._core_module_loader import load_core_module
@@ -83,6 +84,63 @@ def test_create_systemd_service_writes_unit_to_spec_path(monkeypatch, tmp_path):
     assert "cyberwave-cloud-node" in unit_path.read_text()
 
 
+def test_create_launchagent_service_writes_plist_with_config(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    home_dir = tmp_path / "home"
+    binary_path = home_dir / "bin" / "cyberwave-cloud-node"
+    binary_path.parent.mkdir(parents=True, exist_ok=True)
+    binary_path.write_text("#!/bin/sh\n")
+
+    monkeypatch.setattr(core.Path, "home", staticmethod(lambda: home_dir))
+    monkeypatch.setattr(core.CLOUD_NODE_SPEC, "binary_path", binary_path)
+
+    result = core.create_launchagent_service(
+        core.CLOUD_NODE_SPEC,
+        config_path="/tmp/cyberwave.yml",
+    )
+
+    assert result is True
+
+    plist_path = home_dir / "Library" / "LaunchAgents" / "com.cyberwave.cloud-node.plist"
+    assert plist_path.exists()
+    plist_data = plistlib.loads(plist_path.read_bytes())
+    assert plist_data["Label"] == "com.cyberwave.cloud-node"
+    assert plist_data["ProgramArguments"] == [
+        str(binary_path),
+        "start",
+        "--config",
+        "/tmp/cyberwave.yml",
+    ]
+    assert plist_data["RunAtLoad"] is True
+    assert plist_data["KeepAlive"] is True
+
+
+def test_load_launchagent_service_bootstraps_current_gui_user(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    run_calls: list[tuple[list[str], bool]] = []
+    plist_path = tmp_path / "com.cyberwave.cloud-node.plist"
+    plist_path.write_text("plist")
+
+    monkeypatch.setattr(core, "_launchagent_plist_path", lambda spec: plist_path, raising=False)
+    monkeypatch.setattr(core, "os", type("os", (), {"getuid": staticmethod(lambda: 501)})())
+
+    def fake_run(cmd, **kwargs):
+        run_calls.append((cmd, kwargs.get("check", True)))
+        if cmd[1] == "bootout":
+            return type("R", (), {"returncode": 36})()
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(core, "_run", fake_run)
+
+    result = core.load_launchagent_service(core.CLOUD_NODE_SPEC)
+
+    assert result is True
+    assert run_calls == [
+        (["launchctl", "bootout", "gui/501/com.cyberwave.cloud-node"], False),
+        (["launchctl", "bootstrap", "gui/501", str(plist_path)], True),
+    ]
+
+
 def _make_apt_recorder(calls):
     def _fake_apt(spec, *, package_name, package_version):
         calls.append((package_name, package_version))
@@ -146,6 +204,7 @@ def test_setup_service_cloud_node_non_linux(monkeypatch):
     calls: list[str] = []
 
     monkeypatch.setattr(core, "_is_linux", lambda: False)
+    monkeypatch.setattr(core, "_is_macos", lambda: False, raising=False)
     monkeypatch.setattr(
         core,
         "_ensure_credentials",
@@ -167,6 +226,75 @@ def test_setup_service_cloud_node_non_linux(monkeypatch):
     assert result is True
     assert "creds" in calls
     assert "install:cyberwave-cloud-node" in calls
+
+
+def test_setup_service_cloud_node_macos_creates_launchagent(monkeypatch):
+    core = load_core_module(monkeypatch)
+    calls: list[str] = []
+
+    monkeypatch.setattr(core, "_is_linux", lambda: False)
+    monkeypatch.setattr(core, "_is_macos", lambda: True, raising=False)
+    monkeypatch.setattr(core.os, "geteuid", lambda: 501)
+    monkeypatch.setattr(
+        core,
+        "_ensure_credentials",
+        lambda *, skip_confirm: calls.append("creds") or True,
+    )
+    monkeypatch.setattr(
+        core,
+        "install_service_package",
+        lambda spec, *, channel, version: calls.append(f"install:{spec.package_name}") or True,
+    )
+    monkeypatch.setattr(core, "create_systemd_service", _raise_assertion())
+    monkeypatch.setattr(core, "enable_and_start_service", _raise_assertion())
+    monkeypatch.setattr(
+        core,
+        "create_launchagent_service",
+        lambda spec, *, config_path=None: calls.append(f"plist:{config_path}") or True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        core,
+        "load_launchagent_service",
+        lambda spec: calls.append("launchctl") or True,
+        raising=False,
+    )
+
+    result = core.setup_service(
+        core.CLOUD_NODE_SPEC,
+        skip_confirm=True,
+        channel="stable",
+        version=None,
+        config_path="/tmp/cyberwave.yml",
+    )
+
+    assert result is True
+    assert calls == [
+        "creds",
+        "install:cyberwave-cloud-node",
+        "plist:/tmp/cyberwave.yml",
+        "launchctl",
+    ]
+
+
+def test_setup_service_macos_rejects_sudo(monkeypatch):
+    core = load_core_module(monkeypatch)
+    messages: list[str] = []
+
+    monkeypatch.setattr(core.console, "print", lambda msg="", *a, **kw: messages.append(str(msg)))
+    monkeypatch.setattr(core, "_is_linux", lambda: False)
+    monkeypatch.setattr(core, "_is_macos", lambda: True, raising=False)
+    monkeypatch.setattr(core.os, "geteuid", lambda: 0)
+
+    result = core.setup_service(
+        core.CLOUD_NODE_SPEC,
+        skip_confirm=True,
+        channel="stable",
+        version=None,
+    )
+
+    assert result is False
+    assert any("without sudo" in message.lower() for message in messages)
 
 
 def test_setup_service_does_not_call_docker_when_requires_docker_false(monkeypatch):
@@ -191,6 +319,7 @@ def test_setup_service_calls_post_install_hook(monkeypatch):
     hook_calls: list[bool] = []
 
     monkeypatch.setattr(core, "_is_linux", lambda: False)
+    monkeypatch.setattr(core, "_is_macos", lambda: False, raising=False)
     monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
     monkeypatch.setattr(core, "install_service_package", lambda spec, *, channel, version: True)
 
@@ -203,6 +332,71 @@ def test_setup_service_calls_post_install_hook(monkeypatch):
     )
 
     assert hook_calls == [True]
+
+
+def test_ensure_credentials_uses_env_api_key_without_prompt(monkeypatch):
+    core = load_core_module(monkeypatch)
+    saved_credentials: list[object] = []
+
+    class FakeWorkspace:
+        uuid = "ws-123"
+        name = "Test Workspace"
+        slug = "test-workspace"
+
+    class FakeWorkspaces:
+        @staticmethod
+        def list():
+            return [FakeWorkspace()]
+
+    class FakeClient:
+        workspaces = FakeWorkspaces()
+
+    class FakeCredentials:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class _Status:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(core, "load_credentials", lambda: None)
+    monkeypatch.setattr(
+        core,
+        "_get_sdk_client",
+        lambda token, base_url=None: FakeClient(),
+    )
+    monkeypatch.setattr(
+        core,
+        "save_credentials",
+        lambda credentials: saved_credentials.append(credentials),
+    )
+    monkeypatch.setattr(core, "Credentials", FakeCredentials)
+    monkeypatch.setattr(
+        core,
+        "collect_runtime_env_overrides",
+        lambda: {"CYBERWAVE_BASE_URL": "http://localhost:8000"},
+    )
+    monkeypatch.setattr(core.console, "status", lambda *args, **kwargs: _Status())
+    monkeypatch.setattr(
+        core.Prompt,
+        "ask",
+        lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(AssertionError("Prompt should not be called")),
+    )
+    monkeypatch.setenv("CYBERWAVE_API_KEY", "token-123")
+    monkeypatch.setenv("CYBERWAVE_WORKSPACE_SLUG", "test-workspace")
+
+    result = core._ensure_credentials(skip_confirm=True)
+
+    assert result is True
+    assert len(saved_credentials) == 1
+    assert saved_credentials[0].token == "token-123"
+    assert saved_credentials[0].workspace_uuid == "ws-123"
+    assert saved_credentials[0].workspace_name == "Test Workspace"
 
 
 def test_pip_install_error_uses_spec_package_name(monkeypatch):
@@ -229,6 +423,7 @@ def test_setup_service_non_linux_error_uses_spec_package_name(monkeypatch):
         core.console, "print", lambda msg="", *a, **kw: messages.append(str(msg))
     )
     monkeypatch.setattr(core, "_is_linux", lambda: False)
+    monkeypatch.setattr(core, "_is_macos", lambda: False, raising=False)
     monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
     monkeypatch.setattr(core, "install_service_package", lambda spec, *, channel, version: False)
 
