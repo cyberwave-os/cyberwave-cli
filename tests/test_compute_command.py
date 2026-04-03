@@ -358,6 +358,32 @@ def test_status_handles_missing_identity_file(monkeypatch, tmp_path):
     assert any("not yet registered" in p for p in printed)
 
 
+def test_status_macos_shows_launchagent_loaded(monkeypatch):
+    printed: list[str] = []
+
+    class FakeSpec:
+        package_name = "cyberwave-cloud-node"
+        unit_name = "cyberwave-cloud-node.service"
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.CLOUD_NODE_SPEC = FakeSpec()
+    fake_core._is_macos = lambda: True
+    fake_core._launchagent_label = lambda spec: "com.cyberwave.cloud-node"
+
+    compute = _load_compute_module(monkeypatch, fake_core)
+    monkeypatch.setattr(compute.os, "getuid", lambda: 501)
+    monkeypatch.setattr(
+        compute.subprocess,
+        "run",
+        lambda *a, **kw: type("R", (), {"returncode": 0, "stdout": "state = running\n"})(),
+    )
+    monkeypatch.setattr(compute.console, "print", lambda msg="", *a, **kw: printed.append(str(msg)))
+
+    compute.status_cloud_node.callback()
+
+    assert any("launchagent" in message.lower() and "loaded" in message.lower() for message in printed)
+
+
 def test_logs_macos_shows_missing_log_file_message(monkeypatch, tmp_path):
     printed: list[str] = []
     home_dir = tmp_path / "home"
@@ -460,6 +486,52 @@ def test_logs_macos_follow_streams_new_lines(monkeypatch, tmp_path):
     output = "\n".join(printed)
     assert "existing" in output
     assert "new line" in output
+
+
+# ---- macOS uninstall ----
+
+
+def test_uninstall_macos_removes_launchagent_and_uninstalls_package(monkeypatch, tmp_path):
+    home_dir = tmp_path / "home"
+    plist_path = home_dir / "Library" / "LaunchAgents" / "com.cyberwave.cloud-node.plist"
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text("plist", encoding="utf-8")
+
+    calls: list[list[str]] = []
+
+    class FakeSpec:
+        package_name = "cyberwave-cloud-node"
+        unit_name = "cyberwave-cloud-node.service"
+        unit_path = tmp_path / "nonexistent.service"
+        sudo_command_hint = "cyberwave compute install"
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.CLOUD_NODE_SPEC = FakeSpec()
+    fake_core._is_macos = lambda: True
+    fake_core._resolve_installed_service_package_name = lambda spec: "cyberwave-cloud-node"
+    fake_core.clear_service_override = lambda spec: None
+    fake_core._launchagent_plist_path = lambda spec: plist_path
+    fake_core._launchagent_label = lambda spec: "com.cyberwave.cloud-node"
+
+    fake_config = ModuleType("cyberwave_cli.config")
+    fake_config.clean_subprocess_env = lambda: {}
+
+    compute = _load_compute_module(monkeypatch, fake_core, fake_config)
+    monkeypatch.setattr(compute.os, "getuid", lambda: 501)
+
+    def fake_run(cmd, **_kw):
+        calls.append(cmd)
+        if cmd[:2] == ["launchctl", "bootout"]:
+            return type("R", (), {"returncode": 0})()
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(compute.subprocess, "run", fake_run)
+
+    compute.uninstall_cloud_node.callback(yes=True)
+
+    assert not plist_path.exists()
+    assert ["launchctl", "bootout", "gui/501/com.cyberwave.cloud-node"] in calls
+    assert [compute.sys.executable, "-m", "pip", "uninstall", "-y", "cyberwave-cloud-node"] in calls
 
 
 # ---- uninstall --yes removes package ----
