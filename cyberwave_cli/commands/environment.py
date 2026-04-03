@@ -35,7 +35,10 @@ def list_environments(as_json: bool):
     client = get_sdk_client()
     if not client:
         console.print("[red]✗[/red] Not logged in or SDK not installed.")
-        console.print("[dim]Run: cyberwave configure --token YOUR_TOKEN[/dim]")
+        console.print(
+            "[dim]Run: cyberwave login --token YOUR_TOKEN "
+            "or cyberwave configure --token YOUR_TOKEN[/dim]"
+        )
         raise click.Abort()
 
     try:
