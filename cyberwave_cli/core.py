@@ -10,6 +10,7 @@ import json
 import os
 import platform
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1537,9 +1538,8 @@ def write_service_override(
         return True
 
     extra: list[str] = ["--config", config_path]
-
     binary = _resolve_service_binary(spec)
-    exec_start = " ".join([binary, "start"] + extra)
+    exec_start = shlex.join([binary, "start", *extra])
     contents = textwrap.dedent(f"""\
         [Service]
         ExecStart=

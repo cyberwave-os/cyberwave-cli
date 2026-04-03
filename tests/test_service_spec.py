@@ -141,6 +141,55 @@ def test_load_launchagent_service_bootstraps_current_gui_user(monkeypatch, tmp_p
     ]
 
 
+def test_write_service_override_quotes_config_path_and_reloads(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    run_calls: list[list[str]] = []
+
+    unit_path = tmp_path / "cyberwave-cloud-node.service"
+    override_dir = tmp_path / "cyberwave-cloud-node.service.d"
+    config_path = tmp_path / "configs" / "with spaces" / "cyberwave.yml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("cyberwave-cloud-node:\n  profile_slug: default\n", encoding="utf-8")
+
+    cloud_spec = core.CLOUD_NODE_SPEC
+    monkeypatch.setattr(cloud_spec, "unit_path", unit_path)
+    monkeypatch.setattr(cloud_spec, "binary_path", Path("/usr/bin/cyberwave-cloud-node"))
+    monkeypatch.setattr(core, "_has_systemd", lambda: True)
+    monkeypatch.setattr(core, "_run", lambda cmd, **_kw: run_calls.append(cmd))
+
+    result = core.write_service_override(cloud_spec, config_path=str(config_path))
+
+    override_file = override_dir / "override.conf"
+    assert result is True
+    assert override_file.exists()
+    override_text = override_file.read_text(encoding="utf-8")
+    assert "ExecStart=" in override_text
+    assert str(config_path) in override_text
+    assert f"'{config_path}'" in override_text
+    assert run_calls == [["systemctl", "daemon-reload"]]
+
+
+def test_clear_service_override_removes_file_and_reloads(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    run_calls: list[list[str]] = []
+
+    unit_path = tmp_path / "cyberwave-cloud-node.service"
+    override_file = tmp_path / "cyberwave-cloud-node.service.d" / "override.conf"
+    override_file.parent.mkdir(parents=True)
+    override_file.write_text("[Service]\nExecStart=\n", encoding="utf-8")
+
+    cloud_spec = core.CLOUD_NODE_SPEC
+    monkeypatch.setattr(cloud_spec, "unit_path", unit_path)
+    monkeypatch.setattr(core, "_has_systemd", lambda: True)
+    monkeypatch.setattr(core, "_run", lambda cmd, **_kw: run_calls.append(cmd))
+
+    core.clear_service_override(cloud_spec)
+
+    assert not override_file.exists()
+    assert not override_file.parent.exists()
+    assert run_calls == [["systemctl", "daemon-reload"]]
+
+
 def _make_apt_recorder(calls):
     def _fake_apt(spec, *, package_name, package_version):
         calls.append((package_name, package_version))
