@@ -105,6 +105,12 @@ def _load_compute_module(monkeypatch, fake_core=None, fake_config=None):
     fake_config.clean_subprocess_env = lambda: {}
     if not hasattr(fake_core, "_has_systemd"):
         fake_core._has_systemd = lambda: True
+    if not hasattr(fake_core, "_is_macos"):
+        fake_core._is_macos = lambda: False
+    if not hasattr(fake_core, "create_launchagent_service"):
+        fake_core.create_launchagent_service = lambda spec, config_path=None: True
+    if not hasattr(fake_core, "load_launchagent_service"):
+        fake_core.load_launchagent_service = lambda spec: True
     monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
     sys.modules.pop("cyberwave_cli.commands.compute", None)
@@ -279,6 +285,9 @@ def test_start_non_systemd_spawns_binary(monkeypatch):
     fake_core = ModuleType("cyberwave_cli.core")
     fake_core.CLOUD_NODE_SPEC = FakeSpec()
     fake_core._has_systemd = lambda: False
+    fake_core._is_macos = lambda: False
+    fake_core.create_launchagent_service = lambda spec, config_path=None: True
+    fake_core.load_launchagent_service = lambda spec: True
     fake_core.start_service = lambda spec: None
     fake_core.enable_and_start_service = lambda spec: None
     fake_core.write_service_override = lambda spec, config_path: True
@@ -300,6 +309,45 @@ def test_start_non_systemd_spawns_binary(monkeypatch):
 
     assert len(spawned) == 1
     assert spawned[0][0] == "/usr/bin/cyberwave-cloud-node"
+
+
+def test_start_foreground_uses_resolved_service_binary(monkeypatch, tmp_path):
+    invoked: list[list[str]] = []
+    resolved_binary = tmp_path / "venv-local" / "bin" / "cyberwave-cloud-node"
+    resolved_binary.parent.mkdir(parents=True, exist_ok=True)
+    resolved_binary.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    class FakeSpec:
+        package_name = "cyberwave-cloud-node"
+        unit_name = "cyberwave-cloud-node.service"
+        unit_path = Path("/nonexistent/unit")
+        binary_path = Path("/usr/bin/cyberwave-cloud-node")
+        sudo_command_hint = "cyberwave compute install"
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.CLOUD_NODE_SPEC = FakeSpec()
+    fake_core._has_systemd = lambda: False
+    fake_core._is_macos = lambda: False
+    fake_core._resolve_service_binary = lambda spec: str(resolved_binary)
+    fake_core.create_launchagent_service = lambda spec, config_path=None: True
+    fake_core.load_launchagent_service = lambda spec: True
+    fake_core.start_service = lambda spec: None
+    fake_core.enable_and_start_service = lambda spec: None
+    fake_core.write_service_override = lambda spec, config_path: True
+
+    fake_config = ModuleType("cyberwave_cli.config")
+    fake_config.clean_subprocess_env = lambda: {}
+
+    compute = _load_compute_module(monkeypatch, fake_core, fake_config)
+    monkeypatch.setattr(
+        compute.subprocess,
+        "run",
+        lambda cmd, **_kw: invoked.append(cmd) or type("R", (), {"returncode": 0})(),
+    )
+
+    compute.start_cloud_node.callback(config_path=None, foreground=True)
+
+    assert invoked == [[str(resolved_binary)]]
 
 
 # ---- Task 7: status + logs ----

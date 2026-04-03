@@ -17,7 +17,6 @@ Example usage:
 
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -36,11 +35,10 @@ CLOUD_NODE_IDENTITY_FILE = Path.home() / ".cyberwave" / "instance_identity.json"
 
 def _find_cloud_node_binary() -> Optional[str]:
     """Locate the cyberwave-cloud-node binary."""
-    from ..core import CLOUD_NODE_SPEC
+    from ..core import CLOUD_NODE_SPEC, _resolve_service_binary
 
-    if CLOUD_NODE_SPEC.binary_path.exists():
-        return str(CLOUD_NODE_SPEC.binary_path)
-    return shutil.which(CLOUD_NODE_SPEC.package_name)
+    binary = _resolve_service_binary(CLOUD_NODE_SPEC)
+    return binary if Path(binary).exists() else None
 
 
 def _macos_launchagent_target() -> tuple[str, str]:
