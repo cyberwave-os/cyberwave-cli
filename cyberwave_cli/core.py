@@ -33,8 +33,16 @@ from .credentials import (
     load_credentials,
     save_credentials,
 )
+from .macos import init_console as _init_macos_console
+from .macos import (
+    is_macos,
+    is_usbip_server_running,
+    setup_camera_stream_server,
+    setup_usbip_server,
+)
 
 console = Console()
+_init_macos_console(console)
 
 # ---- constants ---------------------------------------------------------------
 
@@ -1716,8 +1724,13 @@ def setup_service(
     version: str | None = None,
     config_path: str | None = None,
     post_install_hook: Any = None,
+    force_reinstall: bool = False,
 ) -> bool:
     """Generic install orchestrator: install package, optionally set up Docker + systemd.
+
+    When *force_reinstall* is True, platform helpers (USB/IP server, camera
+    stream) are torn down and rebuilt from scratch instead of being skipped
+    when already running.
 
     Returns True if everything succeeded.
     """
@@ -1740,9 +1753,13 @@ def setup_service(
 
     if not linux_service_setup and not macos_launchagent_supported:
         console.print(
-            f"[yellow]{spec.package_name} service setup is only supported on Linux. "
+            f"[yellow]{spec.package_name} systemd service setup is only supported on Linux. "
             "You will need to start it manually upon restart.[/yellow]"
         )
+        if is_macos() and spec.requires_docker:
+            console.print(
+                "[dim]On macOS, USB devices are shared to Docker containers via USB/IP.[/dim]"
+            )
         if channel != "stable":
             console.print(
                 f"[red]Non-stable {spec.package_name} channels are only supported"
@@ -1790,6 +1807,26 @@ def setup_service(
         if not _install_docker():
             return False
 
+    if force_reinstall and not (is_macos() and spec.requires_docker):
+        console.print(
+            "[dim]--force-reinstall has no effect on this platform "
+            "(only applies to macOS platform helpers).[/dim]"
+        )
+
+    if is_macos() and spec.requires_docker:
+        if not setup_usbip_server(force=force_reinstall):
+            console.print(
+                "[yellow]USB/IP setup failed. USB devices will not be "
+                "available inside Docker containers.[/yellow]\n"
+                "[dim]You can retry later: cyberwave edge install[/dim]"
+            )
+        if not setup_camera_stream_server(force=force_reinstall):
+            console.print(
+                "[yellow]Camera stream setup failed. MJPEG fallback will "
+                "not be available.[/yellow]\n"
+                "[dim]You can retry later: cyberwave edge install[/dim]"
+            )
+
     if post_install_hook is not None:
         if not post_install_hook():
             return False
@@ -1821,8 +1858,12 @@ def setup_edge_core(
     skip_confirm: bool = False,
     edge_core_channel: str = "stable",
     edge_core_version: str | None = None,
+    force_reinstall: bool = False,
 ) -> bool:
     """Full setup for edge core: install the package, create the service, enable on boot.
+
+    When *force_reinstall* is True, platform helpers (USB/IP, camera stream)
+    are torn down and rebuilt from scratch.
 
     Returns True if everything succeeded.
     """
@@ -1832,4 +1873,5 @@ def setup_edge_core(
         channel=edge_core_channel,
         version=edge_core_version,
         post_install_hook=lambda: configure_edge_environment(skip_confirm=skip_confirm),
+        force_reinstall=force_reinstall,
     )

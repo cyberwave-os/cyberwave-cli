@@ -14,8 +14,18 @@ def load_core_module(monkeypatch):
     fingerprint_module = ModuleType("cyberwave.fingerprint")
     fingerprint_module.generate_fingerprint = lambda: "fingerprint-test"
 
+    edge_module = ModuleType("cyberwave.edge")
+    edge_module.__path__ = []  # type: ignore[attr-defined]
+    edge_platform_module = ModuleType("cyberwave.edge.platform")
+    edge_platform_module.USBIP_LAUNCHD_LABEL = "com.cyberwave.usbip"
+    edge_platform_module.USBIP_PORT = 3240
+    edge_platform_module.is_port_listening = lambda port, host="127.0.0.1", timeout=1: False
+    edge_platform_module.is_usbip_server_running = lambda: False
+    edge_module.platform = edge_platform_module
+
     cyberwave_module.config = config_module
     cyberwave_module.fingerprint = fingerprint_module
+    cyberwave_module.edge = edge_module
 
     rich_module = ModuleType("rich")
     rich_console_module = ModuleType("rich.console")
@@ -60,6 +70,7 @@ def load_core_module(monkeypatch):
     cli_config_module.CONFIG_DIR = Path("/tmp/cyberwave-config")
     cli_config_module.clean_subprocess_env = lambda: {}
     cli_config_module.get_api_url = lambda: "https://api.example.test"
+    cli_config_module._resolve_sudo_user_home = lambda: None
 
     credentials_module = ModuleType("cyberwave_cli.credentials")
     credentials_module.Credentials = object
@@ -69,6 +80,8 @@ def load_core_module(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "cyberwave", cyberwave_module)
     monkeypatch.setitem(sys.modules, "cyberwave.config", config_module)
+    monkeypatch.setitem(sys.modules, "cyberwave.edge", edge_module)
+    monkeypatch.setitem(sys.modules, "cyberwave.edge.platform", edge_platform_module)
     monkeypatch.setitem(sys.modules, "cyberwave.fingerprint", fingerprint_module)
     monkeypatch.setitem(sys.modules, "rich", rich_module)
     monkeypatch.setitem(sys.modules, "rich.console", rich_console_module)
@@ -77,5 +90,6 @@ def load_core_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", cli_config_module)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", credentials_module)
 
+    sys.modules.pop("cyberwave_cli.macos", None)
     sys.modules.pop("cyberwave_cli.core", None)
     return importlib.import_module("cyberwave_cli.core")

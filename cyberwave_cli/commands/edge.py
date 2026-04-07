@@ -192,7 +192,13 @@ def edge():
     default=None,
     help="Exact edge-core version to install from the selected channel",
 )
-def install_edge(yes, edge_core_channel, edge_core_version):
+@click.option(
+    "--force-reinstall",
+    is_flag=True,
+    default=False,
+    help="Tear down and reinstall platform helpers (USB/IP, camera stream) from scratch",
+)
+def install_edge(yes, edge_core_channel, edge_core_version, force_reinstall):
     """Install cyberwave-edge-core and register it as a boot service.
 
     Downloads the cyberwave-edge-core package (via apt-get on Debian/Ubuntu)
@@ -202,6 +208,7 @@ def install_edge(yes, edge_core_channel, edge_core_version):
     Examples:
         sudo cyberwave edge install
         sudo cyberwave edge install -y
+        sudo cyberwave edge install --force-reinstall
         sudo cyberwave edge install --edge-core-channel dev
         sudo cyberwave edge install --edge-core-channel staging --edge-core-version 0.0.42.595
     """
@@ -212,6 +219,7 @@ def install_edge(yes, edge_core_channel, edge_core_version):
             skip_confirm=yes,
             edge_core_channel=edge_core_channel.lower(),
             edge_core_version=edge_core_version,
+            force_reinstall=force_reinstall,
         ):
             raise SystemExit(1)
     except KeyboardInterrupt:
