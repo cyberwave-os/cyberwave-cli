@@ -111,6 +111,9 @@ def test_create_launchagent_service_writes_plist_with_config(monkeypatch, tmp_pa
         "--config",
         str(Path("/tmp/cyberwave.yml").resolve()),
     ]
+    assert plist_data["EnvironmentVariables"]["PATH"] == (
+        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    )
     assert plist_data["RunAtLoad"] is True
     assert plist_data["KeepAlive"] is True
 

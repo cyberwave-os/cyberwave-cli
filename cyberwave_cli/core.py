@@ -1495,6 +1495,9 @@ def create_launchagent_service(
     plist_data = {
         "Label": label,
         "ProgramArguments": program_arguments,
+        "EnvironmentVariables": {
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        },
         "RunAtLoad": True,
         "KeepAlive": True,
         "StandardOutPath": str(_launchagent_log_path(spec)),

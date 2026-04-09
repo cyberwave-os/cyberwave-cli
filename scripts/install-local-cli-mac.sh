@@ -26,6 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLI_SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 SDK_SRC_DIR="${REPO_ROOT}/cyberwave-sdks/cyberwave-python"
+EDGE_CORE_SRC_DIR="${REPO_ROOT}/cyberwave-edge-core"
 CLOUD_NODE_SRC_DIR="${REPO_ROOT}/cyberwave-cloud-nodes/cyberwave-cloud-node"
 
 VENV_DIR="${CYBERWAVE_LOCAL_ENV_DIR:-${HOME}/.cyberwave-cli/venv-local}"
@@ -135,6 +136,11 @@ if [ "${SDK_SOURCE}" = "local" ] && [ ! -f "${SDK_SRC_DIR}/pyproject.toml" ]; th
   exit 1
 fi
 
+if [ "${SDK_SOURCE}" = "local" ] && [ ! -f "${EDGE_CORE_SRC_DIR}/pyproject.toml" ]; then
+  echo "ERROR: Local edge-core source not found at ${EDGE_CORE_SRC_DIR}." >&2
+  exit 1
+fi
+
 # Find a Python interpreter that satisfies >=3.10.
 # Probe candidates in descending version order so we always pick the newest available.
 PYTHON3=""
@@ -175,6 +181,7 @@ echo "CLI source:        ${CLI_SRC_DIR}"
 echo "SDK source:        ${SDK_SOURCE}"
 if [ "${SDK_SOURCE}" = "local" ]; then
   echo "SDK repo:          ${SDK_SRC_DIR}"
+  echo "Edge core source:  ${EDGE_CORE_SRC_DIR}"
 fi
 echo "Cloud node source: ${CLOUD_NODE_SRC_DIR}"
 echo "Python:            ${PYTHON3} (${PYTHON3_VERSION})"
@@ -215,6 +222,17 @@ echo "Upgrading pip ..."
 if [ "${SDK_SOURCE}" = "local" ]; then
   echo "Installing local cyberwave SDK in editable mode ..."
   "${VENV_DIR}/bin/python" -m pip install --quiet -e "${SDK_SRC_DIR}"
+fi
+
+if [ -f "${EDGE_CORE_SRC_DIR}/pyproject.toml" ]; then
+  echo "Installing local cyberwave-edge-core in editable mode ..."
+  "${VENV_DIR}/bin/python" -m pip install --quiet -e "${EDGE_CORE_SRC_DIR}"
+elif [ "${SDK_SOURCE}" = "local" ]; then
+  echo "ERROR: edge-core source not found at ${EDGE_CORE_SRC_DIR}." >&2
+  exit 1
+else
+  echo "WARNING: edge-core source not found at ${EDGE_CORE_SRC_DIR} — skipping." >&2
+  echo "         'cyberwave edge install' may use a non-local package version." >&2
 fi
 
 echo "Installing local cyberwave-cli in editable mode ..."
