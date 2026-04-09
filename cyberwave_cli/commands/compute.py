@@ -58,10 +58,9 @@ def _find_cloud_node_binary() -> Optional[str]:
 
 def _macos_launchagent_target() -> tuple[str, str]:
     """Return the launchctl domain/label target for the cloud node LaunchAgent."""
-    from ..core import CLOUD_NODE_SPEC, _launchagent_label
+    from ..core import CLOUD_NODE_SPEC, _launchagent_target
 
-    domain = f"gui/{os.getuid()}"
-    return domain, f"{domain}/{_launchagent_label(CLOUD_NODE_SPEC)}"
+    return _launchagent_target(CLOUD_NODE_SPEC)
 
 
 def _ensure_macos_launchagent_installed() -> bool:

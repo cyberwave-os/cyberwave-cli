@@ -96,9 +96,12 @@ class ServiceSpec:
     keyring_path: Path
     sources_list_path: Path
     process_match: str
+    install_command_hint: str
     sudo_command_hint: str
     unit_template: str
     requires_docker: bool
+    supports_macos_launchagent: bool
+    launch_command: tuple[str, ...]
 
 
 EDGE_CORE_SPEC = ServiceSpec(
@@ -111,10 +114,13 @@ EDGE_CORE_SPEC = ServiceSpec(
     gpg_key_url=BUILDKITE_GPG_KEY_URL,
     keyring_path=BUILDKITE_KEYRING_PATH,
     sources_list_path=Path("/etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-edge-core.list"),
-    process_match="cyberwave_edge.service",
+    process_match="cyberwave-edge-core",
+    install_command_hint="cyberwave edge install",
     sudo_command_hint="sudo cyberwave edge install",
     unit_template=SYSTEMD_UNIT_TEMPLATE,
     requires_docker=True,
+    supports_macos_launchagent=True,
+    launch_command=(),
 )
 
 # ---- cloud node service constants -------------------------------------------
@@ -157,9 +163,12 @@ CLOUD_NODE_SPEC = ServiceSpec(
     keyring_path=Path("/etc/apt/keyrings/cyberwave_cyberwave-cloud-node-archive-keyring.gpg"),
     sources_list_path=Path("/etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-cloud-node.list"),
     process_match="cyberwave-cloud-node start",
+    install_command_hint="cyberwave compute install",
     sudo_command_hint="sudo cyberwave compute install",
     unit_template=_CLOUD_NODE_UNIT_TEMPLATE,
     requires_docker=False,
+    supports_macos_launchagent=True,
+    launch_command=("start",),
 )
 
 
@@ -1460,28 +1469,42 @@ def _launchagent_plist_path(spec: ServiceSpec) -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{_launchagent_label(spec)}.plist"
 
 
+def _launchagent_target(spec: ServiceSpec) -> tuple[str, str]:
+    """Return the launchctl domain/label target for a macOS LaunchAgent."""
+    domain = f"gui/{os.getuid()}"
+    return domain, f"{domain}/{_launchagent_label(spec)}"
+
+
+def _launchagent_log_path(spec: ServiceSpec) -> Path:
+    """Return the LaunchAgent log file path for the current user."""
+    return Path.home() / "Library" / "Logs" / "Cyberwave" / f"{_launchagent_label(spec)}.log"
+
+
 def create_launchagent_service(
     spec: ServiceSpec = CLOUD_NODE_SPEC,
     *,
     config_path: str | None = None,
 ) -> bool:
     """Write a LaunchAgent plist for the service on macOS."""
-    program_arguments = [_resolve_service_binary(spec), "start"]
+    program_arguments = [_resolve_service_binary(spec), *spec.launch_command]
     if config_path:
         # launchd launches from /, so config paths must be absolute.
         abs_config = str(Path(config_path).resolve())
         program_arguments.extend(["--config", abs_config])
 
-    log_dir = Path.home() / "Library" / "Logs" / "Cyberwave"
+    log_dir = _launchagent_log_path(spec).parent
     log_dir.mkdir(parents=True, exist_ok=True)
     label = _launchagent_label(spec)
     plist_data = {
         "Label": label,
         "ProgramArguments": program_arguments,
+        "EnvironmentVariables": {
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        },
         "RunAtLoad": True,
         "KeepAlive": True,
-        "StandardOutPath": str(log_dir / f"{label}.log"),
-        "StandardErrorPath": str(log_dir / f"{label}.log"),
+        "StandardOutPath": str(_launchagent_log_path(spec)),
+        "StandardErrorPath": str(_launchagent_log_path(spec)),
     }
 
     plist_path = _launchagent_plist_path(spec)
@@ -1491,7 +1514,7 @@ def create_launchagent_service(
     except PermissionError:
         console.print(
             "[red]Permission denied writing LaunchAgent plist.[/red]\n"
-            "[dim]Run 'cyberwave compute install' without sudo on macOS.[/dim]"
+            f"[dim]Run '{spec.install_command_hint}' without sudo on macOS.[/dim]"
         )
         return False
 
@@ -1507,8 +1530,7 @@ def load_launchagent_service(spec: ServiceSpec = CLOUD_NODE_SPEC) -> bool:
         return False
 
     label = _launchagent_label(spec)
-    domain = f"gui/{os.getuid()}"
-    bootout_target = f"{domain}/{label}"
+    domain, bootout_target = _launchagent_target(spec)
 
     try:
         result = subprocess.run(
@@ -1738,7 +1760,7 @@ def setup_service(
     Returns True if everything succeeded.
     """
     linux_service_setup = _is_linux()
-    macos_launchagent_supported = _is_macos() and spec.package_name == CLOUD_NODE_SPEC.package_name
+    macos_launchagent_supported = _is_macos() and spec.supports_macos_launchagent
 
     if linux_service_setup and os.geteuid() != 0:
         console.print(
@@ -1750,7 +1772,7 @@ def setup_service(
     if macos_launchagent_supported and os.geteuid() == 0:
         console.print(
             "[red]macOS LaunchAgent installs must be run without sudo.[/red]\n"
-            "[dim]Re-run as your regular user: cyberwave compute install[/dim]"
+            f"[dim]Re-run as your regular user: {spec.install_command_hint}[/dim]"
         )
         return False
 
