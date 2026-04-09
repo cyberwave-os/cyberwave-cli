@@ -107,6 +107,15 @@ def _load_compute_module(monkeypatch, fake_core=None, fake_config=None):
         fake_core._has_systemd = lambda: True
     if not hasattr(fake_core, "_is_macos"):
         fake_core._is_macos = lambda: False
+    if not hasattr(fake_core, "_launchagent_label"):
+        fake_core._launchagent_label = lambda spec: "com.cyberwave.cloud-node"
+    if not hasattr(fake_core, "_launchagent_target"):
+        fake_core._launchagent_target = lambda spec: (
+            "gui/501",
+            f"gui/501/{fake_core._launchagent_label(spec)}",
+        )
+    if not hasattr(fake_core, "_launchagent_log_path"):
+        fake_core._launchagent_log_path = lambda spec: Path.home() / "Library" / "Logs" / "Cyberwave" / f"{fake_core._launchagent_label(spec)}.log"
     if not hasattr(fake_core, "create_launchagent_service"):
         fake_core.create_launchagent_service = lambda spec, config_path=None: True
     if not hasattr(fake_core, "load_launchagent_service"):

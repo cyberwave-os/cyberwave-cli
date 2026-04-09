@@ -5,6 +5,7 @@ def _mock_is_macos(monkeypatch, core, value: bool):
     """Patch ``is_macos`` in both the core module and the macos sub-module."""
     import cyberwave_cli.macos as macos_mod
 
+    monkeypatch.setattr(core, "_is_macos", lambda: value, raising=False)
     monkeypatch.setattr(core, "is_macos", lambda: value)
     monkeypatch.setattr(macos_mod, "is_macos", lambda: value)
 
@@ -77,6 +78,7 @@ def test_setup_edge_core_macos_calls_usbip_setup(monkeypatch):
 
     monkeypatch.setattr(core, "_is_linux", lambda: False)
     _mock_is_macos(monkeypatch, core, True)
+    monkeypatch.setattr(core, "_is_macos", lambda: True)
     monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
     monkeypatch.setattr(
         core,
@@ -97,6 +99,16 @@ def test_setup_edge_core_macos_calls_usbip_setup(monkeypatch):
         core,
         "configure_edge_environment",
         lambda *, skip_confirm: True,
+    )
+    monkeypatch.setattr(
+        core,
+        "create_launchagent_service",
+        lambda spec, *, config_path=None: calls.append("plist") or True,
+    )
+    monkeypatch.setattr(
+        core,
+        "load_launchagent_service",
+        lambda spec: calls.append("launchctl") or True,
     )
 
     assert core.setup_edge_core(skip_confirm=True) is True
@@ -122,6 +134,8 @@ def test_setup_edge_core_macos_continues_when_usbip_fails(monkeypatch):
         "configure_edge_environment",
         lambda *, skip_confirm: True,
     )
+    monkeypatch.setattr(core, "create_launchagent_service", lambda spec, *, config_path=None: True)
+    monkeypatch.setattr(core, "load_launchagent_service", lambda spec: True)
 
     assert core.setup_edge_core(skip_confirm=True) is True
 
@@ -155,6 +169,8 @@ def test_setup_edge_core_force_reinstall_passes_force_to_helpers(monkeypatch):
         "configure_edge_environment",
         lambda *, skip_confirm: True,
     )
+    monkeypatch.setattr(core, "create_launchagent_service", lambda spec, *, config_path=None: True)
+    monkeypatch.setattr(core, "load_launchagent_service", lambda spec: True)
 
     assert core.setup_edge_core(skip_confirm=True, force_reinstall=True) is True
     assert usbip_kwargs == [{"force": True}]
@@ -190,7 +206,24 @@ def test_setup_edge_core_default_does_not_force(monkeypatch):
         "configure_edge_environment",
         lambda *, skip_confirm: True,
     )
+    monkeypatch.setattr(core, "create_launchagent_service", lambda spec, *, config_path=None: True)
+    monkeypatch.setattr(core, "load_launchagent_service", lambda spec: True)
 
     assert core.setup_edge_core(skip_confirm=True) is True
     assert usbip_kwargs == [{"force": False}]
     assert camera_kwargs == [{"force": False}]
+
+
+def test_setup_edge_core_macos_rejects_sudo(monkeypatch):
+    core = load_core_module(monkeypatch)
+    messages: list[str] = []
+
+    monkeypatch.setattr(core.console, "print", lambda message="", *a, **kw: messages.append(str(message)))
+    monkeypatch.setattr(core, "_is_linux", lambda: False)
+    _mock_is_macos(monkeypatch, core, True)
+    monkeypatch.setattr(core, "_is_macos", lambda: True)
+    monkeypatch.setattr(core.os, "geteuid", lambda: 0)
+
+    result = core.setup_edge_core(skip_confirm=True)
+
+    assert result is False

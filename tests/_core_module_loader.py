@@ -1,4 +1,5 @@
 import importlib
+import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -90,6 +91,20 @@ def load_core_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", cli_config_module)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", credentials_module)
 
+    package_root = Path(__file__).resolve().parents[1] / "cyberwave_cli"
+    cyberwave_cli_package = ModuleType("cyberwave_cli")
+    cyberwave_cli_package.__path__ = [str(package_root)]  # type: ignore[attr-defined]
+    sys.modules["cyberwave_cli"] = cyberwave_cli_package
+
     sys.modules.pop("cyberwave_cli.macos", None)
     sys.modules.pop("cyberwave_cli.core", None)
-    return importlib.import_module("cyberwave_cli.core")
+
+    spec = importlib.util.spec_from_file_location(
+        "cyberwave_cli.core",
+        package_root / "core.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cyberwave_cli.core"] = module
+    spec.loader.exec_module(module)
+    return module

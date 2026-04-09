@@ -171,6 +171,99 @@ def _stop_edge_driver_containers(run_command) -> list[str]:
     return containers
 
 
+def _find_edge_core_binary() -> str | None:
+    """Locate the cyberwave-edge-core binary used for process-mode startups."""
+    from ..core import EDGE_CORE_SPEC, _resolve_service_binary
+
+    return _resolve_service_binary(EDGE_CORE_SPEC)
+
+
+def _edge_process_match() -> str:
+    """Return the process match string for manual edge-core launches."""
+    from ..core import EDGE_CORE_SPEC
+
+    return EDGE_CORE_SPEC.process_match
+
+
+def _edge_process_pids() -> list[str]:
+    """Return running edge-core process IDs for non-systemd process mode."""
+    result = subprocess.run(
+        ["pgrep", "-f", _edge_process_match()],
+        capture_output=True,
+        text=True,
+    )
+    own_pid = str(os.getpid())
+    return [pid for pid in result.stdout.strip().split("\n") if pid and pid != own_pid]
+
+
+def _edge_process_logs_hint() -> str:
+    """Return the manual log guidance for process mode."""
+    return "[dim]Logs: run 'cyberwave edge start -f' to view live output.[/dim]"
+
+
+def _macos_launchagent_target() -> tuple[str, str]:
+    """Return the launchctl domain/label target for the edge LaunchAgent."""
+    from ..core import EDGE_CORE_SPEC, _launchagent_target
+
+    return _launchagent_target(EDGE_CORE_SPEC)
+
+
+def _ensure_macos_launchagent_installed() -> bool:
+    """Ensure the macOS LaunchAgent plist exists before controlling it."""
+    if _macos_launchagent_plist_path().exists():
+        return True
+    console.print(
+        "[red]LaunchAgent plist not found.[/red]\n"
+        "[dim]Run 'cyberwave edge install' first.[/dim]"
+    )
+    return False
+
+
+def _macos_launchagent_plist_path() -> Path:
+    """Return the edge LaunchAgent plist path for the current user."""
+    from ..core import EDGE_CORE_SPEC, _launchagent_plist_path
+
+    return _launchagent_plist_path(EDGE_CORE_SPEC)
+
+
+def _macos_launchagent_log_path() -> Path:
+    """Return the edge LaunchAgent log file path for the current user."""
+    from ..core import EDGE_CORE_SPEC, _launchagent_label
+
+    label = _launchagent_label(EDGE_CORE_SPEC)
+    return Path.home() / "Library" / "Logs" / "Cyberwave" / f"{label}.log"
+
+
+def _show_macos_launchagent_logs(*, follow: bool, lines: int) -> None:
+    """Show logs from the macOS LaunchAgent log file."""
+    log_path = _macos_launchagent_log_path()
+    if not log_path.exists():
+        console.print(
+            "[yellow]Edge core log file not found.[/yellow]\n"
+            f"[dim]Expected: {log_path}[/dim]\n"
+            "[dim]Run 'cyberwave edge install' to enable LaunchAgent logs, "
+            "or use 'cyberwave edge start -f' for manual process output.[/dim]"
+        )
+        return
+
+    lines_to_show = max(0, int(lines))
+    existing_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in existing_lines[-lines_to_show:]:
+        console.print(line)
+
+    if not follow:
+        return
+
+    with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+        handle.seek(0, os.SEEK_END)
+        while True:
+            line = handle.readline()
+            if line:
+                console.print(line.rstrip("\n"))
+                continue
+            time.sleep(0.5)
+
+
 @click.group()
 def edge():
     """Manage the edge node service."""
@@ -242,11 +335,12 @@ def uninstall_edge(yes):
     """
     from ..config import CONFIG_DIR
     from ..core import (
+        EDGE_CORE_SPEC,
         SYSTEMD_UNIT_NAME,
         SYSTEMD_UNIT_PATH,
+        _is_macos,
         _load_or_generate_edge_fingerprint,
         _resolve_installed_edge_core_package_name,
-        _run,
     )
     from ..credentials import load_credentials
 
@@ -265,6 +359,107 @@ def uninstall_edge(yes):
         ):
             console.print("[dim]Aborted.[/dim]")
             return
+
+    if _is_macos():
+        from ..config import clean_subprocess_env
+
+        _domain, target = _macos_launchagent_target()
+        plist_path = _macos_launchagent_plist_path()
+
+        try:
+            result = subprocess.run(
+                ["launchctl", "bootout", target],
+                env=clean_subprocess_env(),
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                console.print(f"[green]Stopped LaunchAgent:[/green] {target}")
+            elif result.returncode not in {3, 36}:
+                console.print(
+                    f"[yellow]launchctl bootout failed (exit {result.returncode}). Continuing cleanup.[/yellow]"
+                )
+        except FileNotFoundError:
+            console.print("[yellow]launchctl not found — skipping LaunchAgent unload.[/yellow]")
+
+        if plist_path.exists():
+            try:
+                plist_path.unlink()
+                console.print(f"[green]Removed:[/green] {plist_path}")
+            except PermissionError:
+                console.print(
+                    "[red]Permission denied removing LaunchAgent plist.[/red]\n"
+                    "[dim]Run 'cyberwave edge uninstall' as your regular macOS user.[/dim]"
+                )
+
+        stopped_driver_containers = _stop_edge_driver_containers(
+            lambda command, check=False: subprocess.run(
+                command,
+                check=check,
+                env=clean_subprocess_env(),
+            )
+        )
+        if stopped_driver_containers:
+            console.print(
+                f"[green]Stopped {len(stopped_driver_containers)} edge driver container(s).[/green]"
+            )
+
+        if CONFIG_DIR.exists():
+            try:
+                shutil.rmtree(CONFIG_DIR)
+                console.print(f"[green]Removed:[/green] {CONFIG_DIR}")
+            except PermissionError:
+                console.print(
+                    "[red]Permission denied removing edge config directory.[/red]\n"
+                    "[dim]Re-run as your regular user: cyberwave edge uninstall[/dim]"
+                )
+            except OSError as exc:
+                console.print(f"[yellow]Could not fully remove {CONFIG_DIR}: {exc}[/yellow]")
+
+        installed_package_name = _resolve_installed_edge_core_package_name()
+        remove_pkg = yes or Confirm.ask(
+            f"Also uninstall {installed_package_name} package?", default=False
+        )
+        if remove_pkg:
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "uninstall", "-y", installed_package_name],
+                    env=clean_subprocess_env(),
+                    check=False,
+                )
+                if result.returncode != 0:
+                    console.print(
+                        "[yellow]pip uninstall returned a non-zero exit code. "
+                        "The package may need manual removal.[/yellow]"
+                    )
+            except FileNotFoundError:
+                console.print("[yellow]pip not found — remove the package manually.[/yellow]")
+
+        deleted_count, failed_count = _delete_registered_edges_for_fingerprint(
+            fingerprint=edge_fingerprint,
+            token=token,
+            base_url=base_url,
+            workspace_uuid=workspace_uuid,
+        )
+        if deleted_count:
+            console.print(
+                "[green]Removed backend edge registration(s): "
+                f"{deleted_count} (fingerprint: {edge_fingerprint}).[/green]"
+            )
+        elif token and failed_count == 0:
+            console.print(
+                "[dim]No backend edge registration found for this fingerprint "
+                f"({edge_fingerprint}).[/dim]"
+            )
+
+        if failed_count:
+            console.print(
+                f"[yellow]Failed to remove {failed_count} backend edge registration(s).[/yellow]"
+            )
+
+        console.print(f"[green]{EDGE_CORE_SPEC.package_name} service removed.[/green]")
+        return
+
+    from ..core import _run
 
     # Stop and disable the service
     try:
@@ -351,6 +546,43 @@ def uninstall_edge(yes):
 @click.option("--foreground", "-f", is_flag=True, help="Run in foreground (don't daemonize)")
 def start_edge(env_file, foreground):
     """Start the edge node service."""
+    from ..core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, load_launchagent_service, start_service
+
+    spec = EDGE_CORE_SPEC
+
+    if not foreground and _has_systemd() and SYSTEMD_UNIT_PATH.exists():
+        if not start_service(spec):
+            raise SystemExit(1)
+        return
+
+    if not foreground and _is_macos() and _macos_launchagent_plist_path().exists():
+        from ..config import clean_subprocess_env
+
+        domain, target = _macos_launchagent_target()
+        try:
+            result = subprocess.run(
+                ["launchctl", "kickstart", "-k", target],
+                env=clean_subprocess_env(),
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                console.print(f"[green]✓ LaunchAgent started:[/green] {target}")
+                return
+            result = subprocess.run(
+                ["launchctl", "bootstrap", domain, str(_macos_launchagent_plist_path())],
+                env=clean_subprocess_env(),
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                console.print(f"[green]✓ LaunchAgent started:[/green] {target}")
+                return
+            if not load_launchagent_service(spec):
+                raise SystemExit(1)
+            return
+        except FileNotFoundError:
+            console.print("[red]launchctl not found on this system.[/red]")
+            raise SystemExit(1)
+
     env_path = Path(env_file).resolve() if env_file else Path(".env").resolve()
 
     if not env_path.exists():
@@ -368,13 +600,18 @@ def start_edge(env_file, foreground):
 
     env = clean_subprocess_env()
     env["DOTENV_PATH"] = str(env_path)
+    binary = _find_edge_core_binary()
+    if not binary:
+        console.print("[red]Error: cyberwave-edge-core binary not found[/red]")
+        console.print("[dim]Run 'cyberwave edge install' to install it first.[/dim]")
+        return
 
     try:
         if foreground:
             # Run in foreground
             console.print("[green]Running edge node in foreground (Ctrl+C to stop)...[/green]")
             subprocess.run(
-                [sys.executable, "-m", "cyberwave_edge.service"],
+                [binary],
                 cwd=work_dir,
                 env=env,
             )
@@ -382,7 +619,7 @@ def start_edge(env_file, foreground):
             # Run in background
             console.print("[green]Starting edge node in background...[/green]")
             process = subprocess.Popen(
-                [sys.executable, "-m", "cyberwave_edge.service"],
+                [binary],
                 cwd=work_dir,
                 env=env,
                 stdout=subprocess.DEVNULL,
@@ -390,13 +627,11 @@ def start_edge(env_file, foreground):
                 start_new_session=True,
             )
             console.print(f"[green]✓ Edge node started (PID: {process.pid})[/green]")
-            console.print(f"[dim]Logs: Check terminal or use 'cyberwave edge logs'[/dim]")
+            console.print(_edge_process_logs_hint())
 
     except FileNotFoundError:
-        console.print("[red]Error: cyberwave_edge package not found[/red]")
-        console.print(
-            "[dim]Install it with: pip install -e cyberwave-edges/cyberwave-edge-python[/dim]"
-        )
+        console.print(f"[red]Binary not found: {binary}[/red]")
+        console.print("[dim]Run 'cyberwave edge install' to reinstall it.[/dim]")
 
 
 @edge.command("stop")
@@ -404,22 +639,44 @@ def stop_edge():
     """Stop the edge node service."""
     import signal
 
-    from ..core import SYSTEMD_UNIT_PATH, _has_systemd, stop_service
+    from ..core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, stop_service
 
     # Prefer systemd when available
     if _has_systemd() and SYSTEMD_UNIT_PATH.exists():
         stop_service()
         return
 
+    if _is_macos() and _macos_launchagent_plist_path().exists():
+        if not _ensure_macos_launchagent_installed():
+            raise SystemExit(1)
+
+        from ..config import clean_subprocess_env
+
+        _domain, target = _macos_launchagent_target()
+        try:
+            result = subprocess.run(
+                ["launchctl", "bootout", target],
+                env=clean_subprocess_env(),
+                capture_output=True,
+            )
+        except FileNotFoundError:
+            console.print("[red]launchctl not found on this system.[/red]")
+            raise SystemExit(1)
+
+        if result.returncode == 0:
+            console.print(f"[green]✓ LaunchAgent stopped:[/green] {target}")
+            return
+
+        if result.returncode in {3, 36}:
+            console.print(f"[yellow]{EDGE_CORE_SPEC.package_name} LaunchAgent is not loaded.[/yellow]")
+            return
+
+        console.print(f"[red]launchctl bootout failed (exit {result.returncode}).[/red]")
+        raise SystemExit(1)
+
     # Fallback: find and kill background process
     try:
-        result = subprocess.run(
-            ["pgrep", "-f", "cyberwave_edge.service"],
-            capture_output=True,
-            text=True,
-        )
-        pids = result.stdout.strip().split("\n")
-        pids = [p for p in pids if p]
+        pids = _edge_process_pids()
 
         if not pids:
             console.print("[yellow]No running edge node found[/yellow]")
@@ -451,11 +708,19 @@ def restart_edge(env_file):
         sudo cyberwave edge restart
         cyberwave edge restart --env-file /path/to/.env
     """
-    from ..core import SYSTEMD_UNIT_PATH, _has_systemd, restart_service
+    from ..core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, load_launchagent_service, restart_service
 
     # Prefer systemd when available
     if _has_systemd() and SYSTEMD_UNIT_PATH.exists():
         restart_service()
+        return
+
+    if _is_macos() and _macos_launchagent_plist_path().exists():
+        if not _ensure_macos_launchagent_installed():
+            raise SystemExit(1)
+        console.print("[cyan]Restarting edge LaunchAgent...[/cyan]")
+        if not load_launchagent_service(EDGE_CORE_SPEC):
+            raise SystemExit(1)
         return
 
     # Fallback: stop running process, then start a new one
@@ -464,12 +729,7 @@ def restart_edge(env_file):
     console.print("[cyan]Restarting edge node process...[/cyan]")
 
     try:
-        result = subprocess.run(
-            ["pgrep", "-f", "cyberwave_edge.service"],
-            capture_output=True,
-            text=True,
-        )
-        pids = [p for p in result.stdout.strip().split("\n") if p]
+        pids = _edge_process_pids()
 
         for pid in pids:
             os.kill(int(pid), signal.SIGTERM)
@@ -492,10 +752,15 @@ def restart_edge(env_file):
 
     env = clean_subprocess_env()
     env["DOTENV_PATH"] = str(env_path)
+    binary = _find_edge_core_binary()
+    if not binary:
+        console.print("[red]Error: cyberwave-edge-core binary not found[/red]")
+        console.print("[dim]Run 'cyberwave edge install' to install it first.[/dim]")
+        return
 
     try:
         process = subprocess.Popen(
-            [sys.executable, "-m", "cyberwave_edge.service"],
+            [binary],
             cwd=env_path.parent,
             env=env,
             stdout=subprocess.DEVNULL,
@@ -503,34 +768,53 @@ def restart_edge(env_file):
             start_new_session=True,
         )
         console.print(f"[green]✓ Edge node restarted (PID: {process.pid})[/green]")
+        console.print(_edge_process_logs_hint())
     except FileNotFoundError:
-        console.print("[red]Error: cyberwave_edge package not found[/red]")
-        console.print(
-            "[dim]Install it with: pip install -e cyberwave-edges/cyberwave-edge-python[/dim]"
-        )
+        console.print(f"[red]Binary not found: {binary}[/red]")
+        console.print("[dim]Run 'cyberwave edge install' to reinstall it.[/dim]")
 
 
 @edge.command("status")
 def status_edge():
     """Check edge node status."""
-    from ..core import SYSTEMD_UNIT_NAME
+    from ..core import EDGE_CORE_SPEC, SYSTEMD_UNIT_NAME, _is_macos
 
-    # --- systemd service ---
-    try:
+    if _is_macos():
+        from ..config import clean_subprocess_env
+
+        _domain, target = _macos_launchagent_target()
         result = subprocess.run(
-            ["systemctl", "is-active", SYSTEMD_UNIT_NAME],
+            ["launchctl", "print", target],
             capture_output=True,
             text=True,
+            env=clean_subprocess_env(),
+            check=False,
         )
-        service_state = result.stdout.strip()  # "active", "inactive", "failed", etc.
-        if service_state == "active":
-            console.print(f"[green]✓ Service {SYSTEMD_UNIT_NAME}:[/green] active")
-        elif service_state == "failed":
-            console.print(f"[red]✗ Service {SYSTEMD_UNIT_NAME}:[/red] failed")
+        if result.returncode == 0:
+            console.print(f"[green]✓ LaunchAgent {target}:[/green] loaded")
+        elif _macos_launchagent_plist_path().exists():
+            console.print(f"[yellow]  LaunchAgent {target}:[/yellow] installed but not loaded")
         else:
-            console.print(f"[yellow]  Service {SYSTEMD_UNIT_NAME}:[/yellow] {service_state or 'not installed'}")
-    except FileNotFoundError:
-        console.print("[dim]  systemctl not found — skipping service check.[/dim]")
+            console.print(f"[yellow]  LaunchAgent {target}:[/yellow] not installed")
+    else:
+        # --- systemd service ---
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", SYSTEMD_UNIT_NAME],
+                capture_output=True,
+                text=True,
+            )
+            service_state = result.stdout.strip()  # "active", "inactive", "failed", etc.
+            if service_state == "active":
+                console.print(f"[green]✓ Service {SYSTEMD_UNIT_NAME}:[/green] active")
+            elif service_state == "failed":
+                console.print(f"[red]✗ Service {SYSTEMD_UNIT_NAME}:[/red] failed")
+            else:
+                console.print(
+                    f"[yellow]  Service {SYSTEMD_UNIT_NAME}:[/yellow] {service_state or 'not installed'}"
+                )
+        except FileNotFoundError:
+            console.print("[dim]  systemctl not found — skipping service check.[/dim]")
 
     # --- driver containers ---
     try:
@@ -849,6 +1133,13 @@ def install_deps(runtime):
 @click.option("--lines", "-n", default=50, help="Number of lines to show")
 def show_logs(follow, lines):
     """Show edge node logs."""
+    if sys.platform == "darwin":
+        try:
+            _show_macos_launchagent_logs(follow=follow, lines=lines)
+        except KeyboardInterrupt:
+            pass
+        return
+
     from ..config import clean_subprocess_env
     from ..core import SYSTEMD_UNIT_NAME
 
@@ -869,13 +1160,7 @@ def show_logs(follow, lines):
         if result.returncode != 0:
             console.print("[dim]Tip: run with sudo if you see no output.[/dim]")
     except FileNotFoundError:
-        if sys.platform == "darwin":
-            console.print(
-                "[yellow]journalctl is not available on macOS.[/yellow]\n"
-                "[dim]Run edge-core in a terminal to see logs: cyberwave-edge-core[/dim]"
-            )
-        else:
-            console.print("[red]journalctl not found. Is systemd available on this host?[/red]")
+        console.print("[red]journalctl not found. Is systemd available on this host?[/red]")
     except KeyboardInterrupt:
         pass
 
@@ -1303,7 +1588,7 @@ def _pull_single_twin_config(
     )
 
     print_success(f"Config pulled to {target_dir}/.env")
-    console.print("[dim]Run: python -m cyberwave_edge.service[/dim]")
+    console.print("[dim]Run: cyberwave edge start[/dim]")
 
 
 def _pull_environment_configs(
@@ -1398,7 +1683,7 @@ def _pull_environment_configs(
         console.print(
             f"[dim]  {len(all_configs)} config(s) from {len(twins_with_config)} twin(s)[/dim]"
         )
-        console.print("[dim]Run: python -m cyberwave_edge.service[/dim]")
+        console.print("[dim]Run: cyberwave edge start[/dim]")
     else:
         from ..utils import print_warning
 

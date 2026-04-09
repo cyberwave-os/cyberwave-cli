@@ -109,7 +109,7 @@ def test_create_launchagent_service_writes_plist_with_config(monkeypatch, tmp_pa
         str(binary_path),
         "start",
         "--config",
-        "/tmp/cyberwave.yml",
+        str(Path("/tmp/cyberwave.yml").resolve()),
     ]
     assert plist_data["RunAtLoad"] is True
     assert plist_data["KeepAlive"] is True
@@ -117,26 +117,33 @@ def test_create_launchagent_service_writes_plist_with_config(monkeypatch, tmp_pa
 
 def test_load_launchagent_service_bootstraps_current_gui_user(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
-    run_calls: list[tuple[list[str], bool]] = []
+    bootout_calls: list[list[str]] = []
+    bootstrap_calls: list[tuple[list[str], bool]] = []
     plist_path = tmp_path / "com.cyberwave.cloud-node.plist"
     plist_path.write_text("plist")
 
     monkeypatch.setattr(core, "_launchagent_plist_path", lambda spec: plist_path, raising=False)
     monkeypatch.setattr(core, "os", type("os", (), {"getuid": staticmethod(lambda: 501)})())
 
-    def fake_run(cmd, **kwargs):
-        run_calls.append((cmd, kwargs.get("check", True)))
-        if cmd[1] == "bootout":
-            return type("R", (), {"returncode": 36})()
-        return type("R", (), {"returncode": 0})()
+    def fake_subprocess_run(cmd, **_kwargs):
+        bootout_calls.append(cmd)
+        return type("R", (), {"returncode": 36})()
 
-    monkeypatch.setattr(core, "_run", fake_run)
+    monkeypatch.setattr(core.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(
+        core,
+        "_run",
+        lambda cmd, **kwargs: bootstrap_calls.append((cmd, kwargs.get("check", True)))
+        or type("R", (), {"returncode": 0})(),
+    )
 
     result = core.load_launchagent_service(core.CLOUD_NODE_SPEC)
 
     assert result is True
-    assert run_calls == [
-        (["launchctl", "bootout", "gui/501/com.cyberwave.cloud-node"], False),
+    assert bootout_calls == [
+        ["launchctl", "bootout", "gui/501/com.cyberwave.cloud-node"],
+    ]
+    assert bootstrap_calls == [
         (["launchctl", "bootstrap", "gui/501", str(plist_path)], True),
     ]
 
