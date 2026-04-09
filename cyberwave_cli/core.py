@@ -420,6 +420,7 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                         cyberwave_edge_log_level=_resolved_edge_log_level(runtime_overrides),
                         cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
                         cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
+                        cyberwave_mqtt_port=runtime_overrides.get("CYBERWAVE_MQTT_PORT"),
                     )
                 )
             return True
@@ -451,6 +452,7 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                     cyberwave_edge_log_level=_resolved_edge_log_level(runtime_overrides),
                     cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
                     cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
+                    cyberwave_mqtt_port=runtime_overrides.get("CYBERWAVE_MQTT_PORT"),
                 )
             )
             console.print("[green]✓[/green] Using CYBERWAVE_API_KEY from environment")
@@ -505,6 +507,7 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                     cyberwave_edge_log_level=_resolved_edge_log_level(runtime_overrides),
                     cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
                     cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
+                    cyberwave_mqtt_port=runtime_overrides.get("CYBERWAVE_MQTT_PORT"),
                 )
             )
 

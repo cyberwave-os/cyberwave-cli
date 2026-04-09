@@ -48,6 +48,7 @@ class Credentials:
     cyberwave_edge_log_level: Optional[str] = None
     cyberwave_base_url: Optional[str] = None
     cyberwave_mqtt_host: Optional[str] = None
+    cyberwave_mqtt_port: Optional[str] = None
 
     def runtime_envs(self) -> dict[str, str]:
         """Return persisted runtime env vars for edge/core processes."""
@@ -60,6 +61,8 @@ class Credentials:
             envs["CYBERWAVE_BASE_URL"] = self.cyberwave_base_url
         if self.cyberwave_mqtt_host:
             envs["CYBERWAVE_MQTT_HOST"] = self.cyberwave_mqtt_host
+        if self.cyberwave_mqtt_port:
+            envs["CYBERWAVE_MQTT_PORT"] = self.cyberwave_mqtt_port
         return envs
 
     def to_dict(self) -> dict[str, Any]:
@@ -106,6 +109,7 @@ class Credentials:
             cyberwave_edge_log_level=_env_value("CYBERWAVE_EDGE_LOG_LEVEL"),
             cyberwave_base_url=_env_value("CYBERWAVE_BASE_URL"),
             cyberwave_mqtt_host=_env_value("CYBERWAVE_MQTT_HOST"),
+            cyberwave_mqtt_port=_env_value("CYBERWAVE_MQTT_PORT"),
         )
 
 
@@ -117,6 +121,7 @@ def collect_runtime_env_overrides(*, api_url_override: Optional[str] = None) -> 
         "CYBERWAVE_EDGE_LOG_LEVEL",
         "CYBERWAVE_BASE_URL",
         "CYBERWAVE_MQTT_HOST",
+        "CYBERWAVE_MQTT_PORT",
     ):
         value = os.getenv(key)
         if isinstance(value, str) and value.strip():

@@ -763,6 +763,58 @@ def test_start_non_systemd_without_config_path_omits_flag(monkeypatch):
     assert "--config" not in spawned[0]
 
 
+def test_start_non_systemd_passes_runtime_envs_from_stored_credentials(monkeypatch):
+    spawned_envs: list[dict[str, str]] = []
+
+    class FakeProc:
+        pid = 33333
+
+    class FakeCredentials:
+        def runtime_envs(self):
+            return {
+                "CYBERWAVE_BASE_URL": "http://localhost:8000",
+                "CYBERWAVE_MQTT_HOST": "localhost",
+                "CYBERWAVE_MQTT_PORT": "1883",
+            }
+
+    fake_core = ModuleType("cyberwave_cli.core")
+
+    class FakeSpec:
+        package_name = "cyberwave-cloud-node"
+        unit_name = "cyberwave-cloud-node.service"
+        unit_path = Path("/nonexistent/unit")
+        binary_path = Path("/usr/bin/cyberwave-cloud-node")
+
+    fake_core.CLOUD_NODE_SPEC = FakeSpec()
+    fake_core._has_systemd = lambda: False
+    fake_core.start_service = lambda spec: None
+    fake_core.enable_and_start_service = lambda spec: None
+    fake_core.write_service_override = lambda spec, config_path: True
+
+    fake_config = ModuleType("cyberwave_cli.config")
+    fake_config.clean_subprocess_env = lambda: {"PATH": "/usr/bin"}
+
+    fake_credentials = ModuleType("cyberwave_cli.credentials")
+    fake_credentials.load_credentials = lambda: FakeCredentials()
+
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
+
+    compute = _load_compute_module(monkeypatch, fake_core, fake_config)
+    monkeypatch.setattr(compute, "_find_cloud_node_binary", lambda: "/usr/bin/cyberwave-cloud-node")
+    monkeypatch.setattr(
+        compute.subprocess,
+        "Popen",
+        lambda cmd, **kw: spawned_envs.append(kw["env"]) or FakeProc(),
+    )
+
+    compute.start_cloud_node.callback(config_path=None, foreground=False)
+
+    assert len(spawned_envs) == 1
+    assert spawned_envs[0]["CYBERWAVE_BASE_URL"] == "http://localhost:8000"
+    assert spawned_envs[0]["CYBERWAVE_MQTT_HOST"] == "localhost"
+    assert spawned_envs[0]["CYBERWAVE_MQTT_PORT"] == "1883"
+
+
 def test_start_systemd_with_config_path_calls_write_service_override(monkeypatch, tmp_path):
     """Under systemd, --config-path should call write_service_override before starting."""
     override_calls: list[tuple] = []

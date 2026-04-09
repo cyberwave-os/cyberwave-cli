@@ -247,3 +247,45 @@ def test_login_with_token_uses_api_token_context(
 
     assert result.exit_code == 0
     mock_client.get_api_token_context.assert_called_once_with("token-123")
+
+
+def test_login_with_token_persists_mqtt_runtime_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_login_module, "load_credentials", lambda: None)
+
+    saved: dict[str, object] = {}
+
+    def _save_credentials(credentials: object) -> None:
+        saved["credentials"] = credentials
+
+    monkeypatch.setattr(_login_module, "save_credentials", _save_credentials)
+    monkeypatch.setattr(
+        _login_module,
+        "collect_runtime_env_overrides",
+        lambda: {
+            "CYBERWAVE_BASE_URL": "http://localhost:8000",
+            "CYBERWAVE_MQTT_HOST": "localhost",
+            "CYBERWAVE_MQTT_PORT": "1883",
+        },
+    )
+
+    mock_cm = MagicMock()
+    mock_client = MagicMock()
+    mock_cm.__enter__.return_value = mock_client
+    mock_cm.__exit__.return_value = None
+    mock_client.get_api_token_context.return_value = APITokenContext(
+        email="user@example.com",
+        workspace_uuid="ws-1",
+        workspace_name="Main",
+    )
+    monkeypatch.setattr(_login_module, "AuthClient", lambda *args, **kwargs: mock_cm)
+
+    runner = CliRunner()
+    result = runner.invoke(_login_module.login, ["--token", "token-123"])
+
+    assert result.exit_code == 0
+    credentials = saved["credentials"]
+    assert credentials.cyberwave_base_url == "http://localhost:8000"
+    assert credentials.cyberwave_mqtt_host == "localhost"
+    assert credentials.cyberwave_mqtt_port == "1883"

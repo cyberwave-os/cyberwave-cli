@@ -103,6 +103,7 @@ def _save_login_credentials(
             cyberwave_edge_log_level=runtime_overrides.get("CYBERWAVE_EDGE_LOG_LEVEL"),
             cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
             cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
+            cyberwave_mqtt_port=runtime_overrides.get("CYBERWAVE_MQTT_PORT"),
         )
     )
 
