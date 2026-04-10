@@ -14,6 +14,7 @@ def test_show_logs_uses_clean_env_and_service_name(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
+    monkeypatch.setattr(edge_module.sys, "platform", "linux")
 
     calls = {}
 
@@ -48,6 +49,7 @@ def test_show_logs_prints_sudo_tip_on_non_zero_exit(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
+    monkeypatch.setattr(edge_module.sys, "platform", "linux")
 
     monkeypatch.setattr(
         edge_module.subprocess,

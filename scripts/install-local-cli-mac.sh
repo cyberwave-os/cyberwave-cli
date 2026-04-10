@@ -5,7 +5,7 @@
 # symlink the `cyberwave` binary into $HOME/.local/bin so it is available on PATH.
 #
 # Usage:
-#   ./scripts/install-local-cli-mac.sh
+#   ./scripts/install-local-cli-mac.sh [--sdk-source pypi|local]
 #
 # Environment variable overrides (optional):
 #   CYBERWAVE_LOCAL_ENV_DIR   venv location  (default: $HOME/.cyberwave-cli/venv-local)
@@ -25,12 +25,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The repo root is two levels above.
 CLI_SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+SDK_SRC_DIR="${REPO_ROOT}/cyberwave-sdks/cyberwave-python"
+EDGE_CORE_SRC_DIR="${REPO_ROOT}/cyberwave-edge-core"
 CLOUD_NODE_SRC_DIR="${REPO_ROOT}/cyberwave-cloud-nodes/cyberwave-cloud-node"
 
 VENV_DIR="${CYBERWAVE_LOCAL_ENV_DIR:-${HOME}/.cyberwave-cli/venv-local}"
 BIN_DIR="${CYBERWAVE_LOCAL_BIN_DIR:-${HOME}/.local/bin}"
 CLI_BINARY="${VENV_DIR}/bin/cyberwave"
 LAUNCHER_PATH="${BIN_DIR}/cyberwave"
+SDK_SOURCE="pypi"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -67,6 +70,45 @@ ensure_path_persisted() {
   export PATH="${dir}:${PATH}"
 }
 
+print_usage() {
+  cat <<EOF
+Usage: ./scripts/install-local-cli-mac.sh [--sdk-source pypi|local]
+
+Options:
+  --sdk-source pypi|local   Install the SDK from PyPI (default) or from the local repo.
+  -h, --help                Show this help message.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --sdk-source)
+      if [ "$#" -lt 2 ]; then
+        echo "ERROR: --sdk-source requires a value of 'pypi' or 'local'." >&2
+        print_usage >&2
+        exit 1
+      fi
+      SDK_SOURCE="$2"
+      shift 2
+      ;;
+    -h|--help)
+      print_usage
+      exit 0
+      ;;
+    *)
+      echo "ERROR: Unknown argument: $1" >&2
+      print_usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [ "${SDK_SOURCE}" != "pypi" ] && [ "${SDK_SOURCE}" != "local" ]; then
+  echo "ERROR: --sdk-source must be 'pypi' or 'local'." >&2
+  print_usage >&2
+  exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # Preflight checks
 # ---------------------------------------------------------------------------
@@ -86,6 +128,16 @@ fi
 if [ ! -f "${CLI_SRC_DIR}/pyproject.toml" ]; then
   echo "ERROR: Could not find pyproject.toml at ${CLI_SRC_DIR}." >&2
   echo "       Run this script from inside the cyberwave-python-cli directory tree." >&2
+  exit 1
+fi
+
+if [ "${SDK_SOURCE}" = "local" ] && [ ! -f "${SDK_SRC_DIR}/pyproject.toml" ]; then
+  echo "ERROR: Local SDK source not found at ${SDK_SRC_DIR}." >&2
+  exit 1
+fi
+
+if [ "${SDK_SOURCE}" = "local" ] && [ ! -f "${EDGE_CORE_SRC_DIR}/pyproject.toml" ]; then
+  echo "ERROR: Local edge-core source not found at ${EDGE_CORE_SRC_DIR}." >&2
   exit 1
 fi
 
@@ -126,6 +178,11 @@ fi
 
 PYTHON3_VERSION="$("$PYTHON3" --version 2>&1)"
 echo "CLI source:        ${CLI_SRC_DIR}"
+echo "SDK source:        ${SDK_SOURCE}"
+if [ "${SDK_SOURCE}" = "local" ]; then
+  echo "SDK repo:          ${SDK_SRC_DIR}"
+  echo "Edge core source:  ${EDGE_CORE_SRC_DIR}"
+fi
 echo "Cloud node source: ${CLOUD_NODE_SRC_DIR}"
 echo "Python:            ${PYTHON3} (${PYTHON3_VERSION})"
 echo "Venv:              ${VENV_DIR}"
@@ -161,6 +218,22 @@ echo "Upgrading pip ..."
 # ---------------------------------------------------------------------------
 # Editable installs of local sources
 # ---------------------------------------------------------------------------
+
+if [ "${SDK_SOURCE}" = "local" ]; then
+  echo "Installing local cyberwave SDK in editable mode ..."
+  "${VENV_DIR}/bin/python" -m pip install --quiet -e "${SDK_SRC_DIR}"
+fi
+
+if [ -f "${EDGE_CORE_SRC_DIR}/pyproject.toml" ]; then
+  echo "Installing local cyberwave-edge-core in editable mode ..."
+  "${VENV_DIR}/bin/python" -m pip install --quiet -e "${EDGE_CORE_SRC_DIR}"
+elif [ "${SDK_SOURCE}" = "local" ]; then
+  echo "ERROR: edge-core source not found at ${EDGE_CORE_SRC_DIR}." >&2
+  exit 1
+else
+  echo "WARNING: edge-core source not found at ${EDGE_CORE_SRC_DIR} — skipping." >&2
+  echo "         'cyberwave edge install' may use a non-local package version." >&2
+fi
 
 echo "Installing local cyberwave-cli in editable mode ..."
 "${VENV_DIR}/bin/python" -m pip install --quiet -e "${CLI_SRC_DIR}"

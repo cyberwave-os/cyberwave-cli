@@ -6,22 +6,31 @@ host USB devices (e.g. serial motor controllers) via USB/IP passthrough.
 Also provides an optional MJPEG camera stream server for cases where
 USB/IP video bandwidth is insufficient (cameras are forwarded as an
 HTTP MJPEG stream instead of raw USB passthrough).
+
+Includes a launchd LaunchAgent for edge-core so that the ``cyberwave edge``
+CLI commands (start/stop/restart/status/logs) work identically to
+the systemd-based experience on Linux.
 """
 
 import os
 import platform
+import re
 import shutil
 import subprocess
+import sys
 import textwrap
 import time
 from pathlib import Path
 from typing import Any, Optional
+from xml.sax.saxutils import escape as _xml_escape
 
 from cyberwave.edge.platform import (
     USBIP_LAUNCHD_LABEL,
     USBIP_PORT,
-    is_port_listening as _is_port_listening,
     is_usbip_server_running,
+)
+from cyberwave.edge.platform import (
+    is_port_listening as _is_port_listening,
 )
 from rich.console import Console
 
@@ -126,6 +135,22 @@ def _run(cmd: list[str], *, check: bool = True, **kwargs: Any) -> subprocess.Com
     return subprocess.run(cmd, check=check, **kwargs)
 
 
+def _launchctl_as_user(args: list[str]) -> list[str]:
+    """Build a launchctl command that targets the real user's domain.
+
+    When running as root (e.g. via ``sudo cyberwave edge install``),
+    ``launchctl bootstrap gui/<uid>`` fails because root can't
+    register into another user's GUI domain.  Wrapping with
+    ``sudo -u <real_user>`` drops privileges so launchd accepts the
+    request.
+    """
+    if os.getuid() == 0:
+        username, _, _ = _resolve_real_user()
+        if username:
+            return ["sudo", "-u", username, "launchctl", *args]
+    return ["launchctl", *args]
+
+
 def _resolve_real_user() -> tuple[Optional[str], Optional[int], Optional[int]]:
     """Return (username, uid, gid) for the real user, even under sudo."""
     sudo_user = os.getenv("SUDO_USER", "").strip()
@@ -171,6 +196,79 @@ def _chown_to_real_user(path: Path, *, recursive: bool = False) -> None:
                 pass
     except OSError:
         pass
+
+
+def _fix_user_dir_ownership(dir_path: Path) -> None:
+    """Reclaim ownership of *dir_path* if it was left root-owned by a prior sudo run."""
+    username, real_uid, _ = _resolve_real_user()
+    if real_uid is None:
+        return
+    try:
+        stat = dir_path.stat()
+        if stat.st_uid != real_uid:
+            subprocess.run(
+                ["sudo", "chown", username or str(real_uid), str(dir_path)],
+                check=True,
+                capture_output=True,
+            )
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+
+def _write_file_as_real_user(
+    path: Path, contents: str, *, mode: Optional[int] = None
+) -> None:
+    """Write *contents* to *path*, handling ownership mismatches.
+
+    When running as root (``sudo``), temporarily drops the effective
+    UID/GID to the invoking user so that files in ``~/Library/`` are
+    created with the correct owner.
+
+    When a prior ``sudo`` run left the parent directory or target file
+    owned by root, reclaims ownership before writing.
+    """
+    _, real_uid, real_gid = _resolve_real_user()
+    my_uid = real_uid if real_uid is not None else os.getuid()
+    need_drop = os.getuid() == 0 and real_uid is not None and real_uid != 0
+
+    # Fix parent directory ownership if it's owned by root (common after
+    # a previous ``sudo cyberwave edge install``).
+    parent = path.parent
+    if parent.exists():
+        _fix_user_dir_ownership(parent)
+
+    # Remove an existing file owned by a different user.
+    if path.exists():
+        try:
+            stat = path.stat()
+            if stat.st_uid != my_uid:
+                try:
+                    path.unlink()
+                except OSError:
+                    subprocess.run(
+                        ["sudo", "rm", "-f", str(path)],
+                        check=True,
+                        capture_output=True,
+                    )
+        except (OSError, subprocess.CalledProcessError):
+            pass
+
+    saved_euid = os.geteuid()
+    saved_egid = os.getegid()
+
+    try:
+        if need_drop:
+            os.setegid(real_gid or saved_egid)
+            os.seteuid(real_uid)  # type: ignore[arg-type]
+
+        parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
+        if mode is not None:
+            path.chmod(mode)
+    finally:
+        if need_drop:
+            os.seteuid(saved_euid)
+            os.setegid(saved_egid)
 
 
 def _strip_xattrs(path: Path) -> None:
@@ -315,21 +413,17 @@ def _create_usbip_launchd_service() -> bool:
 
     if gui_domain:
         try:
-            _run(["launchctl", "bootstrap", gui_domain, str(plist_path)])
+            _run(_launchctl_as_user(["bootstrap", gui_domain, str(plist_path)]))
         except subprocess.CalledProcessError:
-            console.print(
-                "[yellow]launchctl bootstrap failed, falling back to load...[/yellow]"
-            )
+            console.print("[yellow]launchctl bootstrap failed, falling back to load...[/yellow]")
             try:
-                _run(["launchctl", "load", str(plist_path)])
+                _run(_launchctl_as_user(["load", str(plist_path)]))
             except subprocess.CalledProcessError as exc:
-                console.print(
-                    f"[red]Failed to load launchd service (exit {exc.returncode}).[/red]"
-                )
+                console.print(f"[red]Failed to load launchd service (exit {exc.returncode}).[/red]")
                 return False
     else:
         try:
-            _run(["launchctl", "load", str(plist_path)])
+            _run(_launchctl_as_user(["load", str(plist_path)]))
         except subprocess.CalledProcessError as exc:
             console.print(f"[red]Failed to load launchd service (exit {exc.returncode}).[/red]")
             return False
@@ -337,9 +431,7 @@ def _create_usbip_launchd_service() -> bool:
     max_wait_secs = 10
     for i in range(max_wait_secs * 2):
         if _is_port_listening(USBIP_PORT):
-            console.print(
-                f"[green]USB/IP server is running ({USBIP_LAUNCHD_LABEL}).[/green]"
-            )
+            console.print(f"[green]USB/IP server is running ({USBIP_LAUNCHD_LABEL}).[/green]")
             break
         time.sleep(0.5)
     else:
@@ -365,7 +457,7 @@ def _bootout_launchd_service(label: str) -> None:
         if bootout_target:
             try:
                 subprocess.run(
-                    ["launchctl", "bootout", bootout_target],
+                    _launchctl_as_user(["bootout", bootout_target]),
                     capture_output=True,
                     timeout=10,
                 )
@@ -448,16 +540,19 @@ CAMERA_STREAM_PORT = 8091
 _CAMERA_STREAM_WRAPPER_TEMPLATE = textwrap.dedent("""\
     #!/bin/bash
     # Cyberwave camera stream — captures from macOS camera and serves MJPEG.
-    # Device index and port are configurable via env vars.
+    # launchd uses a minimal PATH; ensure Homebrew paths are included.
+    export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
     DEVICE="${{CYBERWAVE_CAMERA_DEVICE:-0}}"
     PORT="${{CYBERWAVE_CAMERA_STREAM_PORT:-{port}}}"
-    RESOLUTION="${{CYBERWAVE_CAMERA_STREAM_RESOLUTION:-640x480}}"
+    RESOLUTION="${{CYBERWAVE_CAMERA_STREAM_RESOLUTION:-1280x720}}"
     FPS="${{CYBERWAVE_CAMERA_STREAM_FPS:-30}}"
 
     exec ffmpeg -hide_banner -loglevel warning \\
+        -fflags nobuffer -flags low_delay -avioflags direct \\
         -f avfoundation -framerate "$FPS" -video_size "$RESOLUTION" \\
-        -i "$DEVICE" \\
+        -thread_queue_size 1 -i "$DEVICE" \\
         -c:v mjpeg -q:v 5 \\
+        -fflags nobuffer -flush_packets 1 \\
         -f mjpeg \\
         -listen 1 \\
         "http://0.0.0.0:$PORT"
@@ -475,10 +570,15 @@ _CAMERA_STREAM_PLIST_TEMPLATE = textwrap.dedent("""\
         <array>
             <string>{wrapper_path}</string>
         </array>
+        <key>EnvironmentVariables</key>
+        <dict>
+            <key>CYBERWAVE_CAMERA_DEVICE</key>
+            <string>{device_name}</string>
+        </dict>
         <key>RunAtLoad</key>
-        <false/>
+        <true/>
         <key>KeepAlive</key>
-        <false/>
+        <true/>
         <key>StandardOutPath</key>
         <string>{log_path}</string>
         <key>StandardErrorPath</key>
@@ -493,12 +593,7 @@ def _camera_stream_wrapper_path() -> Path:
 
 
 def _camera_stream_plist_path() -> Path:
-    return (
-        _user_home()
-        / "Library"
-        / "LaunchAgents"
-        / f"{CAMERA_STREAM_LAUNCHD_LABEL}.plist"
-    )
+    return _user_home() / "Library" / "LaunchAgents" / f"{CAMERA_STREAM_LAUNCHD_LABEL}.plist"
 
 
 def _camera_stream_log_path() -> Path:
@@ -507,6 +602,41 @@ def _camera_stream_log_path() -> Path:
 
 def _has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
+
+
+def _list_avfoundation_devices() -> list[tuple[int, str]]:
+    """Return available AVFoundation video devices as ``[(index, name), ...]``.
+
+    Parses the stderr output of ``ffmpeg -f avfoundation -list_devices true``.
+    Returns an empty list on failure.
+    """
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={
+                **os.environ,
+                "PATH": f"/opt/homebrew/bin:/usr/local/bin:{os.environ.get('PATH', '')}",
+            },
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+    devices: list[tuple[int, str]] = []
+    in_video_section = False
+    for line in result.stderr.splitlines():
+        if "AVFoundation video devices:" in line:
+            in_video_section = True
+            continue
+        if "AVFoundation audio devices:" in line:
+            break
+        if in_video_section:
+            m = re.search(r"\[(\d+)] (.+)$", line)
+            if m:
+                devices.append((int(m.group(1)), m.group(2).strip()))
+    return devices
 
 
 def is_camera_stream_running() -> bool:
@@ -521,6 +651,20 @@ def _teardown_camera_stream_server() -> None:
 
     _bootout_launchd_service(CAMERA_STREAM_LAUNCHD_LABEL)
 
+    # Kill any lingering ffmpeg camera-stream processes that survived bootout.
+    for _ in range(5):
+        result = subprocess.run(
+            ["pgrep", "-f", "ffmpeg.*avfoundation"],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            break
+        subprocess.run(
+            ["pkill", "-f", "ffmpeg.*avfoundation"],
+            capture_output=True,
+        )
+        time.sleep(0.5)
+
     for path in [
         _camera_stream_plist_path(),
         _camera_stream_wrapper_path(),
@@ -534,7 +678,11 @@ def _teardown_camera_stream_server() -> None:
     console.print("[green]Camera stream server teardown complete.[/green]")
 
 
-def setup_camera_stream_server(*, force: bool = False) -> bool:
+def setup_camera_stream_server(
+    *,
+    force: bool = False,
+    device_index: Optional[int] = None,
+) -> bool:
     """Install the optional MJPEG camera stream server on macOS.
 
     This is a fallback for when USB/IP bandwidth is insufficient for
@@ -542,6 +690,9 @@ def setup_camera_stream_server(*, force: bool = False) -> bool:
     serves an HTTP MJPEG stream that Docker containers consume.
 
     When *force* is True, the existing installation is torn down first.
+    *device_index* selects the AVFoundation camera; when ``None``, the
+    user is prompted interactively (or ``0`` is used when only one camera
+    is available).
 
     Returns True on success.  Returns True immediately on non-macOS.
     """
@@ -566,9 +717,49 @@ def setup_camera_stream_server(*, force: bool = False) -> bool:
     console.print(
         "\n[bold]Camera Stream Server Setup[/bold]\n"
         "This creates an MJPEG stream from your macOS camera that Docker\n"
-        "containers can consume. Use this when USB/IP camera bandwidth is\n"
-        "insufficient.\n"
+        "containers can consume.\n"
     )
+
+    # --- camera device selection ---
+    # AVFoundation numeric indices are unstable (they shift when devices
+    # connect/disconnect), so we resolve and store the *device name* which
+    # ffmpeg also accepts via ``-i``.
+    device_name: Optional[str] = None
+    if device_index is None:
+        cameras = _list_avfoundation_devices()
+        if not cameras:
+            console.print(
+                "[yellow]Could not detect AVFoundation cameras; defaulting to device 0.[/yellow]"
+            )
+            device_name = "0"
+        elif len(cameras) == 1:
+            device_name = cameras[0][1]
+            console.print(f"[cyan]Detected camera:[/cyan] {device_name}")
+        else:
+            console.print("[cyan]Available cameras:[/cyan]")
+            for idx, name in cameras:
+                console.print(f"  [bold]{idx}[/bold]) {name}")
+            valid_indices = {i for i, _ in cameras}
+            raw = input(f"Enter camera number [{cameras[0][0]}]: ").strip()
+            if raw == "":
+                chosen_idx = cameras[0][0]
+            else:
+                try:
+                    chosen_idx = int(raw)
+                except ValueError:
+                    console.print("[red]Invalid selection.[/red]")
+                    return False
+            if chosen_idx not in valid_indices:
+                console.print(
+                    f"[red]Camera index {chosen_idx} is not available.[/red]"
+                )
+                return False
+            device_name = next(
+                (n for i, n in cameras if i == chosen_idx), str(chosen_idx)
+            )
+            console.print(f"[green]Selected:[/green] {device_name}")
+    else:
+        device_name = str(device_index)
 
     wrapper_path = _camera_stream_wrapper_path()
     plist_path = _camera_stream_plist_path()
@@ -576,10 +767,7 @@ def setup_camera_stream_server(*, force: bool = False) -> bool:
 
     wrapper_contents = _CAMERA_STREAM_WRAPPER_TEMPLATE.format(port=CAMERA_STREAM_PORT)
     try:
-        wrapper_path.parent.mkdir(parents=True, exist_ok=True)
-        wrapper_path.write_text(wrapper_contents)
-        wrapper_path.chmod(0o755)
-        _chown_to_real_user(wrapper_path)
+        _write_file_as_real_user(wrapper_path, wrapper_contents, mode=0o755)
     except OSError as exc:
         console.print(f"[red]Failed to create camera stream script: {exc}[/red]")
         return False
@@ -588,21 +776,330 @@ def setup_camera_stream_server(*, force: bool = False) -> bool:
         label=CAMERA_STREAM_LAUNCHD_LABEL,
         wrapper_path=str(wrapper_path),
         log_path=str(log_path),
+        device_name=_xml_escape(device_name),
     )
 
     try:
-        plist_path.parent.mkdir(parents=True, exist_ok=True)
-        plist_path.write_text(plist_contents)
-        _chown_to_real_user(plist_path)
+        _write_file_as_real_user(plist_path, plist_contents)
     except OSError as exc:
         console.print(f"[red]Failed to write camera stream plist: {exc}[/red]")
         return False
 
     console.print(f"[green]Created:[/green] {plist_path}")
-    console.print(
-        f"\n[cyan]To start the camera stream manually:[/cyan]\n"
-        f"  launchctl load {plist_path}\n"
-        f"\nThe stream will be available at:\n"
-        f"  http://host.docker.internal:{CAMERA_STREAM_PORT}\n"
+
+    _, real_uid, _ = _resolve_real_user()
+    gui_domain = f"gui/{real_uid}" if real_uid is not None else None
+
+    _bootout_launchd_service(CAMERA_STREAM_LAUNCHD_LABEL)
+
+    if gui_domain:
+        try:
+            _run(_launchctl_as_user(["bootstrap", gui_domain, str(plist_path)]))
+        except subprocess.CalledProcessError:
+            console.print("[yellow]launchctl bootstrap failed, falling back to load...[/yellow]")
+            try:
+                _run(_launchctl_as_user(["load", str(plist_path)]))
+            except subprocess.CalledProcessError as exc:
+                console.print(
+                    f"[red]Failed to load camera stream service (exit {exc.returncode}).[/red]"
+                )
+                return False
+    else:
+        try:
+            _run(_launchctl_as_user(["load", str(plist_path)]))
+        except subprocess.CalledProcessError as exc:
+            console.print(
+                f"[red]Failed to load camera stream service (exit {exc.returncode}).[/red]"
+            )
+            return False
+
+    max_wait_secs = 10
+    for _ in range(max_wait_secs * 2):
+        if is_camera_stream_running():
+            console.print(
+                f"[green]Camera stream server running on port {CAMERA_STREAM_PORT} "
+                f"({CAMERA_STREAM_LAUNCHD_LABEL}).[/green]"
+            )
+            break
+        time.sleep(0.5)
+    else:
+        console.print(
+            f"[yellow]Camera stream service loaded but port {CAMERA_STREAM_PORT} is not "
+            f"listening after {max_wait_secs}s. Check logs at {log_path}[/yellow]"
+        )
+
+    stream_url = f"http://host.docker.internal:{CAMERA_STREAM_PORT}"
+    try:
+        from .credentials import upsert_runtime_env
+
+        upsert_runtime_env("CYBERWAVE_MACOS_CAMERA_STREAM_URL", stream_url)
+        console.print(
+            f"[green]Saved[/green] CYBERWAVE_MACOS_CAMERA_STREAM_URL={stream_url} "
+            "to credentials.json"
+        )
+    except Exception as exc:
+        console.print(
+            f"[yellow]Could not persist camera stream URL: {exc}[/yellow]\n"
+            f"[dim]Set manually: export CYBERWAVE_MACOS_CAMERA_STREAM_URL={stream_url}[/dim]"
+        )
+
+    return True
+
+
+# ---- Edge-core launchd service -----------------------------------------------
+# LaunchAgent for cyberwave-edge-core, giving macOS the same
+# start/stop/restart/status/logs experience as systemd on Linux.
+
+EDGE_CORE_LAUNCHD_LABEL = "com.cyberwave.edge-core"
+
+_EDGE_CORE_WRAPPER_TEMPLATE = textwrap.dedent("""\
+    #!/bin/bash
+    # Cyberwave edge-core — launched by launchd as a background service.
+    # launchd uses a minimal PATH; include Homebrew and Docker paths.
+    export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+    exec {python_path} -m cyberwave_edge_core.main
+""")
+
+_EDGE_CORE_PLIST_TEMPLATE = textwrap.dedent("""\
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+      "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>{label}</string>
+        <key>ProgramArguments</key>
+        <array>
+            <string>{wrapper_path}</string>
+        </array>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>KeepAlive</key>
+        <true/>
+        <key>StandardOutPath</key>
+        <string>{log_path}</string>
+        <key>StandardErrorPath</key>
+        <string>{log_path}</string>
+    </dict>
+    </plist>
+""")
+
+
+def _edge_core_wrapper_path() -> Path:
+    return _user_home() / ".cyberwave" / "edge_core.sh"
+
+
+def edge_core_plist_path() -> Path:
+    return (
+        _user_home()
+        / "Library"
+        / "LaunchAgents"
+        / f"{EDGE_CORE_LAUNCHD_LABEL}.plist"
     )
+
+
+def edge_core_log_path() -> Path:
+    return _user_home() / "Library" / "Logs" / "cyberwave" / "edge-core.log"
+
+
+def is_edge_core_service_loaded() -> bool:
+    """Return True when the edge-core LaunchAgent is loaded in launchd."""
+    _, real_uid, _ = _resolve_real_user()
+    uid = real_uid if real_uid is not None else os.getuid()
+    try:
+        result = subprocess.run(
+            _launchctl_as_user(["print", f"gui/{uid}/{EDGE_CORE_LAUNCHD_LABEL}"]),
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+    except OSError:
+        return False
+
+
+def is_edge_core_service_running() -> bool:
+    """Return True when edge-core's launchd job has a running PID."""
+    _, real_uid, _ = _resolve_real_user()
+    uid = real_uid if real_uid is not None else os.getuid()
+    try:
+        result = subprocess.run(
+            _launchctl_as_user(["print", f"gui/{uid}/{EDGE_CORE_LAUNCHD_LABEL}"]),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return False
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("pid = ") or stripped.startswith("pid =\t"):
+                pid_val = stripped.split("=", 1)[1].strip()
+                return pid_val.isdigit() and int(pid_val) > 0
+        return False
+    except OSError:
+        return False
+
+
+def teardown_edge_core_launchd_service() -> None:
+    """Stop the edge-core LaunchAgent and remove all related artifacts."""
+    console = _get_console()
+    console.print("[cyan]Tearing down edge-core launchd service...[/cyan]")
+
+    _bootout_launchd_service(EDGE_CORE_LAUNCHD_LABEL)
+
+    for path in [
+        edge_core_plist_path(),
+        _edge_core_wrapper_path(),
+    ]:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            console.print(f"[yellow]Could not remove {path}[/yellow]")
+
+    console.print("[green]Edge-core launchd service teardown complete.[/green]")
+
+
+def start_edge_core_service() -> bool:
+    """Start (or restart) the edge-core LaunchAgent."""
+    console = _get_console()
+    _, real_uid, _ = _resolve_real_user()
+    uid = real_uid if real_uid is not None else os.getuid()
+
+    if not edge_core_plist_path().exists():
+        console.print(
+            "[red]Edge-core LaunchAgent not installed. "
+            "Run 'cyberwave edge install' first.[/red]"
+        )
+        return False
+
+    if is_edge_core_service_loaded():
+        try:
+            _run(
+                _launchctl_as_user(
+                    ["kickstart", "-k", f"gui/{uid}/{EDGE_CORE_LAUNCHD_LABEL}"]
+                ),
+                check=True,
+            )
+            console.print("[green]Edge-core service restarted.[/green]")
+            return True
+        except subprocess.CalledProcessError:
+            pass
+
+    gui_domain = f"gui/{uid}"
+    try:
+        _run(
+            _launchctl_as_user(["bootstrap", gui_domain, str(edge_core_plist_path())]),
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        try:
+            _run(
+                _launchctl_as_user(["load", str(edge_core_plist_path())]),
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            console.print(
+                f"[red]Failed to start edge-core service (exit {exc.returncode}).[/red]"
+            )
+            return False
+
+    console.print("[green]Edge-core service started.[/green]")
+    return True
+
+
+def stop_edge_core_service() -> bool:
+    """Stop the edge-core LaunchAgent."""
+    console = _get_console()
+    if not is_edge_core_service_loaded():
+        console.print("[yellow]Edge-core service is not running.[/yellow]")
+        return True
+
+    _bootout_launchd_service(EDGE_CORE_LAUNCHD_LABEL)
+    console.print("[green]Edge-core service stopped.[/green]")
+    return True
+
+
+def setup_edge_core_launchd_service(*, force: bool = False) -> bool:
+    """Install and start the edge-core LaunchAgent on macOS.
+
+    Creates a wrapper script (with the absolute Python path baked in)
+    and a launchd plist, then bootstraps the service.
+
+    Returns True on success.  Returns True immediately on non-macOS.
+    """
+    if not is_macos():
+        return True
+
+    console = _get_console()
+
+    if force:
+        teardown_edge_core_launchd_service()
+    elif is_edge_core_service_running():
+        console.print("[green]Edge-core service is already running.[/green]")
+        return True
+
+    wrapper_path = _edge_core_wrapper_path()
+    plist_path = edge_core_plist_path()
+    log_path = edge_core_log_path()
+
+    # Ensure the log directory exists (launchd won't create it).
+    try:
+        _write_file_as_real_user(log_path, "", mode=0o644)
+    except OSError:
+        pass
+
+    python_path = sys.executable
+    wrapper_contents = _EDGE_CORE_WRAPPER_TEMPLATE.format(python_path=python_path)
+    try:
+        _write_file_as_real_user(wrapper_path, wrapper_contents, mode=0o755)
+    except OSError as exc:
+        console.print(f"[red]Failed to create edge-core wrapper script: {exc}[/red]")
+        return False
+
+    plist_contents = _EDGE_CORE_PLIST_TEMPLATE.format(
+        label=EDGE_CORE_LAUNCHD_LABEL,
+        wrapper_path=str(wrapper_path),
+        log_path=str(log_path),
+    )
+    try:
+        _write_file_as_real_user(plist_path, plist_contents)
+    except OSError as exc:
+        console.print(f"[red]Failed to create edge-core plist: {exc}[/red]")
+        return False
+
+    console.print(f"Created: {plist_path}")
+
+    _bootout_launchd_service(EDGE_CORE_LAUNCHD_LABEL)
+
+    _, real_uid, _ = _resolve_real_user()
+    uid = real_uid if real_uid is not None else os.getuid()
+    gui_domain = f"gui/{uid}"
+
+    try:
+        _run(_launchctl_as_user(["bootstrap", gui_domain, str(plist_path)]))
+    except subprocess.CalledProcessError:
+        console.print(
+            "[yellow]launchctl bootstrap failed, falling back to load...[/yellow]"
+        )
+        try:
+            _run(_launchctl_as_user(["load", str(plist_path)]))
+        except subprocess.CalledProcessError as exc:
+            console.print(
+                f"[red]Failed to load edge-core service (exit {exc.returncode}).[/red]"
+            )
+            return False
+
+    max_wait_secs = 5
+    for _ in range(max_wait_secs * 2):
+        if is_edge_core_service_running():
+            console.print(
+                f"[green]Edge-core service running ({EDGE_CORE_LAUNCHD_LABEL}).[/green]"
+            )
+            break
+        time.sleep(0.5)
+    else:
+        console.print(
+            f"[yellow]Edge-core service loaded but process not detected after "
+            f"{max_wait_secs}s. Check logs: {log_path}[/yellow]"
+        )
+
     return True

@@ -28,10 +28,7 @@ def _raise_permission_error() -> None:
         cmd = " ".join(parts)
     except RuntimeError:
         cmd = "cyberwave edge install"
-    _console.print(
-        "[red]Root privileges required.[/red]\n"
-        f"[dim]Re-run with sudo: sudo {cmd}[/dim]"
-    )
+    _console.print(f"[red]Root privileges required.[/red]\n[dim]Re-run with sudo: sudo {cmd}[/dim]")
     raise SystemExit(1)
 
 
@@ -48,6 +45,7 @@ class Credentials:
     cyberwave_edge_log_level: Optional[str] = None
     cyberwave_base_url: Optional[str] = None
     cyberwave_mqtt_host: Optional[str] = None
+    cyberwave_mqtt_port: Optional[str] = None
 
     def runtime_envs(self) -> dict[str, str]:
         """Return persisted runtime env vars for edge/core processes."""
@@ -60,6 +58,8 @@ class Credentials:
             envs["CYBERWAVE_BASE_URL"] = self.cyberwave_base_url
         if self.cyberwave_mqtt_host:
             envs["CYBERWAVE_MQTT_HOST"] = self.cyberwave_mqtt_host
+        if self.cyberwave_mqtt_port:
+            envs["CYBERWAVE_MQTT_PORT"] = self.cyberwave_mqtt_port
         return envs
 
     def to_dict(self) -> dict[str, Any]:
@@ -106,6 +106,7 @@ class Credentials:
             cyberwave_edge_log_level=_env_value("CYBERWAVE_EDGE_LOG_LEVEL"),
             cyberwave_base_url=_env_value("CYBERWAVE_BASE_URL"),
             cyberwave_mqtt_host=_env_value("CYBERWAVE_MQTT_HOST"),
+            cyberwave_mqtt_port=_env_value("CYBERWAVE_MQTT_PORT"),
         )
 
 
@@ -117,6 +118,7 @@ def collect_runtime_env_overrides(*, api_url_override: Optional[str] = None) -> 
         "CYBERWAVE_EDGE_LOG_LEVEL",
         "CYBERWAVE_BASE_URL",
         "CYBERWAVE_MQTT_HOST",
+        "CYBERWAVE_MQTT_PORT",
     ):
         value = os.getenv(key)
         if isinstance(value, str) and value.strip():
@@ -212,6 +214,39 @@ def clear_credentials() -> None:
     """Remove stored credentials."""
     if CREDENTIALS_FILE.exists():
         CREDENTIALS_FILE.unlink()
+
+
+def upsert_runtime_env(key: str, value: str) -> None:
+    """Set a single runtime env var in credentials.json without a full save.
+
+    Creates the ``envs`` dict if it doesn't exist yet.  Other fields
+    (token, email, etc.) are preserved as-is.
+    """
+    ensure_config_dir()
+    data: dict[str, Any] = {}
+    try:
+        if CREDENTIALS_FILE.exists():
+            with open(CREDENTIALS_FILE) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+    except (json.JSONDecodeError, OSError):
+        pass
+
+    envs = data.get("envs")
+    if not isinstance(envs, dict):
+        envs = {}
+    envs[key] = value
+    data["envs"] = envs
+
+    with open(CREDENTIALS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+    if os.name != "nt":
+        try:
+            os.chmod(CREDENTIALS_FILE, 0o600)
+        except PermissionError:
+            pass
 
 
 def get_token() -> Optional[str]:

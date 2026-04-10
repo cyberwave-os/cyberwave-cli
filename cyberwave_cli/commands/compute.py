@@ -33,6 +33,21 @@ console = Console()
 CLOUD_NODE_IDENTITY_FILE = Path.home() / ".cyberwave" / "instance_identity.json"
 
 
+def _runtime_envs_from_credentials() -> dict[str, str]:
+    """Return stored runtime envs shared with cloud-node launches."""
+    try:
+        from ..credentials import load_credentials
+    except Exception:
+        return {}
+
+    creds = load_credentials()
+    if not creds or not hasattr(creds, "runtime_envs"):
+        return {}
+
+    runtime_envs = creds.runtime_envs()
+    return runtime_envs if isinstance(runtime_envs, dict) else {}
+
+
 def _find_cloud_node_binary() -> Optional[str]:
     """Locate the cyberwave-cloud-node binary."""
     from ..core import CLOUD_NODE_SPEC, _resolve_service_binary
@@ -43,10 +58,9 @@ def _find_cloud_node_binary() -> Optional[str]:
 
 def _macos_launchagent_target() -> tuple[str, str]:
     """Return the launchctl domain/label target for the cloud node LaunchAgent."""
-    from ..core import CLOUD_NODE_SPEC, _launchagent_label
+    from ..core import CLOUD_NODE_SPEC, _launchagent_target
 
-    domain = f"gui/{os.getuid()}"
-    return domain, f"{domain}/{_launchagent_label(CLOUD_NODE_SPEC)}"
+    return _launchagent_target(CLOUD_NODE_SPEC)
 
 
 def _ensure_macos_launchagent_installed() -> bool:
@@ -357,10 +371,12 @@ def start_cloud_node(
         cmd: list[str] = [binary]
         if config_path:
             cmd += ["--config", str(config_path)]
+        env = clean_subprocess_env()
+        env.update(_runtime_envs_from_credentials())
 
         try:
             console.print("[green]Running cloud node in foreground (Ctrl+C to stop)...[/green]")
-            subprocess.run(cmd, env=clean_subprocess_env(), check=False)
+            subprocess.run(cmd, env=env, check=False)
         except FileNotFoundError:
             console.print(f"[red]Binary not found: {binary}[/red]")
         return
@@ -417,6 +433,7 @@ def start_cloud_node(
         cmd += ["--config", str(config_path)]
 
     env = clean_subprocess_env()
+    env.update(_runtime_envs_from_credentials())
 
     try:
         process = subprocess.Popen(
@@ -574,11 +591,13 @@ def restart_cloud_node(config_path: Optional[str]) -> None:
     cmd: list[str] = [binary]
     if config_path:
         cmd += ["--config", str(config_path)]
+    env = clean_subprocess_env()
+    env.update(_runtime_envs_from_credentials())
 
     try:
         process = subprocess.Popen(
             cmd,
-            env=clean_subprocess_env(),
+            env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
