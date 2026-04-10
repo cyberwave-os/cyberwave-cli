@@ -253,14 +253,23 @@ Manage the edge node service lifecycle, configuration, and monitoring.
 
 ### `cyberwave edge install`
 
-Installs the `cyberwave-edge-core` package (via apt-get on Debian/Ubuntu) and creates a systemd service so it starts on boot. Guides you through workspace and environment selection.
+Installs the `cyberwave-edge-core` package (via apt-get on Debian/Ubuntu) and creates a systemd service so it starts on boot. Guides you through workspace, environment, and twin selection.
+
+On **macOS**, the installer also sets up an MJPEG camera stream bridge (using `ffmpeg` and AVFoundation) and prompts you to select which camera to use. The selected camera is stored by **device name** (not index) so it persists across USB reconnections and reboots.
 
 ```bash
 sudo cyberwave edge install
 sudo cyberwave edge install -y   # skip prompts
+sudo cyberwave edge install --reconfigure-camera   # re-select camera without full reinstall
 sudo cyberwave edge install --edge-core-channel dev
 sudo cyberwave edge install --edge-core-channel staging --edge-core-version 0.0.42.595
 ```
+
+**Options:**
+
+- `--reconfigure-camera`: Re-run the camera selection prompt and restart the camera stream and edge-core service. Useful when switching between cameras (e.g. laptop webcam to external USB camera).
+- `--force-reinstall`: Force reinstall of the USB/IP server on macOS. Camera stream and edge-core setup are always forced during install.
+- `-y`: Skip interactive confirmation prompts.
 
 ### `cyberwave edge uninstall`
 
