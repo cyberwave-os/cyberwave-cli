@@ -80,6 +80,31 @@ def _resolve_config_dir() -> Path:
 CONFIG_DIR = _resolve_config_dir()
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 
+
+def chown_to_sudo_user(*paths: "os.PathLike[str]") -> None:
+    """Best-effort chown to the invoking (non-root) user when running via sudo.
+
+    On macOS the config dir lives under the user's home.  Files created by
+    ``sudo cyberwave …`` end up owned by root, which locks out subsequent
+    non-sudo invocations.  Restoring ownership avoids the "permission denied /
+    re-run with sudo" loop that macOS users hit.
+    """
+    sudo_uid = os.environ.get("SUDO_UID")
+    sudo_gid = os.environ.get("SUDO_GID")
+    if not sudo_uid:
+        return
+    try:
+        uid = int(sudo_uid)
+        gid = int(sudo_gid) if sudo_gid else -1
+    except (ValueError, TypeError):
+        return
+    for p in paths:
+        try:
+            os.chown(p, uid, gid)
+        except OSError:
+            pass
+
+
 # SO-101 starter template
 SO101_REPO_URL = "https://github.com/cyberwave-os/so101-starter"
 SO101_DEFAULT_DIR = "so101-project"

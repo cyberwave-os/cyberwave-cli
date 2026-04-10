@@ -26,7 +26,7 @@ from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
 from .auth import APIToken, AuthClient, AuthenticationError
-from .config import CONFIG_DIR, clean_subprocess_env, get_api_url
+from .config import CONFIG_DIR, chown_to_sudo_user, clean_subprocess_env, get_api_url
 from .credentials import (
     Credentials,
     collect_runtime_env_overrides,
@@ -358,15 +358,15 @@ def _save_environment_file(
 
     os.replace(tmp_path, ENVIRONMENT_FILE)
 
-    # Keep same permission model as credentials.
     if os.name != "nt":
         os.chmod(ENVIRONMENT_FILE, 0o600)
-        # Also fsync the directory to persist the rename event.
         dir_fd = os.open(CONFIG_DIR, os.O_RDONLY)
         try:
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
+
+    chown_to_sudo_user(CONFIG_DIR, ENVIRONMENT_FILE)
 
 
 def _load_or_generate_edge_fingerprint() -> str:
@@ -939,6 +939,7 @@ def _download_twin_json_files(client: Any, twin_uuids: list[str]) -> int:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             with open(twin_json_file, "w") as f:
                 json.dump(twin_data, f, indent=2, default=_json_default)
+            chown_to_sudo_user(CONFIG_DIR, twin_json_file)
             written += 1
         except Exception as exc:
             console.print(f"[yellow]Failed to download twin JSON for {twin_uuid[:8]}…: {exc}[/yellow]")

@@ -148,18 +148,27 @@ def _resolve_real_user() -> tuple[Optional[str], Optional[int], Optional[int]]:
 
 
 def _chown_to_real_user(path: Path, *, recursive: bool = False) -> None:
-    """Best-effort chown to the invoking user (relevant when running under sudo)."""
+    """Best-effort chown to the invoking user (relevant when running under sudo).
+
+    For non-recursive single-path chown, delegates to the shared
+    :func:`~cyberwave_cli.config.chown_to_sudo_user` helper.  The recursive
+    variant (used for compiled binary directories) walks the tree locally.
+    """
+    if not recursive:
+        from .config import chown_to_sudo_user
+
+        chown_to_sudo_user(path)
+        return
     _, uid, gid = _resolve_real_user()
     if uid is None:
         return
     try:
         os.chown(path, uid, gid or -1)
-        if recursive and path.is_dir():
-            for child in path.rglob("*"):
-                try:
-                    os.chown(child, uid, gid or -1)
-                except OSError:
-                    pass
+        for child in path.rglob("*"):
+            try:
+                os.chown(child, uid, gid or -1)
+            except OSError:
+                pass
     except OSError:
         pass
 

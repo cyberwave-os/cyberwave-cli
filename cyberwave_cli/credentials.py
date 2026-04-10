@@ -9,7 +9,7 @@ from typing import Any, Optional
 import click
 from rich.console import Console
 
-from .config import CONFIG_DIR, CREDENTIALS_FILE
+from .config import CONFIG_DIR, CREDENTIALS_FILE, chown_to_sudo_user
 
 _console = Console()
 
@@ -135,13 +135,12 @@ def collect_runtime_env_overrides(*, api_url_override: Optional[str] = None) -> 
 def ensure_config_dir() -> None:
     """Ensure the config directory exists with proper permissions."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    # Best-effort: restrict to owner only.  May fail if the directory is
-    # owned by another user (e.g. root-created /etc/cyberwave on a CI runner).
     if os.name != "nt":
         try:
             os.chmod(CONFIG_DIR, 0o700)
         except PermissionError:
             pass
+        chown_to_sudo_user(CONFIG_DIR)
 
 
 def save_credentials(credentials: Credentials) -> None:
@@ -183,12 +182,12 @@ def save_credentials(credentials: Credentials) -> None:
     except PermissionError:
         _raise_permission_error()
 
-    # Best-effort permission restriction.
     if os.name != "nt":
         try:
             os.chmod(CREDENTIALS_FILE, 0o600)
         except PermissionError:
             pass
+        chown_to_sudo_user(CREDENTIALS_FILE)
 
 
 def load_credentials() -> Optional[Credentials]:
