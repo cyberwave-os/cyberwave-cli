@@ -69,6 +69,7 @@ This command will guide you to your first-time setup of your edge device.
 | `core`       | Visualize the core commands              |
 | `completion` | Generate/install shell autocomplete      |
 | `worker`     | Manage local worker files for edge inference |
+| `workflow`   | Manage workflows (list, create, sync, activate, etc.) |
 
 ## Worker Management
 
@@ -152,6 +153,49 @@ nano /etc/cyberwave/workers/my_detector.py
 
 After ejection, `my_detector.py` is yours to edit freely. Edge sync never
 touches files that do not start with `wf_`.
+
+## `cyberwave workflow`
+
+Manage workflows for automation — list, create, show, activate, sync to edge, and delete.
+
+| Subcommand   | Description                                    |
+| ------------ | ---------------------------------------------- |
+| `list`       | List workflows (table or `--json`)             |
+| `templates`  | List available workflow templates               |
+| `create`     | Create a workflow (`--name` or `--template`)   |
+| `show`       | Show workflow details, nodes, and target twins |
+| `sync`       | Sync a workflow to its edge node(s) via MQTT   |
+| `activate`   | Activate a workflow                            |
+| `deactivate` | Deactivate a workflow                          |
+| `delete`     | Delete a workflow (`--yes` to skip confirm)    |
+
+All subcommands accept `--base-url` / `-u` to override the API URL (e.g. `http://192.168.10.101:8000`). When a UUID argument is omitted, an interactive arrow-key selector is shown.
+
+```bash
+# List workflows with target twin(s) column
+cyberwave workflow list
+cyberwave workflow list --json
+
+# Create from template
+cyberwave workflow create --template motion-detection
+
+# Show details (interactive if UUID omitted)
+cyberwave workflow show
+cyberwave workflow show e7f1856c
+
+# Sync workflow to edge device(s)
+cyberwave workflow sync
+cyberwave workflow sync e7f1856c --base-url http://192.168.10.101:8000
+
+# Activate / deactivate
+cyberwave workflow activate
+cyberwave workflow deactivate
+
+# Delete
+cyberwave workflow delete --yes
+```
+
+The `sync` command reads the workflow's `camera_frame` trigger nodes to find target twin(s), then sends `sync_workflows` MQTT commands to each twin's edge node.
 
 ## Shell Autocompletion
 
