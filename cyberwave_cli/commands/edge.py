@@ -289,9 +289,15 @@ def edge():
     "--force-reinstall",
     is_flag=True,
     default=False,
-    help="Tear down and reinstall platform helpers (USB/IP, camera stream) from scratch",
+    help="Tear down and reinstall the USB/IP server from scratch (macOS only)",
 )
-def install_edge(yes, edge_core_channel, edge_core_version, force_reinstall):
+@click.option(
+    "--reconfigure-camera",
+    is_flag=True,
+    default=False,
+    help="Re-run camera selection without a full reinstall (macOS only)",
+)
+def install_edge(yes, edge_core_channel, edge_core_version, force_reinstall, reconfigure_camera):
     """Install cyberwave-edge-core and register it as a boot service.
 
     Downloads the cyberwave-edge-core package (via apt-get on Debian/Ubuntu)
@@ -299,12 +305,35 @@ def install_edge(yes, edge_core_channel, edge_core_version, force_reinstall):
 
     \b
     Examples:
-        sudo cyberwave edge install
-        sudo cyberwave edge install -y
-        sudo cyberwave edge install --force-reinstall
-        sudo cyberwave edge install --edge-core-channel dev
-        sudo cyberwave edge install --edge-core-channel staging --edge-core-version 0.0.42.595
+        cyberwave edge install
+        cyberwave edge install -y
+        cyberwave edge install --force-reinstall
+        cyberwave edge install --reconfigure-camera
+        cyberwave edge install --edge-core-channel dev
+        cyberwave edge install --edge-core-channel staging --edge-core-version 0.0.42.595
     """
+    if reconfigure_camera:
+        from ..macos import (
+            is_macos,
+            setup_camera_stream_server,
+            start_edge_core_service,
+            stop_edge_core_service,
+        )
+
+        if not is_macos():
+            console.print("[yellow]--reconfigure-camera is only available on macOS.[/yellow]")
+            raise SystemExit(1)
+        try:
+            if not setup_camera_stream_server(force=True):
+                raise SystemExit(1)
+            console.print("[cyan]Restarting edge-core so the driver reconnects...[/cyan]")
+            stop_edge_core_service()
+            start_edge_core_service()
+        except KeyboardInterrupt:
+            console.print("\n[dim]Aborted.[/dim]")
+            raise SystemExit(1)
+        return
+
     from ..core import setup_edge_core
 
     try:
@@ -325,8 +354,9 @@ def install_edge(yes, edge_core_channel, edge_core_version, force_reinstall):
 def uninstall_edge(yes):
     """Stop and remove the cyberwave-edge-core service.
 
-    Disables the systemd service, removes the unit file, removes the edge
-    config directory, and optionally uninstalls the package.
+    On Linux: disables the systemd service, removes the unit file.
+    On macOS: tears down the launchd LaunchAgent.
+    On both: removes the edge config directory and optionally the package.
 
     \b
     Examples:
@@ -337,25 +367,28 @@ def uninstall_edge(yes):
     from ..core import (
         EDGE_CORE_SPEC,
         SYSTEMD_UNIT_NAME,
-        SYSTEMD_UNIT_PATH,
         _is_macos,
         _load_or_generate_edge_fingerprint,
         _resolve_installed_edge_core_package_name,
     )
     from ..credentials import load_credentials
+    from ..macos import is_macos
 
-    # Capture auth + identity before deleting local config files.
     creds = load_credentials()
     edge_fingerprint = _load_or_generate_edge_fingerprint()
     token = creds.token if creds else None
     workspace_uuid = str(getattr(creds, "workspace_uuid", "") or "") if creds else None
     base_url = str(getattr(creds, "cyberwave_base_url", "") or "") if creds else None
 
+    service_label = (
+        "edge-core LaunchAgent" if is_macos() else SYSTEMD_UNIT_NAME
+    )
+
     if not yes:
         from rich.prompt import Confirm as RichConfirm
 
         if not RichConfirm.ask(
-            f"Remove {SYSTEMD_UNIT_NAME} and disable boot service?", default=False
+            f"Remove {service_label} and disable boot service?", default=False
         ):
             console.print("[dim]Aborted.[/dim]")
             return
@@ -459,7 +492,7 @@ def uninstall_edge(yes):
         console.print(f"[green]{EDGE_CORE_SPEC.package_name} service removed.[/green]")
         return
 
-    from ..core import _run
+    from ..core import SYSTEMD_UNIT_PATH, _run
 
     # Stop and disable the service
     try:
@@ -468,14 +501,7 @@ def uninstall_edge(yes):
     except FileNotFoundError:
         console.print("[yellow]systemctl not found — skipping service cleanup.[/yellow]")
 
-    # Stop edge driver containers started by edge-core
-    stopped_driver_containers = _stop_edge_driver_containers(_run)
-    if stopped_driver_containers:
-        console.print(
-            f"[green]Stopped {len(stopped_driver_containers)} edge driver container(s).[/green]"
-        )
-
-    # Remove the unit file
+    # Remove the systemd unit file
     if SYSTEMD_UNIT_PATH.exists():
         try:
             SYSTEMD_UNIT_PATH.unlink()
@@ -486,11 +512,16 @@ def uninstall_edge(yes):
                 pass
         except PermissionError:
             console.print(
-                "[red]Permission denied removing systemd unit file.[/red]\n"
+                f"[red]Permission denied removing {SYSTEMD_UNIT_PATH}.[/red]\n"
                 "[dim]Re-run with sudo: sudo cyberwave edge uninstall[/dim]"
             )
 
-    # Remove the edge config directory (credentials.json, environment.json, etc.)
+    stopped_driver_containers = _stop_edge_driver_containers(_run)
+    if stopped_driver_containers:
+        console.print(
+            f"[green]Stopped {len(stopped_driver_containers)} edge driver container(s).[/green]"
+        )
+
     if CONFIG_DIR.exists():
         try:
             shutil.rmtree(CONFIG_DIR)
@@ -503,7 +534,6 @@ def uninstall_edge(yes):
         except OSError as exc:
             console.print(f"[yellow]Could not fully remove {CONFIG_DIR}: {exc}[/yellow]")
 
-    # Offer to uninstall the package
     if not yes:
         from rich.prompt import Confirm as RichConfirm
 
@@ -511,10 +541,19 @@ def uninstall_edge(yes):
         if RichConfirm.ask(
             f"Also uninstall {installed_package_name} package?", default=False
         ):
-            try:
-                _run(["apt-get", "remove", "-y", installed_package_name], check=False)
-            except FileNotFoundError:
-                console.print("[yellow]apt-get not found — remove manually with pip.[/yellow]")
+            if is_macos():
+                try:
+                    _run(
+                        [sys.executable, "-m", "pip", "uninstall", "-y", installed_package_name],
+                        check=False,
+                    )
+                except OSError:
+                    console.print("[yellow]pip uninstall failed — remove manually.[/yellow]")
+            else:
+                try:
+                    _run(["apt-get", "remove", "-y", installed_package_name], check=False)
+                except FileNotFoundError:
+                    console.print("[yellow]apt-get not found — remove manually with pip.[/yellow]")
 
     deleted_count, failed_count = _delete_registered_edges_for_fingerprint(
         fingerprint=edge_fingerprint,
@@ -592,10 +631,8 @@ def start_edge(env_file, foreground):
 
     console.print(f"[cyan]Starting edge node with config: {env_path}[/cyan]")
 
-    # Change to the directory containing .env
     work_dir = env_path.parent
 
-    # Set environment (use clean env to avoid PyInstaller LD_LIBRARY_PATH leaking)
     from ..config import clean_subprocess_env
 
     env = clean_subprocess_env()
@@ -608,7 +645,6 @@ def start_edge(env_file, foreground):
 
     try:
         if foreground:
-            # Run in foreground
             console.print("[green]Running edge node in foreground (Ctrl+C to stop)...[/green]")
             subprocess.run(
                 [binary],
@@ -616,7 +652,6 @@ def start_edge(env_file, foreground):
                 env=env,
             )
         else:
-            # Run in background
             console.print("[green]Starting edge node in background...[/green]")
             process = subprocess.Popen(
                 [binary],
@@ -637,11 +672,18 @@ def start_edge(env_file, foreground):
 @edge.command("stop")
 def stop_edge():
     """Stop the edge node service."""
+    from ..macos import is_macos
+
+    if is_macos():
+        from ..macos import stop_edge_core_service
+
+        stop_edge_core_service()
+        return
+
     import signal
 
     from ..core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, stop_service
 
-    # Prefer systemd when available
     if _has_systemd() and SYSTEMD_UNIT_PATH.exists():
         stop_service()
         return
@@ -684,7 +726,7 @@ def stop_edge():
 
         for pid in pids:
             os.kill(int(pid), signal.SIGTERM)
-            console.print(f"[green]✓ Stopped edge node (PID: {pid})[/green]")
+            console.print(f"[green]Stopped edge node (PID: {pid})[/green]")
 
     except Exception as e:
         console.print(f"[red]Error stopping edge node: {e}[/red]")
@@ -701,6 +743,7 @@ def restart_edge(env_file):
     """Restart the edge node service.
 
     If the edge was installed as a systemd service, restarts it via systemctl.
+    On macOS with a LaunchAgent, restarts via launchctl.
     Otherwise falls back to stopping and re-starting the background process.
 
     \b
@@ -710,7 +753,6 @@ def restart_edge(env_file):
     """
     from ..core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, load_launchagent_service, restart_service
 
-    # Prefer systemd when available
     if _has_systemd() and SYSTEMD_UNIT_PATH.exists():
         restart_service()
         return
@@ -736,12 +778,10 @@ def restart_edge(env_file):
             console.print(f"[dim]Stopped PID {pid}[/dim]")
 
         if pids:
-            # Give the old process a moment to release resources
             time.sleep(1)
     except Exception as exc:
         console.print(f"[yellow]Could not stop existing process: {exc}[/yellow]")
 
-    # Re-start
     env_path = Path(env_file).resolve() if env_file else Path(".env").resolve()
     if not env_path.exists():
         console.print(f"[red]Error: .env file not found at {env_path}[/red]")
@@ -816,7 +856,7 @@ def status_edge():
         except FileNotFoundError:
             console.print("[dim]  systemctl not found — skipping service check.[/dim]")
 
-    # --- driver containers ---
+    # --- driver containers (common to both platforms) ---
     try:
         result = subprocess.run(
             [
@@ -828,9 +868,9 @@ def status_edge():
             capture_output=True,
             text=True,
         )
-        lines = [l for l in result.stdout.strip().splitlines() if l]
+        lines = [ln for ln in result.stdout.strip().splitlines() if ln]
         if lines:
-            console.print(f"[green]✓ Driver containers running: {len(lines)}[/green]")
+            console.print(f"[green]Driver containers running: {len(lines)}[/green]")
             for line in lines:
                 parts = line.split("\t")
                 name = parts[0]
@@ -838,9 +878,9 @@ def status_edge():
                 status = parts[2] if len(parts) > 2 else ""
                 console.print(f"   [cyan]{name}[/cyan]  [dim]{image}[/dim]  [dim]{status}[/dim]")
         else:
-            console.print("[yellow]  No driver containers running[/yellow]")
+            console.print("[yellow]No driver containers running[/yellow]")
     except FileNotFoundError:
-        console.print("[dim]  docker not found — skipping driver container check.[/dim]")
+        console.print("[dim]docker not found — skipping driver container check.[/dim]")
     except Exception as e:
         console.print(f"[red]Error checking driver containers: {e}[/red]")
 
@@ -1154,8 +1194,6 @@ def show_logs(follow, lines):
         cmd.append("-f")
 
     try:
-        # Run journalctl directly as a pass-through command; this keeps behavior
-        # aligned with systemctl tooling and avoids Python parsing dependencies.
         result = subprocess.run(cmd, env=clean_subprocess_env(), check=False)
         if result.returncode != 0:
             console.print("[dim]Tip: run with sudo if you see no output.[/dim]")

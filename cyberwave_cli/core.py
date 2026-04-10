@@ -1845,16 +1845,20 @@ def setup_service(
                 "available inside Docker containers.[/yellow]\n"
                 "[dim]You can retry later: cyberwave edge install[/dim]"
             )
-        if not setup_camera_stream_server(force=force_reinstall):
+
+    if post_install_hook is not None:
+        if not post_install_hook():
+            return False
+
+    # Camera selection runs after twin selection so the interactive prompt
+    # isn't wiped by the twin picker's screen clear.
+    if is_macos() and spec.requires_docker:
+        if not setup_camera_stream_server(force=True):
             console.print(
                 "[yellow]Camera stream setup failed. MJPEG fallback will "
                 "not be available.[/yellow]\n"
                 "[dim]You can retry later: cyberwave edge install[/dim]"
             )
-
-    if post_install_hook is not None:
-        if not post_install_hook():
-            return False
 
     if linux_service_setup:
         if not create_systemd_service(spec):

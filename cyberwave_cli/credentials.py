@@ -28,10 +28,7 @@ def _raise_permission_error() -> None:
         cmd = " ".join(parts)
     except RuntimeError:
         cmd = "cyberwave edge install"
-    _console.print(
-        "[red]Root privileges required.[/red]\n"
-        f"[dim]Re-run with sudo: sudo {cmd}[/dim]"
-    )
+    _console.print(f"[red]Root privileges required.[/red]\n[dim]Re-run with sudo: sudo {cmd}[/dim]")
     raise SystemExit(1)
 
 
@@ -218,6 +215,39 @@ def clear_credentials() -> None:
     """Remove stored credentials."""
     if CREDENTIALS_FILE.exists():
         CREDENTIALS_FILE.unlink()
+
+
+def upsert_runtime_env(key: str, value: str) -> None:
+    """Set a single runtime env var in credentials.json without a full save.
+
+    Creates the ``envs`` dict if it doesn't exist yet.  Other fields
+    (token, email, etc.) are preserved as-is.
+    """
+    ensure_config_dir()
+    data: dict[str, Any] = {}
+    try:
+        if CREDENTIALS_FILE.exists():
+            with open(CREDENTIALS_FILE) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+    except (json.JSONDecodeError, OSError):
+        pass
+
+    envs = data.get("envs")
+    if not isinstance(envs, dict):
+        envs = {}
+    envs[key] = value
+    data["envs"] = envs
+
+    with open(CREDENTIALS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+    if os.name != "nt":
+        try:
+            os.chmod(CREDENTIALS_FILE, 0o600)
+        except PermissionError:
+            pass
 
 
 def get_token() -> Optional[str]:
