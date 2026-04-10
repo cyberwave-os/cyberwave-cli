@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.table import Table
 
 from ..config import get_api_url
-from ..credentials import load_credentials
+from ..utils import get_sdk_client
 
 console = Console()
 
@@ -46,23 +46,6 @@ def _friendly_error(action: str, exc: Exception, base_url: str | None = None) ->
         console.print(f"[red]✗[/red] Failed to {action}: {cause}")
 
     raise click.Abort()
-
-
-def get_sdk_client(api_url: str | None = None):
-    """Get Cyberwave SDK client.
-
-    Args:
-        api_url: Optional API URL override (e.g. ``http://192.168.10.101:8000``).
-            Falls back to ``CYBERWAVE_BASE_URL`` / SDK default when *None*.
-    """
-    creds = load_credentials()
-    if not creds or not creds.token:
-        return None
-    try:
-        from cyberwave import Cyberwave
-        return Cyberwave(base_url=api_url or get_api_url(), token=creds.token)
-    except ImportError:
-        return None
 
 
 # Workflow templates for common use cases

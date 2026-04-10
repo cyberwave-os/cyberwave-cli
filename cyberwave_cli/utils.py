@@ -7,26 +7,80 @@ This module provides common functionality used across multiple CLI commands:
 - Common CLI patterns
 """
 
+from urllib.parse import urlparse
+
 import click
 from rich.console import Console
 from rich.table import Table
 from typing import Any, Callable, Optional, TypeVar
 
 from .config import get_api_url
-from .credentials import load_credentials
+from .credentials import Credentials, load_credentials
 
 console = Console()
 
 T = TypeVar("T")
 
 
-def get_sdk_client():
+def _is_local_or_private(hostname: str) -> bool:
+    """Return True when *hostname* refers to a local or RFC-1918 private address."""
+    if hostname in ("localhost", "0.0.0.0"):
+        return True
+    import ipaddress
+
+    try:
+        return ipaddress.ip_address(hostname).is_private
+    except ValueError:
+        return False
+
+
+def _resolve_mqtt_kwargs(
+    creds: Optional[Credentials],
+    base_url: str,
+) -> dict[str, Any]:
+    """Derive MQTT connection kwargs from credentials and base URL.
+
+    When the backend base URL points at a local or private-network host
+    (``localhost``, ``127.x``, ``192.168.x``, ``10.x``, …) the MQTT broker
+    is assumed to be co-located on the same host at port 1883 without TLS.
+    This matches the standard ``local.yml`` Docker Compose layout.
+
+    For remote base URLs, the value stored in credentials
+    (``cyberwave_mqtt_host``) is forwarded so the SDK connects to the right
+    broker without requiring the ``CYBERWAVE_MQTT_HOST`` env var.
+
+    Returns a dict suitable for passing as ``**kwargs`` to ``Cyberwave()``.
     """
-    Get an authenticated Cyberwave SDK client.
-    
+    mqtt_host: Optional[str] = None
+    mqtt_port: Optional[int] = None
+
+    parsed = urlparse(base_url)
+    hostname = (parsed.hostname or "").lower()
+
+    if _is_local_or_private(hostname):
+        mqtt_host = parsed.hostname  # preserve original casing / IP
+        mqtt_port = 1883
+    elif creds and creds.cyberwave_mqtt_host:
+        mqtt_host = creds.cyberwave_mqtt_host
+
+    kwargs: dict[str, Any] = {}
+    if mqtt_host:
+        kwargs["mqtt_host"] = mqtt_host
+    if mqtt_port is not None:
+        kwargs["mqtt_port"] = mqtt_port
+    return kwargs
+
+
+def get_sdk_client(api_url: Optional[str] = None):
+    """Get an authenticated Cyberwave SDK client.
+
+    Args:
+        api_url: Optional API URL override.  Falls back to
+            ``CYBERWAVE_BASE_URL`` / SDK default when *None*.
+
     Returns:
         Cyberwave client if authenticated, None otherwise.
-        
+
     Example:
         client = get_sdk_client()
         if client:
@@ -37,7 +91,10 @@ def get_sdk_client():
         return None
     try:
         from cyberwave import Cyberwave
-        return Cyberwave(base_url=get_api_url(), token=creds.token)
+
+        base_url = api_url or get_api_url()
+        mqtt_kwargs = _resolve_mqtt_kwargs(creds, base_url)
+        return Cyberwave(base_url=base_url, token=creds.token, **mqtt_kwargs)
     except ImportError:
         return None
 

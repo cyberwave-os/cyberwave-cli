@@ -1883,25 +1883,65 @@ def setup_service(
     return True
 
 
+def _pull_worker_image() -> bool:
+    """Pull the ML worker Docker image (best-effort).
+
+    Returns True always — a failed pull is non-fatal because
+    ``WorkerManager._run_container()`` will pull implicitly on first start.
+    """
+    docker_bin = shutil.which("docker")
+    if not docker_bin:
+        console.print("[yellow]Docker not found — skipping worker image pull.[/yellow]")
+        return True
+
+    image = "cyberwaveos/edge-ml-worker:latest"
+    try:
+        from cyberwave_edge_core.worker_manager import DEFAULT_WORKER_IMAGE
+
+        image = DEFAULT_WORKER_IMAGE
+    except Exception:
+        pass
+
+    console.print(f"[cyan]Pulling worker image {image}...[/cyan]")
+    try:
+        _run([docker_bin, "pull", image])
+        console.print(f"[green]Worker image {image} pulled successfully.[/green]")
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[yellow]Worker image pull failed (exit {exc.returncode}).[/yellow]")
+        console.print("[dim]Workers will still work — edge-core pulls on first start.[/dim]")
+    return True
+
+
 def setup_edge_core(
     *,
     skip_confirm: bool = False,
     edge_core_channel: str = "stable",
     edge_core_version: str | None = None,
     force_reinstall: bool = False,
+    pull_worker_image: bool = True,
 ) -> bool:
     """Full setup for edge core: install the package, create the service, enable on boot.
 
     When *force_reinstall* is True, platform helpers (USB/IP, camera stream)
     are torn down and rebuilt from scratch.
 
+    When *pull_worker_image* is True (the default), the ML worker Docker
+    image is pulled after installation so workers are ready to run immediately.
+
     Returns True if everything succeeded.
     """
+
+    def _post_install() -> bool:
+        ok = configure_edge_environment(skip_confirm=skip_confirm)
+        if ok and pull_worker_image:
+            _pull_worker_image()
+        return ok
+
     return setup_service(
         EDGE_CORE_SPEC,
         skip_confirm=skip_confirm,
         channel=edge_core_channel,
         version=edge_core_version,
-        post_install_hook=lambda: configure_edge_environment(skip_confirm=skip_confirm),
+        post_install_hook=_post_install,
         force_reinstall=force_reinstall,
     )
