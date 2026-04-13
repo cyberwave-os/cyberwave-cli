@@ -17,18 +17,22 @@ Example usage:
     cyberwave worker remove detect_people   # Remove a worker (with or without .py)
     cyberwave worker logs                   # Stream worker container logs
     cyberwave worker status                 # Show worker container status
+    cyberwave worker monitor                # Live resource/throughput dashboard
 """
 
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.live import Live
 from rich.table import Table
 
 from ..config import CONFIG_DIR
+from ..utils import colorize_log_line
 
 console = Console()
 
@@ -348,7 +352,13 @@ def worker_logs(follow: bool, tail: int, container: str | None) -> None:
     cmd.append(container_name)
 
     try:
-        subprocess.run(cmd, check=False)
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        if proc.stdout:
+            for line in proc.stdout:
+                console.print(colorize_log_line(line.rstrip()))
+        proc.wait()
     except FileNotFoundError:
         console.print("[red]✗[/red] Docker not found. Is Docker installed?")
         raise click.Abort()
@@ -444,3 +454,96 @@ def worker_status(container: str | None) -> None:
         console.print("[yellow]⚠[/yellow] Docker not available or timed out.")
 
     console.print()
+
+
+@worker.command("monitor")
+@click.option(
+    "--update",
+    "-u",
+    default=2.0,
+    type=float,
+    show_default=True,
+    help="Dashboard refresh interval in seconds",
+)
+@click.option(
+    "--container",
+    "-c",
+    help="Explicit container name (auto-detected if omitted)",
+)
+def worker_monitor(update: float, container: str | None) -> None:
+    """Live dashboard showing worker resource usage and Zenoh throughput.
+
+    Displays CPU, memory, GPU (Linux/NVIDIA only), per-channel Zenoh
+    message rates, hook frame counts, and ML inference latency.
+
+    \b
+    Examples:
+        cyberwave worker monitor
+        cyberwave worker monitor --update 1
+        cyberwave worker monitor -c cyberwave-worker-abc12345
+    """
+    from .monitor import (
+        RateTracker,
+        WorkerSnapshot,
+        ZenohStatsReader,
+        build_dashboard,
+        collect_host_metrics,
+        get_container_cpu_quota,
+        parse_hook_stats,
+        parse_model_stats,
+    )
+
+    container_name = container or _find_worker_container()
+
+    if not container_name:
+        console.print("[red]✗[/red] Worker container not found.")
+        console.print(
+            "[dim]Start the worker container with: cyberwave-edge-core worker start[/dim]"
+        )
+        raise click.Abort()
+
+    console.print(
+        f"[dim]Monitoring container: [bold]{container_name}[/bold]  "
+        f"(refresh every {update}s)[/dim]\n"
+    )
+
+    cpu_cores = get_container_cpu_quota(container_name)
+    rate_tracker = RateTracker()
+
+    zenoh_reader = ZenohStatsReader()
+    zenoh_ok = zenoh_reader.start(container_name=container_name)
+    if not zenoh_ok:
+        console.print(
+            "[dim]Zenoh not available — showing Docker metrics only. "
+            "Install eclipse-zenoh for full throughput data.[/dim]\n"
+        )
+
+    try:
+        with Live(console=console, refresh_per_second=1, screen=False) as live:
+            while True:
+                docker, gpu, uptime = collect_host_metrics(container_name)
+
+                zenoh_data = zenoh_reader.latest() if zenoh_ok else {}
+                transport = zenoh_data.get("transport", {})
+                hooks_data = zenoh_data.get("hooks", {})
+                models_data = zenoh_data.get("models", [])
+
+                snap = WorkerSnapshot(
+                    container_name=container_name,
+                    uptime=uptime,
+                    cpu_cores=cpu_cores,
+                    docker=docker,
+                    gpu=gpu,
+                    zenoh_channels=rate_tracker.update(transport),
+                    hooks=parse_hook_stats(hooks_data),
+                    models=parse_model_stats(models_data),
+                )
+
+                live.update(build_dashboard(snap))
+                time.sleep(update)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if zenoh_ok:
+            zenoh_reader.stop()
+        console.print("\n[dim]Monitor stopped.[/dim]")

@@ -28,6 +28,8 @@ import click
 from rich.console import Console
 from rich.prompt import Confirm
 
+from cyberwave_cli.utils import colorize_log_line
+
 console = Console()
 
 CLOUD_NODE_IDENTITY_FILE = Path.home() / ".cyberwave" / "instance_identity.json"
@@ -106,7 +108,7 @@ def _show_macos_launchagent_logs(*, follow: bool, lines: int) -> None:
     lines_to_show = max(0, int(lines))
     existing_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     for line in existing_lines[-lines_to_show:]:
-        console.print(line)
+        console.print(colorize_log_line(line))
 
     if not follow:
         return
@@ -116,7 +118,7 @@ def _show_macos_launchagent_logs(*, follow: bool, lines: int) -> None:
         while True:
             line = handle.readline()
             if line:
-                console.print(line.rstrip("\n"))
+                console.print(colorize_log_line(line.rstrip("\n")))
                 continue
             time.sleep(0.5)
 
@@ -689,7 +691,7 @@ def logs_cloud_node(follow: bool, lines: int) -> None:
         "-u", service_name,
         f"-n{lines}",
         "--no-pager",
-        "--output=cat",
+        "--output=short-iso",
     ]
     if follow:
         cmd.append("-f")

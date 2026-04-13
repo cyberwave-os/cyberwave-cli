@@ -7,6 +7,7 @@ This module provides common functionality used across multiple CLI commands:
 - Common CLI patterns
 """
 
+import re
 from urllib.parse import urlparse
 
 import click
@@ -174,6 +175,49 @@ def create_table(title: str, columns: list[tuple[str, str]]) -> Table:
     for name, style in columns:
         table.add_column(name, style=style)
     return table
+
+
+_LEVEL_RICH_STYLE = {
+    "CRITICAL": "bold red",
+    "ERROR": "red",
+    "WARNING": "yellow",
+    "INFO": "green",
+    "DEBUG": "cyan",
+}
+
+_LOG_LINE_RE: re.Pattern[str] | None = None
+
+
+def _log_line_re() -> re.Pattern[str]:
+    global _LOG_LINE_RE  # noqa: PLW0603
+    if _LOG_LINE_RE is None:
+        _LOG_LINE_RE = re.compile(
+            r"(\[(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\])"
+            r"(\s+\[[^\]]+\])"
+        )
+    return _LOG_LINE_RE
+
+
+def colorize_log_line(line: str) -> str:
+    """Wrap log-level and module-name tags with Rich markup for colored output.
+
+    The module name brackets must be escaped (``\\[``) so Rich doesn't
+    interpret them as style tags.
+    """
+    from rich.markup import escape
+
+    m = _log_line_re().search(line)
+    if not m:
+        return escape(line)
+    level_tag = m.group(1)
+    name_tag = m.group(2)
+    level = level_tag[1:-1]
+    style = _LEVEL_RICH_STYLE.get(level, "")
+    colored_level = f"[{style}]{escape(level_tag)}[/{style}]" if style else escape(level_tag)
+    colored_name = f"[dim]{escape(name_tag)}[/dim]"
+    rest = escape(line[m.end() :])
+    prefix = escape(line[: m.start()])
+    return prefix + colored_level + colored_name + rest
 
 
 def format_json(data: Any) -> str:

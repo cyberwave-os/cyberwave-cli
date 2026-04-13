@@ -134,6 +134,30 @@ cyberwave worker logs --no-follow # print and exit
 
 Streams logs from the edge worker container (requires Docker).
 
+### `cyberwave worker monitor`
+
+```bash
+cyberwave worker monitor               # live dashboard (default 2s refresh)
+cyberwave worker monitor --update 1    # refresh every 1 second
+cyberwave worker monitor -c <name>     # target a specific container
+```
+
+Opens a live-updating dashboard showing:
+
+- **Resource usage** — CPU %, memory, network I/O (via `docker stats`)
+- **GPU** — utilization, memory, temperature (Linux + NVIDIA only; shows N/A on macOS)
+- **Zenoh throughput** — per-channel messages/second and totals
+- **Worker hooks** — per-hook frame counts and drop rates
+- **Model inference** — per-model latency (avg / P95 / P99) and inference count
+
+The dashboard connects to the worker's Zenoh data bus for runtime metrics.
+If `eclipse-zenoh` is not installed on the host, only Docker-level metrics are shown.
+
+**Options:**
+
+- `-u, --update`: Refresh interval in seconds (default: `2.0`)
+- `-c, --container`: Explicit container name (auto-detected if omitted)
+
 ### Eject a Workflow Worker
 
 Workflow-generated workers (`wf_*.py`) can be **ejected** into custom workers

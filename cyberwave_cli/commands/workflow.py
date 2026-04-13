@@ -108,7 +108,10 @@ def _pick_workflow(client, title: str = "Select a workflow", base_url: str | Non
 
     options = []
     for w in workflows:
-        status = "Active" if w.is_active else "Inactive"
+        if w.is_active:
+            status = "\033[32mActive\033[0m"
+        else:
+            status = "\033[2mInactive\033[0m"
         name = w.name or "Unnamed"
         options.append(f"{name} [{status}] ({str(w.uuid)[:8]}...)")
 
