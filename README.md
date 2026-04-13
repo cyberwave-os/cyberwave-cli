@@ -61,15 +61,82 @@ This command will guide you to your first-time setup of your edge device.
 
 ## Commands
 
-| Command      | Description                              |
-| ------------ | ---------------------------------------- |
-| `login`      | Authenticate with Cyberwave              |
-| `logout`     | Remove stored credentials                |
-| `config-dir` | Print the active configuration directory |
-| `core`       | Visualize the core commands              |
-| `completion` | Generate/install shell autocomplete      |
-| `worker`     | Manage local worker files for edge inference |
-| `workflow`   | Manage workflows (list, create, sync, activate, etc.) |
+| Command       | Description                                                   |
+| ------------- | ------------------------------------------------------------- |
+| `login`       | Authenticate with Cyberwave                                   |
+| `logout`      | Remove stored credentials                                     |
+| `configure`   | Set API token and URL directly (without login flow)           |
+| `config-dir`  | Print the active configuration directory                      |
+| `completion`  | Generate/install shell autocomplete                           |
+| `twin`        | Create, pair, list, show, and delete digital twins            |
+| `edge`        | Manage edge node (install, start, stop, drivers, sync, etc.)  |
+| `compute`     | Manage cloud node (install, start, stop, status, logs)        |
+| `workflow`    | Manage workflows (list, create, sync, activate, etc.)         |
+| `worker`      | Manage local worker files for edge inference                   |
+| `model`       | Manage ML model bindings on edge nodes                        |
+| `plugin`      | Manage edge node plugins                                      |
+| `environment` | List and inspect environments                                 |
+| `scan`        | Discover IP cameras and NVRs on the local network             |
+| `camera`      | Bootstrap a camera edge project                               |
+| `so101`       | Bootstrap an SO-101 robot arm project                         |
+| `manifest`    | Validate `cyberwave.yml` manifests                            |
+
+## `cyberwave twin`
+
+Create and manage digital twins — the virtual representation of your physical devices.
+
+| Subcommand | Description                                           |
+| ---------- | ----------------------------------------------------- |
+| `create`   | Create a new twin from an asset                       |
+| `pair`     | Pair this device with an existing twin                |
+| `list`     | List all digital twins                                |
+| `show`     | Show details of a specific twin                       |
+| `delete`   | Delete a digital twin                                 |
+
+### `cyberwave twin create`
+
+Create a twin from an asset identifier. The ASSET argument can be a registry ID (`unitree/go2`, `cyberwave/standard-cam`), an alias (`go2`, `camera`), a local JSON file, or a URL.
+
+```bash
+cyberwave twin create camera
+cyberwave twin create go2 --name "My Robot"
+cyberwave twin create camera --pair                          # create + pair in one step
+cyberwave twin create camera --pair --source "rtsp://..." --fps 15
+```
+
+**Options:**
+
+- `-n, --name`: Twin name
+- `-e, --environment`: Environment UUID to create the twin in
+- `--pair`: Also pair this device to the new twin
+- `-d, --target-dir`: Directory to save the `.env` file (when `--pair` is used)
+- `-y, --yes`: Skip confirmation prompts
+- `--<field> <value>`: Any additional field from the asset's `edge_config_schema`
+
+### `cyberwave twin pair`
+
+Register this device and bind it to an existing twin. After pairing, run `cyberwave edge start` to begin streaming.
+
+```bash
+cyberwave twin pair <TWIN_UUID>
+cyberwave twin pair abc-123 --camera-source "rtsp://..." --fps 15
+```
+
+### `cyberwave twin list`
+
+```bash
+cyberwave twin list                    # table view
+cyberwave twin list --json             # JSON output
+cyberwave twin list -e <ENV_UUID>      # filter by environment
+```
+
+### `cyberwave twin show / delete`
+
+```bash
+cyberwave twin show <UUID>
+cyberwave twin delete <UUID>
+cyberwave twin delete <UUID> --yes     # skip confirmation
+```
 
 ## Worker Management
 
@@ -255,16 +322,13 @@ cyberwave completion generate --shell zsh
 - **Permission denied writing RC file**: re-run with a writable `--rc-file` path, then source it.
 - **Already installed**: the installer is idempotent and will report when completion is already configured.
 
-### `cyberwave login`
+## `cyberwave login`
 
 Authenticates with Cyberwave using your email and password.
 
 ```bash
-# Interactive login (prompts for credentials)
-cyberwave login
-
-# Non-interactive login
-cyberwave login --email you@example.com --password yourpassword
+cyberwave login                                              # interactive
+cyberwave login --email you@example.com --password yourpass   # non-interactive
 ```
 
 **Options:**
@@ -272,7 +336,7 @@ cyberwave login --email you@example.com --password yourpassword
 - `-e, --email`: Email address
 - `-p, --password`: Password (will prompt if not provided)
 
-### `cyberwave config-dir`
+## `cyberwave config-dir`
 
 Prints the resolved configuration directory path. Useful in scripts to locate credentials and config files without hardcoding paths.
 
@@ -280,16 +344,11 @@ Prints the resolved configuration directory path. Useful in scripts to locate cr
 cyberwave config-dir
 # /etc/cyberwave
 
-# Use in a script
 CONFIG_DIR=$(cyberwave config-dir)
 cat "$CONFIG_DIR/credentials.json"
 ```
 
-The CLI resolves the directory with the following priority:
-
-1. `CYBERWAVE_EDGE_CONFIG_DIR` environment variable (explicit override)
-2. `/etc/cyberwave` if writable or creatable (system-wide, preferred)
-3. `~/.cyberwave` as a fallback for non-root users
+See [Configuration](#configuration) for how the directory is resolved.
 
 ## `cyberwave edge`
 
@@ -311,13 +370,7 @@ Manage the edge node service lifecycle, configuration, and monitoring.
 | `install-deps`   | Install edge ML dependencies                             |
 | `sync-workflows` | Trigger workflow sync on the edge node                   |
 | `list-models`    | List model bindings loaded on the edge node              |
-| `driver`         | Manage edge driver containers (subgroup)                 |
-
-| `driver` subcommand | Description                      |
-| ------------------- | -------------------------------- |
-| `driver list`       | List running driver containers (`--all` includes exited) |
-| `driver start`      | Start a stopped driver container |
-| `driver stop`       | Stop a running driver container  |
+| `driver`         | Manage edge driver containers (subgroup — see [below](#cyberwave-edge-driver)) |
 
 ### `cyberwave edge install`
 
@@ -456,6 +509,130 @@ cyberwave edge driver stop cyberwave-driver-624d7fe2    # directly by name
 
 ```bash
 sudo systemctl stop cyberwave-video-grabber.service
+```
+
+## `cyberwave compute`
+
+Manage the cloud node service — a GPU-powered companion that runs ML workloads in the cloud.
+
+| Subcommand  | Description                                              |
+| ----------- | -------------------------------------------------------- |
+| `install`   | Install cyberwave-cloud-node and register a boot service |
+| `uninstall` | Stop and remove the boot service                         |
+| `start`     | Start the cloud node                                     |
+| `stop`      | Stop the cloud node                                      |
+| `restart`   | Restart the cloud node                                   |
+| `status`    | Check if the cloud node is running                       |
+| `logs`      | Show cloud node logs                                     |
+
+```bash
+sudo cyberwave compute install
+sudo cyberwave compute install --channel dev
+cyberwave compute start --slug my-gpu-node --profile gpu-a100
+cyberwave compute status
+cyberwave compute logs -f
+cyberwave compute stop
+```
+
+## `cyberwave model`
+
+Manage local ML model bindings on edge nodes. For most use cases, configure models via UI Workflows instead; these commands are for local/offline configuration.
+
+| Subcommand | Description                           |
+| ---------- | ------------------------------------- |
+| `list`     | List available edge-compatible models |
+| `bind`     | Configure a model for local inference |
+| `show`     | Show current model configuration      |
+| `remove`   | Remove a model binding                |
+
+```bash
+cyberwave model list
+cyberwave model bind --model yolov8n --twin-uuid <UUID>
+cyberwave model show
+cyberwave model remove yolov8n
+```
+
+## `cyberwave plugin`
+
+Manage edge node plugins (advanced — most users should use `cyberwave model` or UI Workflows).
+
+| Subcommand  | Description           |
+| ----------- | --------------------- |
+| `list`      | List available plugins |
+| `info`      | Show plugin details    |
+| `install`   | Install/enable a plugin |
+| `uninstall` | Uninstall a plugin     |
+
+```bash
+cyberwave plugin list
+cyberwave plugin info yolo
+cyberwave plugin install yolo
+cyberwave plugin uninstall yolo
+```
+
+## `cyberwave environment`
+
+Browse and inspect environments.
+
+| Subcommand | Description                         |
+| ---------- | ----------------------------------- |
+| `list`     | List environments (table or `--json`) |
+| `show`     | Show environment details and twins  |
+
+```bash
+cyberwave environment list
+cyberwave environment list --json
+cyberwave environment show <UUID>
+```
+
+## `cyberwave scan`
+
+Discover IP cameras and NVRs on the local network using TCP port scanning, ONVIF WS-Discovery, and UPnP/SSDP.
+
+```bash
+cyberwave scan                        # auto-detect subnet
+cyberwave scan -s 10.0.0              # specific subnet
+cyberwave scan --json                 # JSON output
+cyberwave scan --no-ports             # discovery protocols only
+cyberwave scan -t 2.0                 # increase timeout
+```
+
+## `cyberwave camera`
+
+Bootstrap a camera edge project — creates an environment, twin, and edge config for an IP camera.
+
+```bash
+cyberwave camera
+cyberwave camera -u "rtsp://192.168.1.100:554/stream"
+```
+
+## `cyberwave so101`
+
+Bootstrap a new SO-101 robot arm project. Clones the starter template and runs setup scripts.
+
+```bash
+cyberwave so101                       # default directory (./so101-project)
+cyberwave so101 ~/projects/my-robot   # custom path
+```
+
+## `cyberwave manifest`
+
+Validate `cyberwave.yml` manifest files.
+
+```bash
+cyberwave manifest validate                          # default: ./cyberwave.yml
+cyberwave manifest validate path/to/cyberwave.yml
+cyberwave manifest validate --lenient                # unknown fields as warnings
+```
+
+## `cyberwave configure`
+
+Set API credentials directly without the interactive login flow. Useful when you already have a token from the dashboard.
+
+```bash
+cyberwave configure --token YOUR_TOKEN
+cyberwave configure --token YOUR_TOKEN --base-url http://localhost:8000
+cyberwave configure --show
 ```
 
 ## Configuration
