@@ -138,10 +138,10 @@ def _get_worker_manager():  # type: ignore[no-untyped-def]
     environment_uuid = load_environment_uuid()
     if not environment_uuid:
         console.print(
-            "[yellow]⚠[/yellow] No linked environment found. "
+            "[red]✗[/red] No linked environment found. "
             "Run [bold]cyberwave link[/bold] to associate this edge with an environment."
         )
-        environment_uuid = ""
+        sys.exit(1)
 
     twin_uuids: list[str] = []
     if environment_uuid:
@@ -156,7 +156,7 @@ def _get_worker_manager():  # type: ignore[no-untyped-def]
 
     return WorkerManager(
         config_dir=EDGE_CONFIG_DIR,
-        environment_uuid=environment_uuid or "",
+        environment_uuid=environment_uuid,
         token=token,
         twin_uuids=twin_uuids,
         image=resolve_worker_image(),
@@ -631,11 +631,11 @@ def worker_start() -> None:
     ok = wm.start()
     if ok:
         console.print(
-            f"[green]✓[/green] Worker container [bold]{wm._container_name}[/bold] started"
+            f"[green]✓[/green] Worker container [bold]{wm.container_name}[/bold] started"
         )
     else:
         console.print(
-            f"[red]✗[/red] Failed to start worker container [bold]{wm._container_name}[/bold]"
+            f"[red]✗[/red] Failed to start worker container [bold]{wm.container_name}[/bold]"
         )
         sys.exit(1)
 
@@ -652,7 +652,7 @@ def worker_stop() -> None:
     ok = wm.stop()
     if ok:
         console.print(
-            f"[green]✓[/green] Worker container [bold]{wm._container_name}[/bold] stopped"
+            f"[green]✓[/green] Worker container [bold]{wm.container_name}[/bold] stopped"
         )
     else:
         console.print("[red]✗[/red] Failed to stop worker container")
@@ -673,7 +673,7 @@ def worker_restart() -> None:
     ok = wm.restart()
     if ok:
         console.print(
-            f"[green]✓[/green] Worker container [bold]{wm._container_name}[/bold] restarted"
+            f"[green]✓[/green] Worker container [bold]{wm.container_name}[/bold] restarted"
         )
     else:
         console.print("[red]✗[/red] Failed to restart worker container")
@@ -698,12 +698,12 @@ def worker_health() -> None:
         sys.exit(1)
 
     wm = _get_worker_manager()
-    health_monitor = WorkerHealthMonitor(container_name=wm._container_name)
+    health_monitor = WorkerHealthMonitor(container_name=wm.container_name)
     wm.set_health_monitor(health_monitor)
     ws = wm.status()
     hs = ws.health_state
 
-    console.print(f"\n[bold]Worker Health — {wm._container_name}[/bold]\n")
+    console.print(f"\n[bold]Worker Health — {wm.container_name}[/bold]\n")
 
     status_color = (
         "green"

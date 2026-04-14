@@ -208,6 +208,10 @@ def test_setup_camera_stream_force_calls_teardown(monkeypatch):
     monkeypatch.setattr(macos, "_camera_stream_plist_path", lambda: MagicMock())
     monkeypatch.setattr(macos, "_camera_stream_log_path", lambda: MagicMock())
     monkeypatch.setattr(macos, "_chown_to_real_user", lambda *a, **kw: None)
+    monkeypatch.setattr(macos, "_write_file_as_real_user", lambda *a, **kw: None)
+    monkeypatch.setattr(macos, "_resolve_real_user", lambda: ("user", 501, 20))
+    monkeypatch.setattr(macos, "_bootout_launchd_service", lambda *a, **kw: None)
+    monkeypatch.setattr(macos, "_run", lambda *a, **kw: MagicMock())
 
     macos.setup_camera_stream_server(force=True)
     assert "teardown" in calls
