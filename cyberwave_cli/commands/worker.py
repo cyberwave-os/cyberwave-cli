@@ -20,9 +20,11 @@ Example usage:
     cyberwave worker monitor                # Live resource/throughput dashboard
 """
 
+import logging
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -33,6 +35,8 @@ from rich.table import Table
 
 from ..config import CONFIG_DIR
 from ..utils import colorize_log_line
+
+logger = logging.getLogger(__name__)
 
 console = Console()
 
@@ -104,6 +108,61 @@ def _find_worker_container(*, include_stopped: bool = False) -> str | None:
     return None
 
 
+def _get_worker_manager():  # type: ignore[no-untyped-def]
+    """Build a WorkerManager from the current edge configuration.
+
+    Requires ``cyberwave-edge-core`` to be installed.  Prints a helpful
+    error and exits when the package is missing.
+    """
+    try:
+        from cyberwave_edge_core.startup import (
+            _list_linked_twin_uuids_for_fingerprint,
+            get_or_create_fingerprint,
+            load_environment_uuid,
+            load_token,
+        )
+        from cyberwave_edge_core.startup import CONFIG_DIR as EDGE_CONFIG_DIR
+        from cyberwave_edge_core.worker_manager import WorkerManager, resolve_worker_image
+    except ImportError:
+        console.print(
+            "[red]✗[/red] cyberwave-edge-core is required for this command.\n"
+            "  Install it with: [bold]cyberwave edge install[/bold]"
+        )
+        sys.exit(1)
+
+    token = load_token()
+    if not token:
+        console.print("[red]✗[/red] No credentials found. Run [bold]cyberwave login[/bold] first.")
+        sys.exit(1)
+
+    environment_uuid = load_environment_uuid()
+    if not environment_uuid:
+        console.print(
+            "[yellow]⚠[/yellow] No linked environment found. "
+            "Run [bold]cyberwave link[/bold] to associate this edge with an environment."
+        )
+        environment_uuid = ""
+
+    twin_uuids: list[str] = []
+    if environment_uuid:
+        try:
+            fingerprint = get_or_create_fingerprint()
+            if fingerprint:
+                twin_uuids = _list_linked_twin_uuids_for_fingerprint(
+                    token, environment_uuid, fingerprint
+                )
+        except Exception:
+            logger.debug("Failed to resolve twin UUIDs for environment", exc_info=True)
+
+    return WorkerManager(
+        config_dir=EDGE_CONFIG_DIR,
+        environment_uuid=environment_uuid or "",
+        token=token,
+        twin_uuids=twin_uuids,
+        image=resolve_worker_image(),
+    )
+
+
 @click.group()
 def worker() -> None:
     """Manage local worker files for edge inference.
@@ -124,6 +183,9 @@ def worker() -> None:
       cyberwave worker list                 # Verify it's registered
       cyberwave worker status               # Check container state
     """
+    from ..core import _migrate_legacy_config_dir
+
+    _migrate_legacy_config_dir()
 
 
 @worker.command("list")
@@ -338,7 +400,7 @@ def worker_logs(follow: bool, tail: int, container: str | None) -> None:
     if not container_name:
         console.print("[red]✗[/red] Worker container not found.")
         console.print(
-            "[dim]Start the worker container with: cyberwave-edge-core worker start[/dim]"
+            "[dim]Start the worker container with: cyberwave worker start[/dim]"
         )
         raise click.Abort()
 
@@ -404,7 +466,7 @@ def worker_status(container: str | None) -> None:
     if not container_name:
         console.print("  [yellow]⚠[/yellow] No worker container found.")
         console.print(
-            "  [dim]Start with: cyberwave-edge-core worker start[/dim]"
+            "  [dim]Start with: cyberwave worker start[/dim]"
         )
         console.print()
         return
@@ -498,7 +560,7 @@ def worker_monitor(update: float, container: str | None) -> None:
     if not container_name:
         console.print("[red]✗[/red] Worker container not found.")
         console.print(
-            "[dim]Start the worker container with: cyberwave-edge-core worker start[/dim]"
+            "[dim]Start the worker container with: cyberwave worker start[/dim]"
         )
         raise click.Abort()
 
@@ -547,3 +609,146 @@ def worker_monitor(update: float, container: str | None) -> None:
         if zenoh_ok:
             zenoh_reader.stop()
         console.print("\n[dim]Monitor stopped.[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# Worker container lifecycle commands (delegated to cyberwave-edge-core)
+# ---------------------------------------------------------------------------
+
+
+@worker.command("start")
+def worker_start() -> None:
+    """Start the worker container.
+
+    Requires cyberwave-edge-core to be installed. Ensures model weights
+    are cached before launching.
+
+    \b
+    Examples:
+        cyberwave worker start
+    """
+    wm = _get_worker_manager()
+    ok = wm.start()
+    if ok:
+        console.print(
+            f"[green]✓[/green] Worker container [bold]{wm._container_name}[/bold] started"
+        )
+    else:
+        console.print(
+            f"[red]✗[/red] Failed to start worker container [bold]{wm._container_name}[/bold]"
+        )
+        sys.exit(1)
+
+
+@worker.command("stop")
+def worker_stop() -> None:
+    """Stop the worker container.
+
+    \b
+    Examples:
+        cyberwave worker stop
+    """
+    wm = _get_worker_manager()
+    ok = wm.stop()
+    if ok:
+        console.print(
+            f"[green]✓[/green] Worker container [bold]{wm._container_name}[/bold] stopped"
+        )
+    else:
+        console.print("[red]✗[/red] Failed to stop worker container")
+        sys.exit(1)
+
+
+@worker.command("restart")
+def worker_restart() -> None:
+    """Restart the worker container.
+
+    Re-scans worker files and re-ensures model weights are cached.
+
+    \b
+    Examples:
+        cyberwave worker restart
+    """
+    wm = _get_worker_manager()
+    ok = wm.restart()
+    if ok:
+        console.print(
+            f"[green]✓[/green] Worker container [bold]{wm._container_name}[/bold] restarted"
+        )
+    else:
+        console.print("[red]✗[/red] Failed to restart worker container")
+        sys.exit(1)
+
+
+@worker.command("health")
+def worker_health() -> None:
+    """Show detailed worker health: restart history and circuit-breaker state.
+
+    \b
+    Examples:
+        cyberwave worker health
+    """
+    try:
+        from cyberwave_edge_core.worker_health import WorkerHealthMonitor
+    except ImportError:
+        console.print(
+            "[red]✗[/red] cyberwave-edge-core is required for this command.\n"
+            "  Install it with: [bold]cyberwave edge install[/bold]"
+        )
+        sys.exit(1)
+
+    wm = _get_worker_manager()
+    health_monitor = WorkerHealthMonitor(container_name=wm._container_name)
+    wm.set_health_monitor(health_monitor)
+    ws = wm.status()
+    hs = ws.health_state
+
+    console.print(f"\n[bold]Worker Health — {wm._container_name}[/bold]\n")
+
+    status_color = (
+        "green"
+        if ws.status == "running"
+        else ("yellow" if ws.status in {"restarting", "created"} else "red")
+    )
+    console.print(f"  Container status: [{status_color}]{ws.status}[/{status_color}]")
+
+    if hs is not None:
+        healthy_label = "[green]healthy[/green]" if hs.is_healthy else "[red]unhealthy[/red]"
+        ready_label = "[green]ready[/green]" if hs.is_ready else "[yellow]not ready[/yellow]"
+        console.print(f"  Health:           {healthy_label}")
+        console.print(f"  Readiness:        {ready_label}")
+
+        if hs.uptime_seconds is not None:
+            console.print(f"  Uptime:           {hs.uptime_seconds:.0f}s")
+
+        console.print("\n  [bold]Restart accounting:[/bold]")
+        console.print(f"    Total:    {hs.restart_count}")
+        console.print(f"    Recent:   {hs.recent_restarts} (5-min window)")
+
+        if hs.circuit_breaker_tripped:
+            import datetime
+
+            tripped_ts = (
+                datetime.datetime.fromtimestamp(hs.circuit_breaker_tripped_at).isoformat()
+                if hs.circuit_breaker_tripped_at
+                else "unknown"
+            )
+            console.print(f"\n  [bold red]Circuit-breaker: TRIPPED[/bold red] at {tripped_ts}")
+            console.print("  Automatic restarts are suppressed until the 5-minute window clears.")
+        else:
+            console.print("\n  Circuit-breaker: [green]closed[/green]")
+
+        if hs.restart_records:
+            console.print(f"\n  [bold]Restart history ({len(hs.restart_records)} events):[/bold]")
+            import datetime
+
+            for rec in hs.restart_records[-10:]:
+                ts = datetime.datetime.fromtimestamp(rec.timestamp).strftime("%H:%M:%S")
+                ok_label = "[green]ok[/green]" if rec.success else "[red]failed[/red]"
+                console.print(f"    {ts}  {rec.reason:<30} {ok_label}")
+        else:
+            console.print("\n  [dim]No restarts recorded in this session[/dim]")
+    else:
+        console.print("\n  [dim]Health monitor not available[/dim]")
+
+    console.print()

@@ -1,17 +1,17 @@
 """Configuration and constants for the Cyberwave CLI."""
 
 import os
-import platform
 import sys
 from pathlib import Path
 
 # Config directory shared by CLI, edge-core service, and driver containers.
-# - macOS defaults to ~/.cyberwave for Docker Desktop bind-mount compatibility
-# - other platforms prefer /etc/cyberwave and fall back to ~/.cyberwave when
-#   /etc is not writable
-# CYBERWAVE_EDGE_CONFIG_DIR always overrides the default.
-_SYSTEM_CONFIG_DIR = Path("/etc/cyberwave")
-_USER_CONFIG_DIR = Path.home() / ".cyberwave"
+# All platforms resolve to ``~/.cyberwave`` under the invoking user's home
+# (even when running via ``sudo``).
+# ``CYBERWAVE_EDGE_CONFIG_DIR`` always overrides the default.
+#
+# Legacy: Linux previously used ``/etc/cyberwave``.  A migration helper in
+# ``core.py`` copies config from there on first install after the change.
+LEGACY_SYSTEM_CONFIG_DIR = Path("/etc/cyberwave")
 
 
 def _resolve_sudo_user_home() -> Path | None:
@@ -31,50 +31,24 @@ def _resolve_sudo_user_home() -> Path | None:
     return Path(home)
 
 
-def _resolve_macos_config_dir() -> Path:
-    """Resolve a Docker Desktop-friendly config dir on macOS.
-
-    On macOS, storing edge config under /etc can fail when Docker Desktop
-    tries to bind-mount it into driver containers. Prefer the invoking user's
-    home directory so both regular and sudo executions converge to the same
-    path (e.g. /Users/alice/.cyberwave).
-    """
-    sudo_home = _resolve_sudo_user_home()
-    base_home = sudo_home or Path.home()
-    return base_home / ".cyberwave"
-
-
 def _resolve_config_dir() -> Path:
-    """Pick the best writable config directory.
+    """Pick the config directory.
 
     Priority:
       1. ``CYBERWAVE_EDGE_CONFIG_DIR`` env var (explicit override)
-      2. On macOS: ``~/.cyberwave`` for Docker bind-mount compatibility
-      3. On other platforms: ``/etc/cyberwave`` if writable/creatable
-      4. ``~/.cyberwave`` as a fallback for non-root users
+      2. ``~/.cyberwave`` under the invoking user's home (all platforms)
+
+    When running via ``sudo``, the invoking user's home is resolved from
+    ``SUDO_USER`` so that both regular and sudo invocations converge to the
+    same directory.
     """
     env_override = os.getenv("CYBERWAVE_EDGE_CONFIG_DIR")
     if env_override:
         return Path(env_override)
 
-    if platform.system() == "Darwin":
-        return _resolve_macos_config_dir()
-
-    # Prefer /etc/cyberwave if we can write to it. If it already exists and is
-    # not writable, fall back to user config immediately.
-    if _SYSTEM_CONFIG_DIR.exists():
-        if os.access(_SYSTEM_CONFIG_DIR, os.W_OK):
-            return _SYSTEM_CONFIG_DIR
-        return _USER_CONFIG_DIR
-
-    # Try to create it (works when running as root)
-    try:
-        _SYSTEM_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        return _SYSTEM_CONFIG_DIR
-    except PermissionError:
-        pass
-
-    return _USER_CONFIG_DIR
+    sudo_home = _resolve_sudo_user_home()
+    base_home = sudo_home or Path.home()
+    return base_home / ".cyberwave"
 
 
 CONFIG_DIR = _resolve_config_dir()
@@ -84,10 +58,10 @@ CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 def chown_to_sudo_user(*paths: "os.PathLike[str]") -> None:
     """Best-effort chown to the invoking (non-root) user when running via sudo.
 
-    On macOS the config dir lives under the user's home.  Files created by
+    The config dir lives under the user's home.  Files created by
     ``sudo cyberwave …`` end up owned by root, which locks out subsequent
     non-sudo invocations.  Restoring ownership avoids the "permission denied /
-    re-run with sudo" loop that macOS users hit.
+    re-run with sudo" loop.
     """
     sudo_uid = os.environ.get("SUDO_UID")
     sudo_gid = os.environ.get("SUDO_GID")

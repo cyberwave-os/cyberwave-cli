@@ -269,7 +269,9 @@ def _show_macos_launchagent_logs(*, follow: bool, lines: int) -> None:
 @click.group()
 def edge():
     """Manage the edge node service."""
-    pass
+    from ..core import _migrate_legacy_config_dir
+
+    _migrate_legacy_config_dir()
 
 
 @edge.command("install")
@@ -297,7 +299,7 @@ def edge():
     "--reconfigure-camera",
     is_flag=True,
     default=False,
-    help="Re-run camera selection without a full reinstall (macOS only)",
+    help="Re-run camera detection and save to cameras.json",
 )
 @click.option(
     "--without-workers",
@@ -323,25 +325,28 @@ def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, wit
         cyberwave edge install --channel staging --version 0.0.42.595
     """
     if reconfigure_camera:
-        from ..macos import (
-            is_macos,
-            setup_camera_stream_server,
-            start_edge_core_service,
-            stop_edge_core_service,
-        )
+        from ..macos import is_macos
 
-        if not is_macos():
-            console.print("[yellow]--reconfigure-camera is only available on macOS.[/yellow]")
-            raise SystemExit(1)
-        try:
-            if not setup_camera_stream_server(force=True):
+        if is_macos():
+            from ..macos import (
+                setup_camera_stream_server,
+                start_edge_core_service,
+                stop_edge_core_service,
+            )
+
+            try:
+                if not setup_camera_stream_server(force=True):
+                    raise SystemExit(1)
+                console.print("[cyan]Restarting edge-core so the driver reconnects...[/cyan]")
+                stop_edge_core_service()
+                start_edge_core_service()
+            except KeyboardInterrupt:
+                console.print("\n[dim]Aborted.[/dim]")
                 raise SystemExit(1)
-            console.print("[cyan]Restarting edge-core so the driver reconnects...[/cyan]")
-            stop_edge_core_service()
-            start_edge_core_service()
-        except KeyboardInterrupt:
-            console.print("\n[dim]Aborted.[/dim]")
-            raise SystemExit(1)
+        else:
+            from ..core import _detect_and_select_cameras
+
+            _detect_and_select_cameras()
         return
 
     from ..core import setup_edge_core
@@ -896,6 +901,64 @@ def status_edge():
         console.print(f"[red]Error checking driver containers: {e}[/red]")
 
 
+@edge.command("cameras")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Output as JSON")
+@click.option("--save", is_flag=True, default=False, help="Save results to cameras.json")
+def list_cameras(as_json: bool, save: bool):
+    """List cameras detected on this edge device.
+
+    Discovers connected cameras using platform-native tools:
+    Linux uses v4l2-ctl, macOS uses AVFoundation (ffmpeg).
+
+    \b
+    Examples:
+        cyberwave edge cameras
+        cyberwave edge cameras --json
+        cyberwave edge cameras --save
+    """
+    import platform as _platform
+
+    from ..device_utils import discover_usb_cameras
+
+    system = _platform.system()
+    cameras = discover_usb_cameras()
+
+    if as_json:
+        click.echo(json.dumps([c.to_dict() for c in cameras], indent=2))
+    elif not cameras:
+        if system == "Linux":
+            console.print("[yellow]No cameras detected.[/yellow]")
+            if not shutil.which("v4l2-ctl"):
+                console.print("[dim]Install v4l-utils: sudo apt-get install v4l-utils[/dim]")
+        elif system == "Darwin":
+            console.print("[yellow]No cameras detected.[/yellow]")
+            if not shutil.which("ffmpeg"):
+                console.print("[dim]Install ffmpeg: brew install ffmpeg[/dim]")
+        else:
+            console.print(f"[yellow]Camera discovery not supported on {system}.[/yellow]")
+    else:
+        console.print(f"\n[bold]Detected {len(cameras)} camera(s):[/bold]\n")
+        for i, cam in enumerate(cameras):
+            idx_str = cam.index if cam.index is not None else i
+            console.print(f"  [bold cyan]{idx_str}[/bold cyan])  {cam.card}")
+            if cam.primary_path:
+                console.print(f"       Device: {cam.primary_path}")
+            if cam.bus_info:
+                console.print(f"       Bus:    {cam.bus_info}")
+            if cam.driver:
+                console.print(f"       Driver: {cam.driver}")
+            if cam.serial:
+                console.print(f"       Serial: {cam.serial}")
+            console.print()
+
+    if save and cameras:
+        from ..config import CONFIG_DIR
+        from ..device_utils import write_cameras_json
+
+        write_cameras_json(cameras, CONFIG_DIR)
+        console.print(f"[green]✓[/green] Saved to {CONFIG_DIR / 'cameras.json'}")
+
+
 @edge.group("driver")
 def driver():
     """Manage edge driver containers."""
@@ -1199,14 +1262,28 @@ def show_logs(follow, lines):
         "journalctl",
         "-u",
         service_name,
-        f"-n{lines}", "--no-pager", "--output=short-iso",
+        f"-n{lines}", "--no-pager", "--output=cat",
     ]
     if follow:
         cmd.append("-f")
 
     try:
-        result = subprocess.run(cmd, env=clean_subprocess_env(), check=False)
-        if result.returncode != 0:
+        proc = subprocess.Popen(
+            cmd,
+            env=clean_subprocess_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                console.print(colorize_log_line(line.rstrip("\n")))
+        except KeyboardInterrupt:
+            pass
+        finally:
+            proc.terminate()
+            proc.wait()
+        if proc.returncode and proc.returncode not in (0, -15):
             console.print("[dim]Tip: run with sudo if you see no output.[/dim]")
     except FileNotFoundError:
         console.print("[red]journalctl not found. Is systemd available on this host?[/red]")

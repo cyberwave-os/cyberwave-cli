@@ -307,7 +307,11 @@ ZENOH_LISTEN_PORT = 7447
 
 
 def get_container_ip(container_name: str) -> str | None:
-    """Return the bridge-network IP of a Docker container, or ``None``."""
+    """Return the bridge-network IP of a Docker container, or ``None``.
+
+    Host-mode containers have no bridge IP; some Docker versions return
+    the literal ``"invalid IP"`` instead of an empty string.
+    """
     try:
         result = subprocess.run(
             [
@@ -323,11 +327,19 @@ def get_container_ip(container_name: str) -> str | None:
         )
         if result.returncode == 0:
             ip = result.stdout.strip()
-            if ip:
+            if ip and _is_valid_ip(ip):
                 return ip
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return None
+
+
+def _is_valid_ip(value: str) -> bool:
+    """Return True if *value* looks like a valid IPv4 address."""
+    parts = value.split(".")
+    if len(parts) != 4:
+        return False
+    return all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
 
 
 # ---------------------------------------------------------------------------
@@ -640,8 +652,9 @@ class ZenohStatsReader:
                     connect = [f"tcp/127.0.0.1:{ZENOH_LISTEN_PORT}"]
                 else:
                     ip = get_container_ip(container_name)
-                    if ip:
-                        connect = [f"tcp/{ip}:{ZENOH_LISTEN_PORT}"]
+                    connect = [f"tcp/{ip}:{ZENOH_LISTEN_PORT}"] if ip else [
+                        f"tcp/127.0.0.1:{ZENOH_LISTEN_PORT}"
+                    ]
             cfg = zenoh.Config()
             if connect:
                 cfg.insert_json5("connect/endpoints", json.dumps(connect))

@@ -4,12 +4,14 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import click
 from rich.console import Console
 
 from .config import CONFIG_DIR, CREDENTIALS_FILE, chown_to_sudo_user
+from .io_utils import atomic_write_json
 
 _console = Console()
 
@@ -110,8 +112,51 @@ class Credentials:
         )
 
 
+def _infer_env_from_base_url(base_url: str) -> dict[str, str]:
+    """Derive CYBERWAVE_ENVIRONMENT, MQTT_HOST, MQTT_PORT and MQTT_USE_TLS from a base URL.
+
+    Mapping:
+        https://api-dev.cyberwave.com   → dev,  dev.mqtt.cyberwave.com:8883, TLS
+        https://api-staging.cyberwave.com → staging, staging.mqtt.cyberwave.com:8883, TLS
+        https://api.cyberwave.com       → production, mqtt.cyberwave.com:8883, TLS
+        http://localhost:*              → local, localhost:1883, no TLS
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base_url)
+    host = (parsed.hostname or "").lower()
+
+    inferred: dict[str, str] = {}
+
+    if host in ("localhost", "127.0.0.1"):
+        inferred["CYBERWAVE_ENVIRONMENT"] = "local"
+        inferred["CYBERWAVE_MQTT_HOST"] = "localhost"
+        inferred["CYBERWAVE_MQTT_PORT"] = "1883"
+    elif host.endswith(".cyberwave.com"):
+        prefix = host.removesuffix(".cyberwave.com")
+        if prefix.startswith("api-"):
+            env_name = prefix[4:]  # e.g. "dev", "staging"
+            inferred["CYBERWAVE_ENVIRONMENT"] = env_name
+            inferred["CYBERWAVE_MQTT_HOST"] = f"{env_name}.mqtt.cyberwave.com"
+            inferred["CYBERWAVE_MQTT_PORT"] = "8883"
+            inferred["CYBERWAVE_MQTT_USE_TLS"] = "true"
+        else:
+            inferred["CYBERWAVE_ENVIRONMENT"] = "production"
+            inferred["CYBERWAVE_MQTT_HOST"] = "mqtt.cyberwave.com"
+            inferred["CYBERWAVE_MQTT_PORT"] = "8883"
+            inferred["CYBERWAVE_MQTT_USE_TLS"] = "true"
+
+    return inferred
+
+
 def collect_runtime_env_overrides(*, api_url_override: Optional[str] = None) -> dict[str, str]:
-    """Collect Cyberwave environment overrides from the current process."""
+    """Collect Cyberwave environment overrides from the current process.
+
+    Explicit env vars always win.  When ``CYBERWAVE_BASE_URL`` is known
+    (either from the environment or *api_url_override*) but other vars are
+    missing, they are inferred from the URL so that a single
+    ``--base-url`` flag is enough to fully configure the CLI.
+    """
     overrides: dict[str, str] = {}
     for key in (
         "CYBERWAVE_ENVIRONMENT",
@@ -119,6 +164,7 @@ def collect_runtime_env_overrides(*, api_url_override: Optional[str] = None) -> 
         "CYBERWAVE_BASE_URL",
         "CYBERWAVE_MQTT_HOST",
         "CYBERWAVE_MQTT_PORT",
+        "CYBERWAVE_MQTT_USE_TLS",
     ):
         value = os.getenv(key)
         if isinstance(value, str) and value.strip():
@@ -126,6 +172,11 @@ def collect_runtime_env_overrides(*, api_url_override: Optional[str] = None) -> 
 
     if api_url_override and api_url_override.strip():
         overrides["CYBERWAVE_BASE_URL"] = api_url_override.strip()
+
+    base_url = overrides.get("CYBERWAVE_BASE_URL", "").strip()
+    if base_url:
+        for key, value in _infer_env_from_base_url(base_url).items():
+            overrides.setdefault(key, value)
 
     # In non-production explicit environments, default edge-core to verbose logs.
     env_name = overrides.get("CYBERWAVE_ENVIRONMENT", "").strip().lower()
@@ -174,22 +225,17 @@ def save_credentials(credentials: Credentials) -> None:
     existing_envs = existing_payload.get("envs")
     payload_envs = payload.get("envs")
     if isinstance(existing_envs, dict) or isinstance(payload_envs, dict):
-        merged_payload["envs"] = {
+        merged_envs = {
             **(existing_envs if isinstance(existing_envs, dict) else {}),
             **(payload_envs if isinstance(payload_envs, dict) else {}),
         }
+        merged_payload["envs"] = merged_envs
     try:
-        with open(CREDENTIALS_FILE, "w") as f:
-            json.dump(merged_payload, f, indent=2)
+        atomic_write_json(CREDENTIALS_FILE, merged_payload)
     except PermissionError:
         _raise_permission_error()
 
-    if os.name != "nt":
-        try:
-            os.chmod(CREDENTIALS_FILE, 0o600)
-        except PermissionError:
-            pass
-        chown_to_sudo_user(CREDENTIALS_FILE)
+    chown_to_sudo_user(CREDENTIALS_FILE)
 
 
 def load_credentials() -> Optional[Credentials]:
@@ -239,14 +285,7 @@ def upsert_runtime_env(key: str, value: str) -> None:
     envs[key] = value
     data["envs"] = envs
 
-    with open(CREDENTIALS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-    if os.name != "nt":
-        try:
-            os.chmod(CREDENTIALS_FILE, 0o600)
-        except PermissionError:
-            pass
+    atomic_write_json(CREDENTIALS_FILE, data)
 
 
 def get_token() -> Optional[str]:

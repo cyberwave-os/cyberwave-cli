@@ -232,11 +232,11 @@ when you need to customise their logic:
 
 ```bash
 # 1. Copy the generated worker to a custom name
-cp /etc/cyberwave/workers/wf_a1b2c3d4.py \
-   /etc/cyberwave/workers/my_detector.py
+cp ~/.cyberwave/workers/wf_a1b2c3d4.py \
+   ~/.cyberwave/workers/my_detector.py
 
 # 2. Edit your copy
-nano /etc/cyberwave/workers/my_detector.py
+nano ~/.cyberwave/workers/my_detector.py
 
 # 3. Deactivate the originating workflow in the UI
 #    The wf_a1b2c3d4.py file will be removed on the next edge sync.
@@ -342,7 +342,7 @@ Prints the resolved configuration directory path. Useful in scripts to locate cr
 
 ```bash
 cyberwave config-dir
-# /etc/cyberwave
+# ~/.cyberwave
 
 CONFIG_DIR=$(cyberwave config-dir)
 cat "$CONFIG_DIR/credentials.json"
@@ -644,8 +644,9 @@ cyberwave configure --show
 Configuration is stored in a single directory shared by the CLI and the edge-core service. The directory is resolved as follows:
 
 1. **`CYBERWAVE_EDGE_CONFIG_DIR`** env var — explicit override
-2. **`/etc/cyberwave`** — system-wide (preferred, requires root or write access)
-3. **`~/.cyberwave`** — per-user fallback for non-root environments
+2. **`~/.cyberwave`** — per-user directory (owner-only permissions `0700`)
+
+Legacy installs that used `/etc/cyberwave` are automatically migrated on first CLI invocation.
 
 Run `cyberwave config-dir` to see which directory is active.
 

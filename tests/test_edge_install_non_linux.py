@@ -80,6 +80,7 @@ def test_setup_edge_core_macos_calls_usbip_setup(monkeypatch):
     _mock_is_macos(monkeypatch, core, True)
     monkeypatch.setattr(core, "_is_macos", lambda: True)
     monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_any_twin_has_camera_sensor", lambda: True)
     monkeypatch.setattr(
         core,
         "install_service_package",
@@ -149,6 +150,7 @@ def test_setup_edge_core_force_reinstall_passes_force_to_helpers(monkeypatch):
     monkeypatch.setattr(core, "_is_linux", lambda: False)
     _mock_is_macos(monkeypatch, core, True)
     monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_any_twin_has_camera_sensor", lambda: True)
     monkeypatch.setattr(
         core,
         "install_service_package",
@@ -186,6 +188,7 @@ def test_setup_edge_core_default_does_not_force(monkeypatch):
     monkeypatch.setattr(core, "_is_linux", lambda: False)
     _mock_is_macos(monkeypatch, core, True)
     monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_any_twin_has_camera_sensor", lambda: True)
     monkeypatch.setattr(
         core,
         "install_service_package",

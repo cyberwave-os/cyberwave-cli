@@ -31,7 +31,13 @@ from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
 from .auth import APIToken, AuthClient, AuthenticationError
-from .config import CONFIG_DIR, chown_to_sudo_user, clean_subprocess_env, get_api_url
+from .config import (
+    CONFIG_DIR,
+    LEGACY_SYSTEM_CONFIG_DIR,
+    chown_to_sudo_user,
+    clean_subprocess_env,
+    get_api_url,
+)
 from .credentials import (
     Credentials,
     collect_runtime_env_overrides,
@@ -41,7 +47,6 @@ from .credentials import (
 from .macos import init_console as _init_macos_console
 from .macos import (
     is_macos,
-    is_usbip_server_running,
     setup_camera_stream_server,
     setup_usbip_server,
 )
@@ -79,7 +84,7 @@ SYSTEMD_UNIT_TEMPLATE = textwrap.dedent("""\
     ExecStart={binary_path}
     Restart=on-failure
     RestartSec=5
-    Environment=CYBERWAVE_EDGE_CONFIG_DIR=/etc/cyberwave
+    Environment=CYBERWAVE_EDGE_CONFIG_DIR={config_dir}
     StandardOutput=journal
     StandardError=journal
     SyslogIdentifier=cyberwave-edge-core
@@ -192,6 +197,68 @@ def _has_systemd() -> bool:
     return Path("/run/systemd/system").is_dir()
 
 
+def _copy_and_harden(src: Path, dst: Path) -> bool:
+    """Copy *src* to *dst*, lock permissions to owner-only, and fix ownership.
+
+    Returns True on success, False on OSError.
+    """
+    try:
+        shutil.copy2(src, dst)
+        if os.name != "nt":
+            os.chmod(dst, 0o600)
+        chown_to_sudo_user(dst)
+        return True
+    except OSError:
+        return False
+
+
+def _migrate_legacy_config_dir() -> None:
+    """Copy config files from ``/etc/cyberwave`` to the user's ``~/.cyberwave``.
+
+    Old CLI versions stored config under ``/etc/cyberwave`` on Linux.  When
+    upgrading, we copy files across so the user doesn't have to re-login or
+    reconfigure.  Existing files in the target directory are never overwritten.
+    """
+    legacy = LEGACY_SYSTEM_CONFIG_DIR
+    target = CONFIG_DIR
+
+    if legacy == target:
+        return
+
+    try:
+        if not legacy.is_dir():
+            return
+    except OSError:
+        return
+
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    migrated = 0
+    try:
+        for name in ("credentials.json", "environment.json", "fingerprint.json"):
+            src = legacy / name
+            dst = target / name
+            if src.is_file() and not dst.exists() and _copy_and_harden(src, dst):
+                migrated += 1
+
+        for src in legacy.glob("*.json"):
+            if src.name in ("credentials.json", "environment.json", "fingerprint.json"):
+                continue
+            dst = target / src.name
+            if not dst.exists() and _copy_and_harden(src, dst):
+                migrated += 1
+    except OSError:
+        pass
+
+    chown_to_sudo_user(target)
+
+    if migrated:
+        console.print(f"[cyan]Migrated {migrated} config file(s) from {legacy} to {target}[/cyan]")
+
+
 def is_service_active(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
     """Return True if the systemd service described by ``spec`` is currently active."""
     if not _has_systemd():
@@ -212,6 +279,20 @@ def _run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.Complete
     console.print(f"[dim]$ {' '.join(cmd)}[/dim]")
     kwargs.setdefault("env", clean_subprocess_env())
     return subprocess.run(cmd, check=check, **kwargs)
+
+
+def _sudo_systemctl(action: str, unit: str, *, check: bool = True) -> subprocess.CompletedProcess:
+    """Run ``systemctl <action> <unit>``, escalating via ``sudo`` when not root.
+
+    Prints the same "Root privileges required" notification used by
+    ``setup_service`` so the user experience is consistent across all
+    CLI commands that manage systemd services.
+    """
+    cmd = ["systemctl", action, unit]
+    if os.geteuid() != 0:
+        console.print("[cyan]Root privileges required — requesting sudo...[/cyan]")
+        cmd = ["sudo"] + cmd
+    return _run(cmd, check=check)
 
 
 def _select_with_arrows(title: str, options: list[str]) -> int:
@@ -508,7 +589,9 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                 idx = _select_with_arrows("Select a workspace", labels)
                 workspace = workspaces[idx]
 
-            with console.status(f"[dim]Creating API token for workspace '{workspace.name}'...[/dim]"):
+            with console.status(
+                f"[dim]Creating API token for workspace '{workspace.name}'...[/dim]"
+            ):
                 api_token: APIToken = client.create_api_token(session_token, workspace.uuid)
 
             save_credentials(
@@ -605,9 +688,7 @@ def _workspace_projects(client: Any, workspace_uuid: str) -> list[Any]:
 def _environment_workspace_uuid(environment: Any) -> str:
     """Best-effort workspace UUID extraction for environment objects."""
     workspace_uuid = str(
-        getattr(environment, "workspace_uuid", "")
-        or getattr(environment, "workspace_id", "")
-        or ""
+        getattr(environment, "workspace_uuid", "") or getattr(environment, "workspace_id", "") or ""
     )
     if workspace_uuid:
         return workspace_uuid
@@ -824,7 +905,9 @@ def _select_multiple_with_arrows(title: str, options: list[str]) -> list[int]:
 
         _tty_write("\x1b[2J\x1b[H")
         _tty_write(f"{title}\n")
-        _tty_write("Use \u2191/\u2193 to move, Space to toggle, Enter to confirm, q/Ctrl-C to abort\n\n")
+        _tty_write(
+            "Use \u2191/\u2193 to move, Space to toggle, Enter to confirm, q/Ctrl-C to abort\n\n"
+        )
 
         visible_end = min(scroll_offset + max_visible, len(options))
 
@@ -959,7 +1042,9 @@ def _download_twin_json_files(client: Any, twin_uuids: list[str]) -> int:
             chown_to_sudo_user(CONFIG_DIR, twin_json_file)
             written += 1
         except Exception as exc:
-            console.print(f"[yellow]Failed to download twin JSON for {twin_uuid[:8]}…: {exc}[/yellow]")
+            console.print(
+                f"[yellow]Failed to download twin JSON for {twin_uuid[:8]}…: {exc}[/yellow]"
+            )
 
     return written
 
@@ -1084,9 +1169,7 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
             edge_fingerprint,
         )
         if detached_count:
-            console.print(
-                f"[dim]Removed stale edge fingerprint from twins: {detached_count}[/dim]"
-            )
+            console.print(f"[dim]Removed stale edge fingerprint from twins: {detached_count}[/dim]")
         if detach_failed_count:
             console.print(
                 f"[yellow]Failed to clear stale edge fingerprint from "
@@ -1713,9 +1796,7 @@ def load_launchagent_service(spec: ServiceSpec = CLOUD_NODE_SPEC) -> bool:
         return False
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]launchctl failed (exit {exc.returncode}).[/red]")
-        console.print(
-            "[dim]LaunchAgent loading requires an active macOS GUI login session.[/dim]"
-        )
+        console.print("[dim]LaunchAgent loading requires an active macOS GUI login session.[/dim]")
         return False
 
     console.print(f"[green]LaunchAgent loaded:[/green] {label}")
@@ -1800,7 +1881,7 @@ def create_systemd_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
         return False
 
     binary = _resolve_service_binary(spec)
-    unit_contents = spec.unit_template.format(binary_path=binary)
+    unit_contents = spec.unit_template.format(binary_path=binary, config_dir=CONFIG_DIR)
 
     try:
         spec.unit_path.write_text(unit_contents)
@@ -1850,7 +1931,7 @@ def restart_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
         return False
 
     try:
-        _run(["systemctl", "restart", spec.unit_name])
+        _sudo_systemctl("restart", spec.unit_name)
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]systemctl restart failed (exit {exc.returncode}).[/red]")
         return False
@@ -1873,7 +1954,7 @@ def stop_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
         return False
 
     try:
-        _run(["systemctl", "stop", spec.unit_name])
+        _sudo_systemctl("stop", spec.unit_name)
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]systemctl stop failed (exit {exc.returncode}).[/red]")
         return False
@@ -1892,7 +1973,7 @@ def start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
     if not spec.unit_path.exists():
         console.print(f"[red]Service unit not found — run '{spec.sudo_command_hint}' first.[/red]")
         return False
-    result = _run(["systemctl", "start", spec.unit_name], check=False)
+    result = _sudo_systemctl("start", spec.unit_name, check=False)
     if result.returncode == 0:
         console.print(f"[green]✓ Started {spec.unit_name}[/green]")
         return True
@@ -1901,6 +1982,68 @@ def start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
         f"Check status with: systemctl status {spec.unit_name}[/yellow]"
     )
     return False
+
+
+_CAMERA_SENSOR_TYPES = {"camera", "rgb", "depth_camera"}
+
+
+def _any_twin_has_camera_sensor() -> bool:
+    """Check downloaded twin JSON files for camera-type sensors."""
+    for path in CONFIG_DIR.glob("*.json"):
+        if path.name in ("credentials.json", "environment.json", "cameras.json", "fingerprint.json"):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            asset = data.get("asset") or {}
+            schema = asset.get("universal_schema") or {}
+            for sensor in schema.get("sensors", []):
+                if sensor.get("type") in _CAMERA_SENSOR_TYPES:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _detect_and_select_cameras() -> None:
+    """Discover cameras and prompt the user to select one.
+
+    Best-effort: failures are logged but never block installation.
+    """
+    from .device_utils import CameraDevice, discover_usb_cameras, write_cameras_json
+
+    cameras = discover_usb_cameras()
+    if not cameras:
+        console.print("[dim]No cameras detected. You can add one later: cyberwave edge cameras[/dim]")
+        return
+
+    selected: int | None = None
+    if len(cameras) == 1:
+        cam = cameras[0]
+        selected = cam.index if cam.index is not None else 0
+        console.print(f"\n[cyan]Detected camera:[/cyan] {cam.card} ({cam.primary_path})")
+    else:
+        console.print(f"\n[bold]Detected {len(cameras)} camera(s):[/bold]\n")
+        valid_indices: dict[int, CameraDevice] = {}
+        for i, cam in enumerate(cameras):
+            idx = cam.index if cam.index is not None else i
+            valid_indices[idx] = cam
+            console.print(f"  [bold cyan]{idx}[/bold cyan])  {cam.card}  [dim]{cam.primary_path}[/dim]")
+
+        default_idx = cameras[0].index if cameras[0].index is not None else 0
+        console.print()
+        raw = Prompt.ask("Select camera", default=str(default_idx))
+        try:
+            selected = int(raw)
+        except ValueError:
+            console.print("[yellow]Invalid selection — skipping camera config.[/yellow]")
+            return
+        if selected not in valid_indices:
+            console.print(f"[yellow]Camera {selected} not available — skipping.[/yellow]")
+            return
+        console.print(f"[green]Selected:[/green] {valid_indices[selected].card}")
+
+    write_cameras_json(cameras, CONFIG_DIR, selected_index=selected)
+    console.print(f"[dim]Saved to {CONFIG_DIR / 'cameras.json'}[/dim]\n")
 
 
 # ---- orchestrator ------------------------------------------------------------
@@ -1924,15 +2067,38 @@ def setup_service(
 
     Returns True if everything succeeded.
     """
+    _migrate_legacy_config_dir()
+
     linux_service_setup = _is_linux()
     macos_launchagent_supported = _is_macos() and spec.supports_macos_launchagent
 
     if linux_service_setup and os.geteuid() != 0:
-        console.print(
-            "[red]Root privileges required.[/red]\n"
-            f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
-        )
-        return False
+        if os.environ.get("_CYBERWAVE_SUDO_ESCALATED"):
+            console.print(
+                f"[red]Still not root after sudo escalation.[/red]\n"
+                f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
+            )
+            return False
+        console.print("[cyan]Root privileges required — requesting sudo...[/cyan]")
+        try:
+            child_env = {
+                **os.environ,
+                "CYBERWAVE_EDGE_CONFIG_DIR": str(CONFIG_DIR),
+                "_CYBERWAVE_SUDO_ESCALATED": "1",
+            }
+            result = subprocess.run(
+                ["sudo", "--preserve-env=CYBERWAVE_EDGE_CONFIG_DIR,_CYBERWAVE_SUDO_ESCALATED"]
+                + sys.argv,
+                env=child_env,
+            )
+            return result.returncode == 0
+        except FileNotFoundError:
+            console.print(
+                f"[red]sudo not found.[/red]\n[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
+            )
+            return False
+        except KeyboardInterrupt:
+            return False
 
     if macos_launchagent_supported and os.geteuid() == 0:
         console.print(
@@ -2019,13 +2185,17 @@ def setup_service(
 
     # Camera selection runs after twin selection so the interactive prompt
     # isn't wiped by the twin picker's screen clear.
-    if is_macos() and spec.requires_docker:
-        if not setup_camera_stream_server(force=True):
-            console.print(
-                "[yellow]Camera stream setup failed. MJPEG fallback will "
-                "not be available.[/yellow]\n"
-                "[dim]You can retry later: cyberwave edge install[/dim]"
-            )
+    # Only prompt when at least one selected twin has a camera sensor.
+    if spec.requires_docker and _any_twin_has_camera_sensor():
+        if is_macos():
+            if not setup_camera_stream_server(force=force_reinstall):
+                console.print(
+                    "[yellow]Camera stream setup failed. MJPEG fallback will "
+                    "not be available.[/yellow]\n"
+                    "[dim]You can retry later: cyberwave edge install[/dim]"
+                )
+        elif linux_service_setup:
+            _detect_and_select_cameras()
 
     if linux_service_setup:
         if not create_systemd_service(spec):
@@ -2049,8 +2219,34 @@ def setup_service(
     return True
 
 
+def _resolve_worker_image() -> str:
+    """Return the worker Docker image reference, respecting CYBERWAVE_ENVIRONMENT.
+
+    Delegates to the canonical ``resolve_worker_image()`` in
+    ``cyberwave_edge_core.worker_manager`` when available.  Falls back to
+    credentials-based inference when edge-core is not installed (e.g.
+    during initial ``cyberwave edge install``).
+    """
+    try:
+        from cyberwave_edge_core.worker_manager import resolve_worker_image
+
+        return resolve_worker_image()
+    except Exception:
+        pass
+
+    base = "cyberwaveos/edge-ml-worker"
+    creds = load_credentials()
+    env_name = creds.cyberwave_environment if creds and creds.cyberwave_environment else None
+    if env_name and env_name not in ("production",):
+        return f"{base}:{env_name}"
+    return f"{base}:latest"
+
+
 def _pull_worker_image() -> bool:
     """Pull the ML worker Docker image (best-effort).
+
+    Tries the environment-specific tag first (e.g. ``:dev``).  If that fails
+    and the tag is not ``:latest``, retries with ``:latest`` as a fallback.
 
     Returns True always — a failed pull is non-fatal because
     ``WorkerManager._run_container()`` will pull implicitly on first start.
@@ -2060,21 +2256,27 @@ def _pull_worker_image() -> bool:
         console.print("[yellow]Docker not found — skipping worker image pull.[/yellow]")
         return True
 
-    image = "cyberwaveos/edge-ml-worker:latest"
-    try:
-        from cyberwave_edge_core.worker_manager import DEFAULT_WORKER_IMAGE
-
-        image = DEFAULT_WORKER_IMAGE
-    except Exception:
-        pass
-
+    image = _resolve_worker_image()
     console.print(f"[cyan]Pulling worker image {image}...[/cyan]")
     try:
         _run([docker_bin, "pull", image])
         console.print(f"[green]Worker image {image} pulled successfully.[/green]")
-    except subprocess.CalledProcessError as exc:
-        console.print(f"[yellow]Worker image pull failed (exit {exc.returncode}).[/yellow]")
-        console.print("[dim]Workers will still work — edge-core pulls on first start.[/dim]")
+        return True
+    except subprocess.CalledProcessError:
+        pass
+
+    fallback = image.rsplit(":", 1)[0] + ":latest"
+    if fallback != image:
+        console.print(f"[yellow]Tag not found, trying {fallback}...[/yellow]")
+        try:
+            _run([docker_bin, "pull", fallback])
+            console.print(f"[green]Worker image {fallback} pulled successfully.[/green]")
+            return True
+        except subprocess.CalledProcessError:
+            pass
+
+    console.print("[yellow]Worker image pull failed.[/yellow]")
+    console.print("[dim]Workers will still work — edge-core pulls on first start.[/dim]")
     return True
 
 

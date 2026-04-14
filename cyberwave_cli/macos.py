@@ -12,6 +12,7 @@ CLI commands (start/stop/restart/status/logs) work identically to
 the systemd-based experience on Linux.
 """
 
+import logging
 import os
 import platform
 import re
@@ -23,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 from xml.sax.saxutils import escape as _xml_escape
+
+logger = logging.getLogger(__name__)
 
 from cyberwave.edge.platform import (
     USBIP_LAUNCHD_LABEL,
@@ -147,6 +150,7 @@ def _launchctl_as_user(args: list[str]) -> list[str]:
     if os.getuid() == 0:
         username, _, _ = _resolve_real_user()
         if username:
+            logger.debug("Dropping to user %s for launchctl %s", username, args)
             return ["sudo", "-u", username, "launchctl", *args]
     return ["launchctl", *args]
 
@@ -206,6 +210,7 @@ def _fix_user_dir_ownership(dir_path: Path) -> None:
     try:
         stat = dir_path.stat()
         if stat.st_uid != real_uid:
+            logger.debug("Reclaiming ownership of %s (uid %d -> %d)", dir_path, stat.st_uid, real_uid)
             subprocess.run(
                 ["sudo", "chown", username or str(real_uid), str(dir_path)],
                 check=True,
@@ -245,6 +250,7 @@ def _write_file_as_real_user(
                 try:
                     path.unlink()
                 except OSError:
+                    logger.debug("Removing root-owned file %s via sudo rm", path)
                     subprocess.run(
                         ["sudo", "rm", "-f", str(path)],
                         check=True,

@@ -32,7 +32,9 @@ from cyberwave_cli.utils import colorize_log_line
 
 console = Console()
 
-CLOUD_NODE_IDENTITY_FILE = Path.home() / ".cyberwave" / "instance_identity.json"
+from ..config import CONFIG_DIR as _CONFIG_DIR
+
+CLOUD_NODE_IDENTITY_FILE = _CONFIG_DIR / "instance_identity.json"
 
 
 def _runtime_envs_from_credentials() -> dict[str, str]:
@@ -691,14 +693,28 @@ def logs_cloud_node(follow: bool, lines: int) -> None:
         "-u", service_name,
         f"-n{lines}",
         "--no-pager",
-        "--output=short-iso",
+        "--output=cat",
     ]
     if follow:
         cmd.append("-f")
 
     try:
-        result = subprocess.run(cmd, env=clean_subprocess_env(), check=False)
-        if result.returncode != 0:
+        proc = subprocess.Popen(
+            cmd,
+            env=clean_subprocess_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                console.print(colorize_log_line(line.rstrip("\n")))
+        except KeyboardInterrupt:
+            pass
+        finally:
+            proc.terminate()
+            proc.wait()
+        if proc.returncode and proc.returncode not in (0, -15):
             console.print("[dim]Tip: run with sudo if you see no output.[/dim]")
     except FileNotFoundError:
         console.print("[red]journalctl not found. Is systemd available on this host?[/red]")

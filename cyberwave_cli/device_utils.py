@@ -158,7 +158,7 @@ def _ensure_video_device_permissions() -> None:
             if path.is_char_device():
                 os.chmod(path, 0o666)
     except PermissionError:
-        logger.warning(
+        logger.debug(
             "Cannot set permissions on /dev/video* (need root). "
             "Run: sudo chmod 666 /dev/video* to allow camera access."
         )
@@ -222,13 +222,33 @@ def discover_usb_cameras_v4l2() -> list[CameraDevice]:
         return []
 
 
+def _discover_cameras_avfoundation() -> list[CameraDevice]:
+    """Discover cameras on macOS via AVFoundation (ffmpeg probe)."""
+    try:
+        from .macos import _list_avfoundation_devices
+    except ImportError:
+        return []
+
+    cameras: list[CameraDevice] = []
+    for idx, name in _list_avfoundation_devices():
+        cameras.append(
+            CameraDevice(
+                card=name,
+                bus_info=f"avfoundation-{idx}",
+                paths=[str(idx)],
+                driver="avfoundation",
+            )
+        )
+    return cameras
+
+
 def discover_usb_cameras() -> list[CameraDevice]:
-    """Discover USB cameras on the system.
+    """Discover cameras on the system.
 
     Platform-specific:
     - Linux: Uses v4l2-ctl
-    - macOS: Not yet implemented (future: AVFoundation)
-    - Windows: Not yet implemented (future: DirectShow)
+    - macOS: Uses AVFoundation via ffmpeg
+    - Windows: Not yet implemented
 
     Returns:
         List of CameraDevice objects.
@@ -239,8 +259,7 @@ def discover_usb_cameras() -> list[CameraDevice]:
     if system == "Linux":
         return discover_usb_cameras_v4l2()
     elif system == "Darwin":
-        logger.warning("macOS camera discovery not yet implemented")
-        return []
+        return _discover_cameras_avfoundation()
     elif system == "Windows":
         logger.warning("Windows camera discovery not yet implemented")
         return []
@@ -280,25 +299,32 @@ def list_serial_ports() -> list[str]:
     return sorted(set(candidates))
 
 
-def write_cameras_json(cameras: list[CameraDevice], config_dir: Path) -> Path:
+def write_cameras_json(
+    cameras: list[CameraDevice],
+    config_dir: Path,
+    *,
+    selected_index: int | None = None,
+) -> Path:
     """Write discovered cameras to a JSON file in the config directory.
 
     Args:
         cameras: List of discovered CameraDevice objects.
         config_dir: Directory to write the cameras.json file.
+        selected_index: Video device index of the selected camera (stored
+            as ``selected_device`` in the JSON).
 
     Returns:
         Path to the written cameras.json file.
     """
-    import json
+    from .io_utils import atomic_write_json
 
     cameras_file = config_dir / "cameras.json"
-    data = {
+    data: dict = {
         "devices": [cam.to_dict() for cam in cameras],
     }
-    config_dir.mkdir(parents=True, exist_ok=True)
-    with open(cameras_file, "w") as f:
-        json.dump(data, f, indent=2)
+    if selected_index is not None:
+        data["selected_device"] = selected_index
+    atomic_write_json(cameras_file, data)
     logger.info("Wrote cameras.json to %s (%d devices)", cameras_file, len(cameras))
     return cameras_file
 
