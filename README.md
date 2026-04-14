@@ -378,12 +378,14 @@ Installs the `cyberwave-edge-core` package (via apt-get on Debian/Ubuntu) and cr
 
 On **macOS**, the installer also sets up an MJPEG camera stream bridge (using `ffmpeg` and AVFoundation) and prompts you to select which camera to use. The selected camera is stored by **device name** (not index) so it persists across USB reconnections and reboots.
 
+On non-apt platforms, `--channel dev|staging` installs prerelease Python builds from the Buildkite Python registry; stable installs continue to use the public PyPI release.
+
 ```bash
 sudo cyberwave edge install
 sudo cyberwave edge install -y   # skip prompts
 sudo cyberwave edge install --reconfigure-camera   # re-select camera without full reinstall
-sudo cyberwave edge install --edge-core-channel dev
-sudo cyberwave edge install --edge-core-channel staging --edge-core-version 0.0.42.595
+sudo cyberwave edge install --channel dev
+sudo cyberwave edge install --channel staging --version 0.0.42.595
 ```
 
 **Options:**
@@ -533,6 +535,8 @@ cyberwave compute status
 cyberwave compute logs -f
 cyberwave compute stop
 ```
+
+On non-apt platforms, `cyberwave compute install --channel dev|staging` installs prerelease Python builds from the Buildkite Python registry; stable installs continue to use the public PyPI release.
 
 ## `cyberwave model`
 

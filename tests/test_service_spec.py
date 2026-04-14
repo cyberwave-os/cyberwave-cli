@@ -458,15 +458,245 @@ def test_ensure_credentials_uses_env_api_key_without_prompt(monkeypatch):
     assert saved_credentials[0].workspace_name == "Test Workspace"
 
 
-def test_pip_install_error_uses_spec_package_name(monkeypatch):
-    """Non-stable channel error must reference the actual package, not 'edge-core'."""
+def test_buildkite_python_registry_index_url_uses_registry_slug(monkeypatch):
+    core = load_core_module(monkeypatch)
+
+    assert (
+        core._buildkite_python_registry_index_url("cyberwave-edge-core")
+        == "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/pypi/simple"
+    )
+
+
+def test_fetch_available_versions_from_simple_index_parses_buildkite_links(monkeypatch):
+    core = load_core_module(monkeypatch)
+    html = b"""
+    <html>
+      <body>
+        <a href="https://packages.buildkite.com/files/cyberwave-edge-core-0.1.2.dev7.tar.gz">a</a>
+        <a href="https://packages.buildkite.com/files/cyberwave_edge_core-0.1.2.dev12-py3-none-any.whl">b</a>
+        <a href="https://packages.buildkite.com/files/cyberwave-edge-core-0.1.2rc2.tar.gz">c</a>
+      </body>
+    </html>
+    """
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return html
+
+    captured_urls: list[str] = []
+    monkeypatch.setattr(
+        core.urllib.request,
+        "urlopen",
+        lambda url: captured_urls.append(url) or FakeResponse(),
+    )
+
+    versions = core._fetch_available_simple_index_versions(
+        core._buildkite_python_registry_index_url("cyberwave-edge-core"),
+        "cyberwave-edge-core",
+    )
+
+    assert captured_urls == [
+        "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/pypi/simple/cyberwave-edge-core/"
+    ]
+    assert versions == [
+        core.Version("0.1.2.dev7"),
+        core.Version("0.1.2.dev12"),
+        core.Version("0.1.2rc2"),
+    ]
+
+
+def test_select_pip_version_for_dev_channel_picks_highest_dev(monkeypatch):
+    core = load_core_module(monkeypatch)
+    versions = [
+        core.Version("0.1.2.dev7"),
+        core.Version("0.1.2.dev12"),
+        core.Version("0.1.2rc2"),
+    ]
+
+    selected = core._select_pip_version_for_channel(
+        versions,
+        package_name="cyberwave-edge-core",
+        channel="dev",
+    )
+
+    assert str(selected) == "0.1.2.dev12"
+
+
+def test_select_pip_version_for_staging_channel_picks_highest_rc(monkeypatch):
+    core = load_core_module(monkeypatch)
+    versions = [
+        core.Version("0.1.2.dev12"),
+        core.Version("0.1.2rc2"),
+        core.Version("0.1.2rc7"),
+    ]
+
+    selected = core._select_pip_version_for_channel(
+        versions,
+        package_name="cyberwave-edge-core",
+        channel="staging",
+    )
+
+    assert str(selected) == "0.1.2rc7"
+
+
+def test_validate_pip_channel_version_accepts_matching_explicit_version(monkeypatch):
+    core = load_core_module(monkeypatch)
+
+    resolved = core._validate_pip_channel_version(
+        "cyberwave-edge-core",
+        "0.3.1rc2",
+        "staging",
+    )
+
+    assert str(resolved) == "0.3.1rc2"
+
+
+def test_validate_pip_channel_version_rejects_channel_mismatch(monkeypatch):
+    core = load_core_module(monkeypatch)
+
+    try:
+        core._validate_pip_channel_version(
+            "cyberwave-cloud-node",
+            "0.3.1rc2",
+            "dev",
+        )
+    except ValueError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+    assert "cyberwave-cloud-node" in message
+    assert "does not match" in message
+
+
+def test_pip_install_dev_lists_buildkite_versions_and_installs_latest_match(monkeypatch):
+    core = load_core_module(monkeypatch)
+    run_calls: list[list[str]] = []
+    messages: list[str] = []
+    monkeypatch.setattr(
+        core.console,
+        "print",
+        lambda msg="", *args, **kwargs: messages.append(str(msg)),
+    )
+    monkeypatch.setattr(
+        core,
+        "_fetch_available_simple_index_versions",
+        lambda index_url, package_name: [
+            core.Version("0.1.2.dev7"),
+            core.Version("0.1.2.dev12"),
+            core.Version("0.1.2rc2"),
+        ],
+    )
+    monkeypatch.setattr(core, "_run", lambda cmd, **_kw: run_calls.append(cmd))
+
+    result = core._pip_install(core.EDGE_CORE_SPEC, channel="dev")
+
+    assert result is True
+    assert run_calls == [
+        [
+            core.sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--pre",
+            "--extra-index-url",
+            "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/pypi/simple",
+            "cyberwave-edge-core==0.1.2.dev12",
+        ]
+    ]
+    assert any("Resolved cyberwave-edge-core dev channel to 0.1.2.dev12" in message for message in messages)
+
+
+def test_pip_install_stable_falls_back_when_version_query_fails(monkeypatch):
+    core = load_core_module(monkeypatch)
+    run_calls: list[list[str]] = []
+    messages: list[str] = []
+
+    monkeypatch.setattr(
+        core.console,
+        "print",
+        lambda msg="", *args, **kwargs: messages.append(str(msg)),
+    )
+    monkeypatch.setattr(core, "_run", lambda cmd, **_kw: run_calls.append(cmd))
+
+    result = core._pip_install(core.EDGE_CORE_SPEC, channel="stable")
+
+    assert result is True
+    assert run_calls == [[core.sys.executable, "-m", "pip", "install", "cyberwave-edge-core"]]
+    assert not any("Resolved cyberwave-edge-core stable channel" in message for message in messages)
+
+
+def test_pip_install_prerelease_explicit_version_uses_buildkite_index(monkeypatch):
+    core = load_core_module(monkeypatch)
+    run_calls: list[list[str]] = []
+    messages: list[str] = []
+
+    monkeypatch.setattr(
+        core.console,
+        "print",
+        lambda msg="", *args, **kwargs: messages.append(str(msg)),
+    )
+    monkeypatch.setattr(core, "_run", lambda cmd, **_kw: run_calls.append(cmd))
+
+    result = core._pip_install(
+        core.CLOUD_NODE_SPEC,
+        channel="staging",
+        package_version="0.2.24rc7",
+    )
+
+    assert result is True
+    assert run_calls == [
+        [
+            core.sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--pre",
+            "--extra-index-url",
+            "https://packages.buildkite.com/cyberwave/cyberwave-cloud-node/pypi/simple",
+            "cyberwave-cloud-node==0.2.24rc7",
+        ]
+    ]
+    assert any("Buildkite" in message for message in messages)
+
+
+def test_install_service_package_uses_pip_for_nonstable_non_apt_channel(monkeypatch):
+    core = load_core_module(monkeypatch)
+    calls: list[tuple[str, str | None, str]] = []
+    monkeypatch.setattr(core, "_is_linux", lambda: False)
+    monkeypatch.setattr(
+        core,
+        "_pip_install",
+        lambda spec, *, package_version=None, channel="stable": (
+            calls.append((spec.package_name, package_version, channel)) or True
+        ),
+    )
+
+    result = core.install_service_package(core.CLOUD_NODE_SPEC, channel="dev", version="0.3.1.dev7")
+
+    assert result is True
+    assert calls == [("cyberwave-cloud-node", "0.3.1.dev7", "dev")]
+
+
+def test_pip_install_mismatch_error_uses_spec_package_name(monkeypatch):
+    """Channel mismatch errors must reference the actual package name."""
     core = load_core_module(monkeypatch)
     messages: list[str] = []
     monkeypatch.setattr(
         core.console, "print", lambda msg="", *a, **kw: messages.append(str(msg))
     )
 
-    result = core._pip_install(core.CLOUD_NODE_SPEC, channel="dev")
+    result = core._pip_install(
+        core.CLOUD_NODE_SPEC,
+        channel="dev",
+        package_version="0.3.1rc2",
+    )
 
     assert result is False
     combined = " ".join(messages)
@@ -474,24 +704,27 @@ def test_pip_install_error_uses_spec_package_name(monkeypatch):
     assert "edge-core" not in combined, "Must not mention edge-core for cloud node"
 
 
-def test_setup_service_non_linux_error_uses_spec_package_name(monkeypatch):
-    """Non-Linux warning must reference the actual package, not 'edge-core'."""
+def test_setup_service_non_linux_allows_nonstable_channels(monkeypatch):
     core = load_core_module(monkeypatch)
-    messages: list[str] = []
-    monkeypatch.setattr(
-        core.console, "print", lambda msg="", *a, **kw: messages.append(str(msg))
-    )
+    install_calls: list[tuple[str, str | None]] = []
     monkeypatch.setattr(core, "_is_linux", lambda: False)
     monkeypatch.setattr(core, "_is_macos", lambda: False, raising=False)
     monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
-    monkeypatch.setattr(core, "install_service_package", lambda spec, *, channel, version: False)
+    monkeypatch.setattr(
+        core,
+        "install_service_package",
+        lambda spec, *, channel, version: install_calls.append((channel, version)) or True,
+    )
 
-    # Using a non-stable channel triggers the "not supported via pip" message
-    core.setup_service(core.CLOUD_NODE_SPEC, skip_confirm=True, channel="dev", version=None)
+    result = core.setup_service(
+        core.CLOUD_NODE_SPEC,
+        skip_confirm=True,
+        channel="dev",
+        version="0.3.1.dev7",
+    )
 
-    combined = " ".join(messages)
-    assert "cyberwave-cloud-node" in combined
-    assert "edge-core" not in combined
+    assert result is True
+    assert install_calls == [("dev", "0.3.1.dev7")]
 
 
 def test_start_service_returns_false_when_no_systemd(monkeypatch):

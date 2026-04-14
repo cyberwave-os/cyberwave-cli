@@ -8,6 +8,7 @@ from types import ModuleType
 # --- stub rich (same pattern as test_edge_uninstall.py) ---
 rich_module = ModuleType("rich")
 rich_console_module = ModuleType("rich.console")
+rich_markup_module = ModuleType("rich.markup")
 rich_prompt_module = ModuleType("rich.prompt")
 rich_table_module = ModuleType("rich.table")
 click_module = ModuleType("click")
@@ -42,10 +43,12 @@ class _Table:
 
 
 rich_console_module.Console = _Console
+rich_markup_module.escape = lambda value: value
 rich_prompt_module.Prompt = _Prompt
 rich_prompt_module.Confirm = _Confirm
 rich_table_module.Table = _Table
 rich_module.console = rich_console_module
+rich_module.markup = rich_markup_module
 rich_module.prompt = rich_prompt_module
 rich_module.table = rich_table_module
 
@@ -88,6 +91,7 @@ click_module.group = _group
 
 sys.modules.setdefault("rich", rich_module)
 sys.modules.setdefault("rich.console", rich_console_module)
+sys.modules.setdefault("rich.markup", rich_markup_module)
 sys.modules.setdefault("rich.prompt", rich_prompt_module)
 sys.modules.setdefault("rich.table", rich_table_module)
 sys.modules.setdefault("click", click_module)
@@ -102,7 +106,15 @@ sys.modules.setdefault("cyberwave_cli.commands", commands_package)
 def _load_compute_module(monkeypatch, fake_core=None, fake_config=None):
     fake_core = fake_core or ModuleType("cyberwave_cli.core")
     fake_config = fake_config or ModuleType("cyberwave_cli.config")
+    if not hasattr(fake_config, "CONFIG_DIR"):
+        fake_config.CONFIG_DIR = Path("/tmp/cyberwave-config")
+    if not hasattr(fake_config, "CREDENTIALS_FILE"):
+        fake_config.CREDENTIALS_FILE = fake_config.CONFIG_DIR / "credentials.json"
+    if not hasattr(fake_config, "chown_to_sudo_user"):
+        fake_config.chown_to_sudo_user = lambda *args, **kwargs: None
     fake_config.clean_subprocess_env = lambda: {}
+    if not hasattr(fake_config, "get_api_url"):
+        fake_config.get_api_url = lambda: "https://api.example.test"
     if not hasattr(fake_core, "_has_systemd"):
         fake_core._has_systemd = lambda: True
     if not hasattr(fake_core, "_is_macos"):
@@ -120,8 +132,18 @@ def _load_compute_module(monkeypatch, fake_core=None, fake_config=None):
         fake_core.create_launchagent_service = lambda spec, config_path=None: True
     if not hasattr(fake_core, "load_launchagent_service"):
         fake_core.load_launchagent_service = lambda spec: True
+    fake_credentials = sys.modules.get("cyberwave_cli.credentials")
+    if fake_credentials is None:
+        fake_credentials = ModuleType("cyberwave_cli.credentials")
+    if not hasattr(fake_credentials, "Credentials"):
+        fake_credentials.Credentials = type("Credentials", (), {})
+    if not hasattr(fake_credentials, "load_credentials"):
+        fake_credentials.load_credentials = lambda: None
+    if not hasattr(fake_credentials, "save_credentials"):
+        fake_credentials.save_credentials = lambda *_args, **_kwargs: None
     monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
     sys.modules.pop("cyberwave_cli.commands.compute", None)
     spec = importlib.util.spec_from_file_location(
         "cyberwave_cli.commands.compute",
@@ -158,6 +180,34 @@ def test_install_calls_setup_service(monkeypatch):
     compute.install_cloud_node.callback(yes=True, channel="stable", version=None, config_path=None)
 
     assert calls == [(True, "stable", None, None)]
+
+
+def test_install_calls_setup_service_for_nonstable_channel(monkeypatch):
+    calls = []
+
+    class FakeSpec:
+        package_name = "cyberwave-cloud-node"
+        unit_name = "cyberwave-cloud-node.service"
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.CLOUD_NODE_SPEC = FakeSpec()
+    fake_core.setup_service = (
+        lambda spec, *, skip_confirm, channel, version, config_path=None: calls.append(
+            (skip_confirm, channel, version, config_path)
+        )
+        or True
+    )
+    fake_core.write_service_override = lambda spec, config_path: True
+
+    compute = _load_compute_module(monkeypatch, fake_core)
+    compute.install_cloud_node.callback(
+        yes=True,
+        channel="dev",
+        version="0.3.1.dev8",
+        config_path=None,
+    )
+
+    assert calls == [(True, "dev", "0.3.1.dev8", None)]
 
 
 def test_uninstall_skips_config_dir_removal(monkeypatch, tmp_path):

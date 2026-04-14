@@ -10,6 +10,7 @@ import json
 import os
 import platform
 import plistlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -17,11 +18,15 @@ import sys
 import tempfile
 import textwrap
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from cyberwave.fingerprint import generate_fingerprint
+from packaging.version import InvalidVersion, Version
+from packaging.utils import canonicalize_name, parse_sdist_filename, parse_wheel_filename
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
@@ -1296,6 +1301,119 @@ def _apt_get_install(
     return False
 
 
+def _normalize_service_channel(channel: str | None) -> str:
+    """Return a normalized service release channel."""
+    normalized_channel = (channel or "stable").strip().lower()
+    if normalized_channel not in {"stable", "dev", "staging"}:
+        raise ValueError(f"Unsupported channel: {normalized_channel}")
+    return normalized_channel
+
+
+def _pip_version_matches_channel(version: Version, channel: str) -> bool:
+    """Return whether ``version`` belongs to the selected release channel."""
+    normalized_channel = _normalize_service_channel(channel)
+    if normalized_channel == "stable":
+        return not version.is_prerelease and not version.is_devrelease
+    if normalized_channel == "dev":
+        return version.is_devrelease and version.pre is None
+    return version.pre is not None and version.pre[0] == "rc" and not version.is_devrelease
+
+
+def _validate_pip_channel_version(package_name: str, version_text: str, channel: str) -> Version:
+    """Parse and validate an explicit pip version against the selected channel."""
+    normalized_channel = _normalize_service_channel(channel)
+    try:
+        version = Version(version_text)
+    except InvalidVersion as exc:
+        raise ValueError(f"Invalid PEP 440 version '{version_text}' for {package_name}.") from exc
+
+    if not _pip_version_matches_channel(version, normalized_channel):
+        raise ValueError(
+            f"Version '{version}' does not match the selected '{normalized_channel}' channel "
+            f"for {package_name}."
+        )
+
+    return version
+
+
+def _buildkite_python_registry_index_url(registry_slug: str) -> str:
+    """Return the Buildkite Python simple index URL for ``registry_slug``."""
+    return f"https://packages.buildkite.com/cyberwave/{registry_slug}/pypi/simple"
+
+
+def _select_pip_version_for_channel(
+    versions: list[Version], *, package_name: str, channel: str
+) -> Version:
+    """Choose the highest available version that matches ``channel``."""
+    normalized_channel = _normalize_service_channel(channel)
+    matching_versions = [
+        version for version in versions if _pip_version_matches_channel(version, normalized_channel)
+    ]
+    if not matching_versions:
+        raise ValueError(
+            f"No versions matching the '{normalized_channel}' channel are available for "
+            f"{package_name}."
+        )
+    return max(matching_versions)
+
+
+def _extract_version_from_distribution_filename(filename: str, package_name: str) -> Version | None:
+    """Best-effort parse a PEP 440 version from a wheel or sdist filename."""
+    try:
+        if filename.endswith(".whl"):
+            parsed_name, parsed_version, _, _ = parse_wheel_filename(filename)
+        else:
+            parsed_name, parsed_version = parse_sdist_filename(filename)
+    except (InvalidVersion, ValueError):
+        return None
+
+    if canonicalize_name(parsed_name) != canonicalize_name(package_name):
+        return None
+    return parsed_version
+
+
+def _fetch_available_simple_index_versions(index_url: str, package_name: str) -> list[Version]:
+    """Fetch and parse available versions from a PEP 503-style simple index page."""
+    normalized_name = canonicalize_name(package_name)
+    project_url = f"{index_url.rstrip('/')}/{normalized_name}/"
+    try:
+        with urllib.request.urlopen(project_url) as response:
+            html = response.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Failed to query available versions for {package_name}: {exc}") from exc
+
+    hrefs = re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    parsed_versions: set[Version] = set()
+    for href in hrefs:
+        parsed_href = urllib.parse.urlsplit(href)
+        filename = urllib.parse.unquote(Path(parsed_href.path).name)
+        if not filename:
+            continue
+        parsed_version = _extract_version_from_distribution_filename(filename, package_name)
+        if parsed_version is not None:
+            parsed_versions.add(parsed_version)
+
+    if not parsed_versions:
+        raise RuntimeError(f"No valid PEP 440 versions were found for {package_name}.")
+
+    return sorted(parsed_versions)
+
+
+def _describe_pip_install_target(
+    spec: ServiceSpec = EDGE_CORE_SPEC,
+    *,
+    channel: str = "stable",
+    package_version: str | None = None,
+) -> str:
+    """Return the user-facing pip target shown during confirmation prompts."""
+    if package_version:
+        return f"{spec.package_name}=={package_version}"
+    normalized_channel = _normalize_service_channel(channel)
+    if normalized_channel == "stable":
+        return f"{spec.package_name} (latest stable release)"
+    return f"{spec.package_name} (latest {normalized_channel} release)"
+
+
 def _pip_install(
     spec: ServiceSpec = EDGE_CORE_SPEC,
     *,
@@ -1307,17 +1425,56 @@ def _pip_install(
     Used on non-Debian systems (macOS, other Linux flavors).
     Returns True on success.
     """
-    if channel != "stable":
-        console.print(
-            f"[red]Non-stable {spec.package_name} channels are only supported"
-            " via apt-get on Debian/Ubuntu.[/red]"
-        )
-        return False
+    normalized_channel = _normalize_service_channel(channel)
+    pip_command = [sys.executable, "-m", "pip", "install"]
+    buildkite_index_url = _buildkite_python_registry_index_url(spec.package_name)
 
-    pip_target = f"{spec.package_name}=={package_version}" if package_version else spec.package_name
+    if normalized_channel == "stable" and not package_version:
+        pip_target = spec.package_name
+    else:
+        try:
+            if package_version:
+                validated_version = _validate_pip_channel_version(
+                    spec.package_name,
+                    package_version,
+                    normalized_channel,
+                )
+                pip_target = f"{spec.package_name}=={validated_version}"
+            else:
+                available_versions = _fetch_available_simple_index_versions(
+                    buildkite_index_url,
+                    spec.package_name,
+                )
+                resolved_version = _select_pip_version_for_channel(
+                    available_versions,
+                    package_name=spec.package_name,
+                    channel=normalized_channel,
+                )
+                pip_target = f"{spec.package_name}=={resolved_version}"
+                console.print(
+                    f"[cyan]Resolved {spec.package_name} {normalized_channel} channel to "
+                    f"{resolved_version}.[/cyan]"
+                )
+        except (RuntimeError, ValueError) as exc:
+            console.print(f"[red]{exc}[/red]")
+            return False
+
+        if normalized_channel != "stable":
+            pip_command.extend(
+                [
+                    "--pre",
+                    "--extra-index-url",
+                    buildkite_index_url,
+                ]
+            )
+            console.print(
+                f"[cyan]Using Buildkite Python registry for the "
+                f"{normalized_channel} channel.[/cyan]"
+            )
+
     console.print(f"[cyan]Installing {pip_target} via pip...[/cyan]")
     try:
-        _run([sys.executable, "-m", "pip", "install", pip_target])
+        _run([*pip_command, pip_target])
         return True
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]pip install failed (exit {exc.returncode}).[/red]")
@@ -1786,12 +1943,6 @@ def setup_service(
             console.print(
                 "[dim]On macOS, USB devices are shared to Docker containers via USB/IP.[/dim]"
             )
-        if channel != "stable":
-            console.print(
-                f"[red]Non-stable {spec.package_name} channels are only supported"
-                " via apt-get on Debian/Ubuntu.[/red]"
-            )
-            return False
 
     if not _ensure_credentials(skip_confirm=skip_confirm):
         return False
@@ -1807,7 +1958,11 @@ def setup_service(
                 f"  3. Enable it to start on boot\n"
             )
         elif macos_launchagent_supported:
-            pip_target = f"{spec.package_name}=={version}" if version else spec.package_name
+            pip_target = _describe_pip_install_target(
+                spec,
+                channel=channel,
+                package_version=version,
+            )
             console.print(
                 f"\nThis will:\n"
                 f"  1. Install [bold]{pip_target}[/bold] via pip\n"
@@ -1815,7 +1970,11 @@ def setup_service(
                 "  3. Create and load a LaunchAgent for your macOS user session\n"
             )
         else:
-            pip_target = f"{spec.package_name}=={version}" if version else spec.package_name
+            pip_target = _describe_pip_install_target(
+                spec,
+                channel=channel,
+                package_version=version,
+            )
             console.print(
                 f"\nThis will:\n"
                 f"  1. Install [bold]{pip_target}[/bold] via pip\n"
@@ -1915,8 +2074,8 @@ def _pull_worker_image() -> bool:
 def setup_edge_core(
     *,
     skip_confirm: bool = False,
-    edge_core_channel: str = "stable",
-    edge_core_version: str | None = None,
+    channel: str = "stable",
+    version: str | None = None,
     force_reinstall: bool = False,
     pull_worker_image: bool = True,
 ) -> bool:
@@ -1940,8 +2099,8 @@ def setup_edge_core(
     return setup_service(
         EDGE_CORE_SPEC,
         skip_confirm=skip_confirm,
-        channel=edge_core_channel,
-        version=edge_core_version,
+        channel=channel,
+        version=version,
         post_install_hook=_post_install,
         force_reinstall=force_reinstall,
     )

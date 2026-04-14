@@ -69,6 +69,7 @@ def load_core_module(monkeypatch):
 
     cli_config_module = ModuleType("cyberwave_cli.config")
     cli_config_module.CONFIG_DIR = Path("/tmp/cyberwave-config")
+    cli_config_module.chown_to_sudo_user = lambda *_args, **_kwargs: None
     cli_config_module.clean_subprocess_env = lambda: {}
     cli_config_module.get_api_url = lambda: "https://api.example.test"
     cli_config_module._resolve_sudo_user_home = lambda: None

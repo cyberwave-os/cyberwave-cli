@@ -275,14 +275,14 @@ def edge():
 @edge.command("install")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
 @click.option(
-    "--edge-core-channel",
+    "--channel",
     type=click.Choice(["stable", "dev", "staging"], case_sensitive=False),
     default="stable",
     show_default=True,
     help="Which edge-core package channel to install",
 )
 @click.option(
-    "--edge-core-version",
+    "--version",
     type=str,
     default=None,
     help="Exact edge-core version to install from the selected channel",
@@ -305,7 +305,7 @@ def edge():
     default=False,
     help="Skip pulling the ML worker Docker image (cyberwaveos/edge-ml-worker)",
 )
-def install_edge(yes, edge_core_channel, edge_core_version, force_reinstall, reconfigure_camera, without_workers):
+def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, without_workers):
     """Install cyberwave-edge-core and register it as a boot service.
 
     Downloads the cyberwave-edge-core package (via apt-get on Debian/Ubuntu)
@@ -319,8 +319,8 @@ def install_edge(yes, edge_core_channel, edge_core_version, force_reinstall, rec
         cyberwave edge install --without-workers
         cyberwave edge install --force-reinstall
         cyberwave edge install --reconfigure-camera
-        cyberwave edge install --edge-core-channel dev
-        cyberwave edge install --edge-core-channel staging --edge-core-version 0.0.42.595
+        cyberwave edge install --channel dev
+        cyberwave edge install --channel staging --version 0.0.42.595
     """
     if reconfigure_camera:
         from ..macos import (
@@ -349,8 +349,8 @@ def install_edge(yes, edge_core_channel, edge_core_version, force_reinstall, rec
     try:
         if not setup_edge_core(
             skip_confirm=yes,
-            edge_core_channel=edge_core_channel.lower(),
-            edge_core_version=edge_core_version,
+            channel=channel.lower(),
+            version=version,
             force_reinstall=force_reinstall,
             pull_worker_image=not without_workers,
         ):
