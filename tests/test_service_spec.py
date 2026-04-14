@@ -462,8 +462,8 @@ def test_buildkite_python_registry_index_url_uses_registry_slug(monkeypatch):
     core = load_core_module(monkeypatch)
 
     assert (
-        core._buildkite_python_registry_index_url("cyberwave-edge-core")
-        == "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/pypi/simple"
+        core._buildkite_python_registry_index_url("cyberwave-edge-core-python")
+        == "https://packages.buildkite.com/cyberwave/cyberwave-edge-core-python/pypi/simple"
     )
 
 
@@ -497,12 +497,12 @@ def test_fetch_available_versions_from_simple_index_parses_buildkite_links(monke
     )
 
     versions = core._fetch_available_simple_index_versions(
-        core._buildkite_python_registry_index_url("cyberwave-edge-core"),
+        core._buildkite_python_registry_index_url("cyberwave-edge-core-python"),
         "cyberwave-edge-core",
     )
 
     assert captured_urls == [
-        "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/pypi/simple/cyberwave-edge-core/"
+        "https://packages.buildkite.com/cyberwave/cyberwave-edge-core-python/pypi/simple/cyberwave-edge-core/"
     ]
     assert versions == [
         core.Version("0.1.2.dev7"),
@@ -606,7 +606,7 @@ def test_pip_install_dev_lists_buildkite_versions_and_installs_latest_match(monk
             "install",
             "--pre",
             "--extra-index-url",
-            "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/pypi/simple",
+            "https://packages.buildkite.com/cyberwave/cyberwave-edge-core-python/pypi/simple",
             "cyberwave-edge-core==0.1.2.dev12",
         ]
     ]
@@ -659,7 +659,7 @@ def test_pip_install_prerelease_explicit_version_uses_buildkite_index(monkeypatc
             "install",
             "--pre",
             "--extra-index-url",
-            "https://packages.buildkite.com/cyberwave/cyberwave-cloud-node/pypi/simple",
+            "https://packages.buildkite.com/cyberwave/cyberwave-cloud-node-python/pypi/simple",
             "cyberwave-cloud-node==0.2.24rc7",
         ]
     ]

@@ -1341,6 +1341,11 @@ def _buildkite_python_registry_index_url(registry_slug: str) -> str:
     return f"https://packages.buildkite.com/cyberwave/{registry_slug}/pypi/simple"
 
 
+def _buildkite_python_registry_slug(package_name: str) -> str:
+    """Return the Buildkite Python registry slug for a package."""
+    return f"{package_name}-python"
+
+
 def _select_pip_version_for_channel(
     versions: list[Version], *, package_name: str, channel: str
 ) -> Version:
@@ -1427,7 +1432,9 @@ def _pip_install(
     """
     normalized_channel = _normalize_service_channel(channel)
     pip_command = [sys.executable, "-m", "pip", "install"]
-    buildkite_index_url = _buildkite_python_registry_index_url(spec.package_name)
+    buildkite_index_url = _buildkite_python_registry_index_url(
+        _buildkite_python_registry_slug(spec.package_name)
+    )
 
     if normalized_channel == "stable" and not package_version:
         pip_target = spec.package_name
