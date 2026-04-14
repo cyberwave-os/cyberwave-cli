@@ -39,6 +39,29 @@ BANNER = """
 """
 
 
+def _load_sdk_default_api():
+    """Import and return the generated SDK DefaultApi type."""
+    from cyberwave.rest import DefaultApi
+
+    return DefaultApi
+
+
+def run_sdk_selfcheck() -> int:
+    """Verify the packaged runtime contains the generated REST SDK."""
+    try:
+        default_api = _load_sdk_default_api()
+    except Exception as exc:
+        click.echo(f"sdk-rest-missing: {exc}", err=True)
+        return 1
+
+    if default_api is None:
+        click.echo("sdk-rest-missing: DefaultApi unavailable", err=True)
+        return 1
+
+    click.echo("sdk-rest-ok")
+    return 0
+
+
 @click.group(invoke_without_command=True)
 @click.version_option(version=__version__, prog_name="cyberwave")
 @click.pass_context
@@ -102,6 +125,12 @@ cli.add_command(so101)
 cli.add_command(twin)
 cli.add_command(workflow)
 cli.add_command(worker)
+
+
+@cli.command(name="__selfcheck_sdk", hidden=True)
+def selfcheck_sdk() -> None:
+    """Hidden packaged-runtime check for generated SDK imports."""
+    raise click.exceptions.Exit(run_sdk_selfcheck())
 
 
 def main() -> None:
