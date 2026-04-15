@@ -198,6 +198,34 @@ def _edge_process_pids() -> list[str]:
     return [pid for pid in result.stdout.strip().split("\n") if pid and pid != own_pid]
 
 
+def _kill_lingering_edge_processes(timeout: float = 5.0) -> None:
+    """Send SIGKILL to any remaining edge-core processes and wait for them to exit.
+
+    Called during uninstall after ``systemctl stop`` to guarantee the process
+    is fully gone before we remove the config directory.  Without this, a
+    still-running edge-core can recreate subdirectories (e.g. ``workers/``)
+    between the ``rmtree`` call and the test assertion.
+    """
+    import signal
+
+    pids = _edge_process_pids()
+    if not pids:
+        return
+
+    for pid in pids:
+        try:
+            os.kill(int(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pids = _edge_process_pids()
+        if not pids:
+            return
+        time.sleep(0.2)
+
+
 def _edge_process_logs_hint() -> str:
     """Return the manual log guidance for process mode."""
     return "[dim]Logs: run 'cyberwave edge start -f' to view live output.[/dim]"
@@ -434,6 +462,8 @@ def uninstall_edge(yes):
         except FileNotFoundError:
             console.print("[yellow]launchctl not found — skipping LaunchAgent unload.[/yellow]")
 
+        _kill_lingering_edge_processes()
+
         if plist_path.exists():
             try:
                 plist_path.unlink()
@@ -520,6 +550,8 @@ def uninstall_edge(yes):
         _run(["systemctl", "disable", SYSTEMD_UNIT_NAME], check=False)
     except FileNotFoundError:
         console.print("[yellow]systemctl not found — skipping service cleanup.[/yellow]")
+
+    _kill_lingering_edge_processes()
 
     # Remove the systemd unit file
     if SYSTEMD_UNIT_PATH.exists():

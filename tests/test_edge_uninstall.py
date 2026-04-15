@@ -156,6 +156,7 @@ def test_uninstall_edge_stops_driver_containers(monkeypatch, tmp_path):
     monkeypatch.setattr(
         edge_module, "_delete_registered_edges_for_fingerprint", _fake_backend_cleanup
     )
+    monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", lambda: None)
 
     edge_module.uninstall_edge.callback(yes=True)
 
@@ -212,6 +213,7 @@ def test_uninstall_edge_removes_detected_channel_package(monkeypatch, tmp_path):
         "_delete_registered_edges_for_fingerprint",
         lambda **_kwargs: (0, 0),
     )
+    monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", lambda: None)
     monkeypatch.setattr(
         edge_module.Confirm,
         "ask",
@@ -255,6 +257,7 @@ def test_uninstall_edge_macos_removes_launchagent_and_uninstalls_package(monkeyp
     monkeypatch.setattr(edge_module.os, "getuid", lambda: 501)
     monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", lambda _runner: [])
     monkeypatch.setattr(edge_module, "_delete_registered_edges_for_fingerprint", lambda **_kwargs: (0, 0))
+    monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", lambda: None)
 
     def _fake_run(command, **_kwargs):
         calls.append(command)
