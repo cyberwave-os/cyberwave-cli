@@ -20,6 +20,7 @@ Example usage:
     cyberwave worker monitor                # Live resource/throughput dashboard
 """
 
+import datetime
 import logging
 import re
 import shutil
@@ -205,6 +206,7 @@ def list_workers(as_json: bool) -> None:
                 "origin": _worker_origin(f.name),
                 "size_bytes": f.stat().st_size,
                 "model_ids": _scan_model_ids(f),
+                "installed_at": datetime.datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
             }
             for f in files
         ]
@@ -223,6 +225,7 @@ def list_workers(as_json: bool) -> None:
     table.add_column("Models", style="green")
     table.add_column("File")
     table.add_column("Size")
+    table.add_column("Installed", style="dim")
 
     for f in files:
         stat = f.stat()
@@ -231,13 +234,13 @@ def list_workers(as_json: bool) -> None:
         origin_fmt = f"[dim]{origin}[/dim]" if origin == "workflow" else origin
         model_ids = _scan_model_ids(f)
         models_fmt = ", ".join(model_ids) if model_ids else "[dim]-[/dim]"
-        table.add_row(f.stem, origin_fmt, models_fmt, f.name, size)
+        installed_dt = datetime.datetime.fromtimestamp(stat.st_mtime)
+        installed_fmt = installed_dt.strftime("%Y-%m-%d %H:%M")
+        table.add_row(f.stem, origin_fmt, models_fmt, f.name, size, installed_fmt)
 
     console.print(table)
     console.print(f"\n[dim]{len(files)} worker(s) installed.[/dim]")
-    console.print(
-        "[dim]Tip: Generated workers (wf_*) are managed by edge-core sync.[/dim]"
-    )
+    console.print("[dim]Tip: Generated workers (wf_*) are managed by edge-core sync.[/dim]")
 
 
 @worker.command("add")
@@ -340,9 +343,7 @@ def remove_worker(name: str, yes: bool) -> None:
             f"[yellow]⚠[/yellow] [bold]{filename}[/bold] is a workflow-generated worker. "
             "Removing it manually will cause it to be re-created on the next edge sync."
         )
-        console.print(
-            "[dim]To stop a workflow worker, deactivate the workflow in the UI.[/dim]"
-        )
+        console.print("[dim]To stop a workflow worker, deactivate the workflow in the UI.[/dim]")
 
     if not yes:
         if not click.confirm(f"Remove worker [bold]{filename}[/bold]?"):
@@ -399,14 +400,10 @@ def worker_logs(follow: bool, tail: int, container: str | None) -> None:
 
     if not container_name:
         console.print("[red]✗[/red] Worker container not found.")
-        console.print(
-            "[dim]Start the worker container with: cyberwave worker start[/dim]"
-        )
+        console.print("[dim]Start the worker container with: cyberwave worker start[/dim]")
         raise click.Abort()
 
-    console.print(
-        f"[dim]Streaming logs for container: [bold]{container_name}[/bold][/dim]"
-    )
+    console.print(f"[dim]Streaming logs for container: [bold]{container_name}[/bold][/dim]")
 
     cmd = ["docker", "logs", "--tail", str(tail)]
     if follow:
@@ -414,9 +411,7 @@ def worker_logs(follow: bool, tail: int, container: str | None) -> None:
     cmd.append(container_name)
 
     try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-        )
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         if proc.stdout:
             for line in proc.stdout:
                 console.print(colorize_log_line(line.rstrip()))
@@ -465,9 +460,7 @@ def worker_status(container: str | None) -> None:
 
     if not container_name:
         console.print("  [yellow]⚠[/yellow] No worker container found.")
-        console.print(
-            "  [dim]Start with: cyberwave worker start[/dim]"
-        )
+        console.print("  [dim]Start with: cyberwave worker start[/dim]")
         console.print()
         return
 
@@ -507,9 +500,7 @@ def worker_status(container: str | None) -> None:
                     console.print(f"  Stopped:   [dim]{finished[:19]}[/dim]")
                 if exit_code and exit_code != "0":
                     console.print(f"  Exit code: [red]{exit_code}[/red]")
-                console.print(
-                    "\n  [dim]View logs with: cyberwave worker logs --no-follow[/dim]"
-                )
+                console.print("\n  [dim]View logs with: cyberwave worker logs --no-follow[/dim]")
         else:
             console.print(f"  [yellow]⚠[/yellow] Could not inspect container {container_name}.")
     except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -535,8 +526,9 @@ def worker_status(container: str | None) -> None:
 def worker_monitor(update: float, container: str | None) -> None:
     """Live dashboard showing worker resource usage and Zenoh throughput.
 
-    Displays CPU, memory, GPU (Linux/NVIDIA only), per-channel Zenoh
-    message rates, hook frame counts, and ML inference latency.
+    Displays CPU, memory, temperature, power consumption, GPU
+    (Linux/NVIDIA only), per-channel Zenoh message rates, hook frame
+    counts, and ML inference latency.
 
     \b
     Examples:
@@ -544,8 +536,13 @@ def worker_monitor(update: float, container: str | None) -> None:
         cyberwave worker monitor --update 1
         cyberwave worker monitor -c cyberwave-worker-abc12345
     """
+    import platform as _platform
+
     from ..monitor import (
+        LinuxThermalReader,
+        MacMonReader,
         RateTracker,
+        ThermalPowerStats,
         WorkerSnapshot,
         ZenohStatsReader,
         build_dashboard,
@@ -567,9 +564,7 @@ def worker_monitor(update: float, container: str | None) -> None:
             )
         else:
             console.print("[red]✗[/red] Worker container not found.")
-            console.print(
-                "[dim]Start the worker container with: cyberwave worker start[/dim]"
-            )
+            console.print("[dim]Start the worker container with: cyberwave worker start[/dim]")
         raise click.Abort()
 
     console.print(
@@ -588,6 +583,14 @@ def worker_monitor(update: float, container: str | None) -> None:
             "Install eclipse-zenoh for full throughput data.[/dim]\n"
         )
 
+    if _platform.system() == "Darwin":
+        thermal_reader: MacMonReader | LinuxThermalReader = MacMonReader()
+    else:
+        thermal_reader = LinuxThermalReader()
+    thermal_ok = thermal_reader.start()
+    if not thermal_ok and _platform.system() == "Darwin":
+        console.print("[dim]Tip: brew install macmon for temperature & power data.[/dim]\n")
+
     try:
         with Live(console=console, refresh_per_second=1, screen=False) as live:
             while True:
@@ -604,6 +607,7 @@ def worker_monitor(update: float, container: str | None) -> None:
                     cpu_cores=cpu_cores,
                     docker=docker,
                     gpu=gpu,
+                    thermal_power=thermal_reader.latest() if thermal_ok else ThermalPowerStats(),
                     zenoh_channels=rate_tracker.update(transport),
                     hooks=parse_hook_stats(hooks_data),
                     models=parse_model_stats(models_data),
@@ -616,6 +620,8 @@ def worker_monitor(update: float, container: str | None) -> None:
     finally:
         if zenoh_ok:
             zenoh_reader.stop()
+        if thermal_ok:
+            thermal_reader.stop()
         console.print("\n[dim]Monitor stopped.[/dim]")
 
 
@@ -650,9 +656,7 @@ def worker_start() -> None:
 
     ok = wm.start()
     if ok:
-        console.print(
-            f"[green]✓[/green] Worker container [bold]{wm.container_name}[/bold] started"
-        )
+        console.print(f"[green]✓[/green] Worker container [bold]{wm.container_name}[/bold] started")
     else:
         console.print(
             f"[red]✗[/red] Failed to start worker container [bold]{wm.container_name}[/bold]"
@@ -671,9 +675,7 @@ def worker_stop() -> None:
     wm = _get_worker_manager()
     ok = wm.stop()
     if ok:
-        console.print(
-            f"[green]✓[/green] Worker container [bold]{wm.container_name}[/bold] stopped"
-        )
+        console.print(f"[green]✓[/green] Worker container [bold]{wm.container_name}[/bold] stopped")
     else:
         console.print("[red]✗[/red] Failed to stop worker container")
         sys.exit(1)

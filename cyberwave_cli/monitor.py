@@ -82,6 +82,21 @@ class ModelStats:
 
 
 @dataclass
+class ThermalPowerStats:
+    """Host-level temperature and power readings."""
+
+    available: bool = False
+    cpu_temp: float = 0.0
+    gpu_temp: float = 0.0
+    cpu_power_w: float = 0.0
+    gpu_power_w: float = 0.0
+    ane_power_w: float = 0.0
+    total_power_w: float = 0.0
+    avg_power_w: float = 0.0
+    message: str = ""
+
+
+@dataclass
 class WorkerSnapshot:
     """All data needed to render one dashboard frame."""
 
@@ -90,6 +105,7 @@ class WorkerSnapshot:
     cpu_cores: int = 1
     docker: DockerStats = field(default_factory=DockerStats)
     gpu: GpuStats = field(default_factory=GpuStats)
+    thermal_power: ThermalPowerStats = field(default_factory=ThermalPowerStats)
     zenoh_channels: list[ZenohChannelStats] = field(default_factory=list)
     hooks: list[HookStats] = field(default_factory=list)
     models: list[ModelStats] = field(default_factory=list)
@@ -225,9 +241,7 @@ def get_gpu_stats(container_name: str) -> GpuStats:
     except FileNotFoundError:
         has_gpu = check_container_gpu(container_name)
         if has_gpu:
-            return GpuStats(
-                message="N/A — install NVIDIA drivers for GPU metrics"
-            )
+            return GpuStats(message="N/A — install NVIDIA drivers for GPU metrics")
         return GpuStats(message="Container has no GPU access")
     except subprocess.TimeoutExpired:
         pass
@@ -392,10 +406,7 @@ class RateTracker:
             total_bytes = publish_bytes.get(ch, 0) + recv_bytes.get(ch, 0)
 
             prev_total = self._prev_publish.get(ch, 0) + self._prev_recv.get(ch, 0)
-            prev_bytes = (
-                self._prev_publish_bytes.get(ch, 0)
-                + self._prev_recv_bytes.get(ch, 0)
-            )
+            prev_bytes = self._prev_publish_bytes.get(ch, 0) + self._prev_recv_bytes.get(ch, 0)
 
             msg_rate = (total - prev_total) / elapsed
             byte_rate = (total_bytes - prev_bytes) / elapsed
@@ -418,9 +429,7 @@ class RateTracker:
         return results
 
     @staticmethod
-    def _zeros(
-        publish: dict[str, int], recv: dict[str, int]
-    ) -> list[ZenohChannelStats]:
+    def _zeros(publish: dict[str, int], recv: dict[str, int]) -> list[ZenohChannelStats]:
         """Return zero-rate entries for the seed call."""
         all_ch = set(publish.keys()) | set(recv.keys())
         return [
@@ -479,6 +488,16 @@ def _parse_percent(s: str) -> float:
         return 0.0
 
 
+def _colorize_temp(temp_c: float) -> str:
+    """Return a Rich-markup string with green/yellow/red coloring."""
+    label = f"{temp_c:.1f}°C"
+    if temp_c >= 80:
+        return f"[red]{label}[/red]"
+    if temp_c >= 60:
+        return f"[yellow]{label}[/yellow]"
+    return f"[green]{label}[/green]"
+
+
 def _format_bytes_rate(bps: float) -> str:
     """Format a bytes-per-second value into a human-readable string."""
     if bps <= 0:
@@ -503,7 +522,6 @@ def build_dashboard(snap: WorkerSnapshot) -> RenderGroup:
     header = Text()
     header.append("Cyberwave Worker Monitor", style="bold cyan")
     header.append(f"  (container: {snap.container_name})", style="dim")
-    header.append(f"  Uptime: {snap.uptime}", style="dim")
     parts.append(header)
     parts.append(Text("Press Ctrl+C to stop.\n", style="dim"))
 
@@ -544,13 +562,46 @@ def build_dashboard(snap: WorkerSnapshot) -> RenderGroup:
     else:
         res_table.add_row("GPU", snap.gpu.message or "N/A", "")
 
+    tp = snap.thermal_power
+    if tp.available:
+        temp_parts = []
+        if tp.cpu_temp > 0:
+            temp_parts.append(f"CPU: {_colorize_temp(tp.cpu_temp)}")
+        if tp.gpu_temp > 0:
+            temp_parts.append(f"GPU: {_colorize_temp(tp.gpu_temp)}")
+        res_table.add_row(
+            "Temp",
+            " | ".join(temp_parts) if temp_parts else "N/A",
+            "",
+        )
+
+        if tp.total_power_w > 0:
+            power_detail_parts = []
+            if tp.cpu_power_w > 0:
+                power_detail_parts.append(f"CPU: {tp.cpu_power_w:.1f}W")
+            if tp.gpu_power_w > 0:
+                power_detail_parts.append(f"GPU: {tp.gpu_power_w:.1f}W")
+            if tp.ane_power_w > 0:
+                power_detail_parts.append(f"ANE: {tp.ane_power_w:.1f}W")
+            res_table.add_row(
+                "Power",
+                f"{tp.total_power_w:.1f}W (avg: {tp.avg_power_w:.1f}W)",
+                " | ".join(power_detail_parts),
+            )
+        elif tp.avg_power_w > 0:
+            res_table.add_row("Power", f"avg: {tp.avg_power_w:.1f}W", "")
+    else:
+        res_table.add_row("Temp", "N/A", "")
+        res_table.add_row("Power", "N/A", "")
+
     net_parts = [p.strip() for p in snap.docker.net_io.split("/")]
     net_display = (
-        f"{net_parts[0]} in / {net_parts[1]} out"
-        if len(net_parts) == 2
-        else snap.docker.net_io
+        f"{net_parts[0]} in / {net_parts[1]} out" if len(net_parts) == 2 else snap.docker.net_io
     )
     res_table.add_row("Network", net_display, "")
+
+    if snap.uptime:
+        res_table.add_row("Uptime", snap.uptime, "")
 
     parts.append(Panel(res_table, border_style="dim"))
 
@@ -610,6 +661,267 @@ def build_dashboard(snap: WorkerSnapshot) -> RenderGroup:
 
 
 # ---------------------------------------------------------------------------
+# Thermal / power readers
+# ---------------------------------------------------------------------------
+
+
+class _RunningAverage:
+    """Incrementally compute a running mean."""
+
+    __slots__ = ("_sum", "_count")
+
+    def __init__(self) -> None:
+        self._sum = 0.0
+        self._count = 0
+
+    def add(self, value: float) -> float:
+        self._sum += value
+        self._count += 1
+        return self._sum / self._count
+
+
+class MacMonReader:
+    """Read temperature and power from ``macmon pipe`` on Apple Silicon.
+
+    Spawns the process in the background and parses its newline-delimited
+    JSON output.  If ``macmon`` is not installed, :meth:`start` returns
+    ``False`` and the monitor degrades gracefully.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._latest = ThermalPowerStats()
+        self._proc: subprocess.Popen[str] | None = None
+        self._thread: threading.Thread | None = None
+        self._avg = _RunningAverage()
+
+    def start(self) -> bool:
+        try:
+            self._proc = subprocess.Popen(
+                ["macmon", "pipe"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            return False
+
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+        return True
+
+    def _read_loop(self) -> None:
+        assert self._proc is not None and self._proc.stdout is not None
+        while True:
+            line = self._proc.stdout.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            temp = data.get("temp", {})
+            total_power = float(data.get("all_power", 0.0))
+            if total_power > 0:
+                avg = self._avg.add(total_power)
+            else:
+                avg = self._avg._sum / max(self._avg._count, 1)
+
+            stats = ThermalPowerStats(
+                available=True,
+                cpu_temp=float(temp.get("cpu_temp_avg", 0.0)),
+                gpu_temp=float(temp.get("gpu_temp_avg", 0.0)),
+                cpu_power_w=float(data.get("cpu_power", 0.0)),
+                gpu_power_w=float(data.get("gpu_power", 0.0)),
+                ane_power_w=float(data.get("ane_power", 0.0)),
+                total_power_w=total_power,
+                avg_power_w=avg,
+            )
+            with self._lock:
+                self._latest = stats
+
+    def latest(self) -> ThermalPowerStats:
+        with self._lock:
+            return self._latest
+
+    def stop(self) -> None:
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+
+
+class LinuxThermalReader:
+    """Read temperature from sysfs and power from RAPL / Jetson INA / battery.
+
+    All data comes from the kernel's sysfs interface -- no external tools.
+    """
+
+    def __init__(self) -> None:
+        self._thermal_zones: list[str] = []
+        self._rapl_path: str | None = None
+        self._jetson_power_path: str | None = None
+        self._battery_power_path: str | None = None
+        self._prev_energy_uj: int | None = None
+        self._prev_energy_ts: float = 0.0
+        self._avg = _RunningAverage()
+        self._available = False
+
+    def start(self) -> bool:
+        from pathlib import Path
+
+        # -- Discover thermal zones --
+        thermal_base = Path("/sys/class/thermal")
+        if thermal_base.exists():
+            for zone in sorted(thermal_base.glob("thermal_zone*")):
+                temp_file = zone / "temp"
+                if temp_file.exists():
+                    self._thermal_zones.append(str(temp_file))
+
+        # -- Discover power source (priority order) --
+        # 1. RAPL (x86)
+        rapl_base = Path("/sys/class/powercap")
+        rapl_energy = rapl_base / "intel-rapl:0" / "energy_uj"
+        if rapl_energy.exists():
+            try:
+                rapl_energy.read_text()
+                self._rapl_path = str(rapl_energy)
+            except PermissionError:
+                pass
+
+        # 2. Jetson INA3221 total board power (VDD_IN)
+        if self._rapl_path is None:
+            for hwmon in Path("/sys/class/hwmon").glob("hwmon*"):
+                name_file = hwmon / "name"
+                if name_file.exists():
+                    try:
+                        name = name_file.read_text().strip()
+                    except OSError:
+                        continue
+                    if "ina3221" in name.lower():
+                        for power_file in sorted(hwmon.glob("power*_input")):
+                            self._jetson_power_path = str(power_file)
+                            break
+                        if self._jetson_power_path:
+                            break
+
+        # 3. Battery
+        if self._rapl_path is None and self._jetson_power_path is None:
+            for bat in Path("/sys/class/power_supply").glob("BAT*"):
+                pnow = bat / "power_now"
+                if pnow.exists():
+                    self._battery_power_path = str(pnow)
+                    break
+
+        self._available = bool(self._thermal_zones) or self._has_power_source()
+        return self._available
+
+    def _has_power_source(self) -> bool:
+        return any(
+            [
+                self._rapl_path,
+                self._jetson_power_path,
+                self._battery_power_path,
+            ]
+        )
+
+    def latest(self) -> ThermalPowerStats:
+        if not self._available:
+            return ThermalPowerStats()
+
+        cpu_temp = self._read_thermal_zones()
+        power_w = self._read_power()
+        avg = self._avg.add(power_w) if power_w > 0 else (self._avg._sum / max(self._avg._count, 1))
+
+        return ThermalPowerStats(
+            available=True,
+            cpu_temp=cpu_temp,
+            total_power_w=power_w,
+            avg_power_w=avg,
+        )
+
+    def _read_thermal_zones(self) -> float:
+        """Return the highest thermal zone reading in Celsius."""
+        max_temp = 0.0
+        for path in self._thermal_zones:
+            try:
+                with open(path) as f:
+                    raw = f.read().strip()
+                temp_c = int(raw) / 1000.0
+                if temp_c > max_temp:
+                    max_temp = temp_c
+            except (OSError, ValueError):
+                continue
+        return max_temp
+
+    def _read_power(self) -> float:
+        """Return instantaneous power in watts from the best available source."""
+        if self._rapl_path is not None:
+            return self._read_rapl()
+        if self._jetson_power_path is not None:
+            return self._read_jetson()
+        if self._battery_power_path is not None:
+            return self._read_battery()
+        return 0.0
+
+    def _read_rapl(self) -> float:
+        """Compute watts from the RAPL cumulative energy counter."""
+        try:
+            with open(self._rapl_path) as f:  # type: ignore[arg-type]
+                energy_uj = int(f.read().strip())
+        except (OSError, ValueError):
+            return 0.0
+
+        now = time.time()
+        if self._prev_energy_uj is not None:
+            elapsed = now - self._prev_energy_ts
+            if elapsed > 0:
+                delta_uj = energy_uj - self._prev_energy_uj
+                if delta_uj < 0:
+                    # Counter wrapped (32-bit or 64-bit overflow)
+                    delta_uj = 0
+                watts = (delta_uj / 1_000_000.0) / elapsed
+                self._prev_energy_uj = energy_uj
+                self._prev_energy_ts = now
+                return watts
+
+        self._prev_energy_uj = energy_uj
+        self._prev_energy_ts = now
+        return 0.0
+
+    def _read_jetson(self) -> float:
+        """Read Jetson INA3221 power in milliwatts, return watts."""
+        try:
+            with open(self._jetson_power_path) as f:  # type: ignore[arg-type]
+                mw = int(f.read().strip())
+            return mw / 1000.0
+        except (OSError, ValueError):
+            return 0.0
+
+    def _read_battery(self) -> float:
+        """Read battery power_now in microwatts, return watts."""
+        try:
+            with open(self._battery_power_path) as f:  # type: ignore[arg-type]
+                uw = int(f.read().strip())
+            return uw / 1_000_000.0
+        except (OSError, ValueError):
+            return 0.0
+
+    def stop(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Zenoh stats subscriber (reads from the worker's stats channel)
 # ---------------------------------------------------------------------------
 
@@ -652,9 +964,11 @@ class ZenohStatsReader:
                     connect = [f"tcp/127.0.0.1:{ZENOH_LISTEN_PORT}"]
                 else:
                     ip = get_container_ip(container_name)
-                    connect = [f"tcp/{ip}:{ZENOH_LISTEN_PORT}"] if ip else [
-                        f"tcp/127.0.0.1:{ZENOH_LISTEN_PORT}"
-                    ]
+                    connect = (
+                        [f"tcp/{ip}:{ZENOH_LISTEN_PORT}"]
+                        if ip
+                        else [f"tcp/127.0.0.1:{ZENOH_LISTEN_PORT}"]
+                    )
             cfg = zenoh.Config()
             if connect:
                 cfg.insert_json5("connect/endpoints", json.dumps(connect))
