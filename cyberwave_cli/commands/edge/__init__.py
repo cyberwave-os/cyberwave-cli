@@ -199,31 +199,74 @@ def _edge_process_pids() -> list[str]:
 
 
 def _kill_lingering_edge_processes(timeout: float = 5.0) -> None:
-    """Send SIGKILL to any remaining edge-core processes and wait for them to exit.
+    """Kill any remaining edge-core processes and wait for them to exit.
 
-    Called during uninstall after ``systemctl stop`` to guarantee the process
-    is fully gone before we remove the config directory.  Without this, a
-    still-running edge-core can recreate subdirectories (e.g. ``workers/``)
-    between the ``rmtree`` call and the test assertion.
+    Called during uninstall after ``systemctl stop`` / ``launchctl bootout``
+    to guarantee the process is fully gone before we remove the config
+    directory.  Without this, a still-running edge-core can recreate
+    subdirectories (e.g. ``workers/``) between the ``rmtree`` call and
+    any subsequent assertions.
     """
     import signal
 
-    pids = _edge_process_pids()
+    try:
+        pids = _edge_process_pids()
+    except FileNotFoundError:
+        pids = []
+
     if not pids:
         return
 
     for pid in pids:
         try:
             os.kill(int(pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
+        except (ProcessLookupError, PermissionError, ValueError):
             pass
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        pids = _edge_process_pids()
+        try:
+            pids = _edge_process_pids()
+        except FileNotFoundError:
+            return
         if not pids:
             return
         time.sleep(0.2)
+
+
+def _remove_config_dir_reliably(config_dir: Path, *, retries: int = 5, delay: float = 1.0) -> bool:
+    """Remove *config_dir*, retrying if a dying process recreates subdirectories.
+
+    Returns True if the directory no longer exists after all attempts.
+    """
+    for _attempt in range(retries):
+        if not config_dir.exists():
+            return True
+        try:
+            shutil.rmtree(config_dir)
+        except PermissionError:
+            console.print(
+                "[red]Permission denied removing edge config directory.[/red]\n"
+                "[dim]Re-run with sudo: sudo cyberwave edge uninstall[/dim]"
+            )
+            return False
+        except OSError as exc:
+            console.print(f"[yellow]Could not fully remove {config_dir}: {exc}[/yellow]")
+            return False
+        if not config_dir.exists():
+            return True
+        time.sleep(delay)
+
+    if config_dir.exists():
+        console.print(
+            f"[yellow]{config_dir} was recreated by a lingering process; "
+            f"attempting final cleanup.[/yellow]"
+        )
+        try:
+            shutil.rmtree(config_dir)
+        except OSError:
+            pass
+    return not config_dir.exists()
 
 
 def _edge_process_logs_hint() -> str:
@@ -486,17 +529,8 @@ def uninstall_edge(yes):
                 f"[green]Stopped {len(stopped_driver_containers)} edge driver container(s).[/green]"
             )
 
-        if CONFIG_DIR.exists():
-            try:
-                shutil.rmtree(CONFIG_DIR)
-                console.print(f"[green]Removed:[/green] {CONFIG_DIR}")
-            except PermissionError:
-                console.print(
-                    "[red]Permission denied removing edge config directory.[/red]\n"
-                    "[dim]Re-run as your regular user: cyberwave edge uninstall[/dim]"
-                )
-            except OSError as exc:
-                console.print(f"[yellow]Could not fully remove {CONFIG_DIR}: {exc}[/yellow]")
+        if _remove_config_dir_reliably(CONFIG_DIR):
+            console.print(f"[green]Removed:[/green] {CONFIG_DIR}")
 
         installed_package_name = _resolve_installed_edge_core_package_name()
         remove_pkg = yes or Confirm.ask(
@@ -574,17 +608,8 @@ def uninstall_edge(yes):
             f"[green]Stopped {len(stopped_driver_containers)} edge driver container(s).[/green]"
         )
 
-    if CONFIG_DIR.exists():
-        try:
-            shutil.rmtree(CONFIG_DIR)
-            console.print(f"[green]Removed:[/green] {CONFIG_DIR}")
-        except PermissionError:
-            console.print(
-                "[red]Permission denied removing edge config directory.[/red]\n"
-                "[dim]Re-run with sudo: sudo cyberwave edge uninstall[/dim]"
-            )
-        except OSError as exc:
-            console.print(f"[yellow]Could not fully remove {CONFIG_DIR}: {exc}[/yellow]")
+    if _remove_config_dir_reliably(CONFIG_DIR):
+        console.print(f"[green]Removed:[/green] {CONFIG_DIR}")
 
     if not yes:
         from rich.prompt import Confirm as RichConfirm
