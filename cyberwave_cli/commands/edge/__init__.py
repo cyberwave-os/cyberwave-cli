@@ -67,7 +67,7 @@ def _delete_registered_edges_for_fingerprint(
         return 0, 1
 
     try:
-        from ..config import get_api_url
+        from ...config import get_api_url
 
         client = Cyberwave(base_url=base_url or get_api_url(), token=token)
         edges = client.edges.list()
@@ -175,14 +175,14 @@ def _stop_edge_driver_containers(run_command) -> list[str]:
 
 def _find_edge_core_binary() -> str | None:
     """Locate the cyberwave-edge-core binary used for process-mode startups."""
-    from ..core import EDGE_CORE_SPEC, _resolve_service_binary
+    from ...core import EDGE_CORE_SPEC, _resolve_service_binary
 
     return _resolve_service_binary(EDGE_CORE_SPEC)
 
 
 def _edge_process_match() -> str:
     """Return the process match string for manual edge-core launches."""
-    from ..core import EDGE_CORE_SPEC
+    from ...core import EDGE_CORE_SPEC
 
     return EDGE_CORE_SPEC.process_match
 
@@ -205,7 +205,7 @@ def _edge_process_logs_hint() -> str:
 
 def _macos_launchagent_target() -> tuple[str, str]:
     """Return the launchctl domain/label target for the edge LaunchAgent."""
-    from ..core import EDGE_CORE_SPEC, _launchagent_target
+    from ...core import EDGE_CORE_SPEC, _launchagent_target
 
     return _launchagent_target(EDGE_CORE_SPEC)
 
@@ -223,14 +223,14 @@ def _ensure_macos_launchagent_installed() -> bool:
 
 def _macos_launchagent_plist_path() -> Path:
     """Return the edge LaunchAgent plist path for the current user."""
-    from ..core import EDGE_CORE_SPEC, _launchagent_plist_path
+    from ...core import EDGE_CORE_SPEC, _launchagent_plist_path
 
     return _launchagent_plist_path(EDGE_CORE_SPEC)
 
 
 def _macos_launchagent_log_path() -> Path:
     """Return the edge LaunchAgent log file path for the current user."""
-    from ..core import EDGE_CORE_SPEC, _launchagent_label
+    from ...core import EDGE_CORE_SPEC, _launchagent_label
 
     label = _launchagent_label(EDGE_CORE_SPEC)
     return Path.home() / "Library" / "Logs" / "Cyberwave" / f"{label}.log"
@@ -269,7 +269,7 @@ def _show_macos_launchagent_logs(*, follow: bool, lines: int) -> None:
 @click.group()
 def edge():
     """Manage the edge node service."""
-    from ..core import _migrate_legacy_config_dir
+    from ...core import _migrate_legacy_config_dir
 
     _migrate_legacy_config_dir()
 
@@ -325,10 +325,10 @@ def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, wit
         cyberwave edge install --channel staging --version 0.0.42.595
     """
     if reconfigure_camera:
-        from ..macos import is_macos
+        from ...macos import is_macos
 
         if is_macos():
-            from ..macos import (
+            from ...macos import (
                 setup_camera_stream_server,
                 start_edge_core_service,
                 stop_edge_core_service,
@@ -344,12 +344,16 @@ def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, wit
                 console.print("\n[dim]Aborted.[/dim]")
                 raise SystemExit(1)
         else:
-            from ..core import _detect_and_select_cameras
+            from ...core import _detect_and_select_cameras
 
             _detect_and_select_cameras()
+            console.print(
+                "[dim]Edge-core will automatically pick up the new camera "
+                "within a few seconds.[/dim]"
+            )
         return
 
-    from ..core import setup_edge_core
+    from ...core import setup_edge_core
 
     try:
         if not setup_edge_core(
@@ -379,16 +383,16 @@ def uninstall_edge(yes):
         sudo cyberwave edge uninstall
         sudo cyberwave edge uninstall -y
     """
-    from ..config import CONFIG_DIR
-    from ..core import (
+    from ...config import CONFIG_DIR
+    from ...core import (
         EDGE_CORE_SPEC,
         SYSTEMD_UNIT_NAME,
         _is_macos,
         _load_or_generate_edge_fingerprint,
         _resolve_installed_edge_core_package_name,
     )
-    from ..credentials import load_credentials
-    from ..macos import is_macos
+    from ...credentials import load_credentials
+    from ...macos import is_macos
 
     creds = load_credentials()
     edge_fingerprint = _load_or_generate_edge_fingerprint()
@@ -410,7 +414,7 @@ def uninstall_edge(yes):
             return
 
     if _is_macos():
-        from ..config import clean_subprocess_env
+        from ...config import clean_subprocess_env
 
         _domain, target = _macos_launchagent_target()
         plist_path = _macos_launchagent_plist_path()
@@ -508,7 +512,7 @@ def uninstall_edge(yes):
         console.print(f"[green]{EDGE_CORE_SPEC.package_name} service removed.[/green]")
         return
 
-    from ..core import SYSTEMD_UNIT_PATH, _run
+    from ...core import SYSTEMD_UNIT_PATH, _run
 
     # Stop and disable the service
     try:
@@ -601,7 +605,7 @@ def uninstall_edge(yes):
 @click.option("--foreground", "-f", is_flag=True, help="Run in foreground (don't daemonize)")
 def start_edge(env_file, foreground):
     """Start the edge node service."""
-    from ..core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, load_launchagent_service, start_service
+    from ...core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, load_launchagent_service, start_service
 
     spec = EDGE_CORE_SPEC
 
@@ -611,7 +615,7 @@ def start_edge(env_file, foreground):
         return
 
     if not foreground and _is_macos() and _macos_launchagent_plist_path().exists():
-        from ..config import clean_subprocess_env
+        from ...config import clean_subprocess_env
 
         domain, target = _macos_launchagent_target()
         try:
@@ -649,7 +653,7 @@ def start_edge(env_file, foreground):
 
     work_dir = env_path.parent
 
-    from ..config import clean_subprocess_env
+    from ...config import clean_subprocess_env
 
     env = clean_subprocess_env()
     env["DOTENV_PATH"] = str(env_path)
@@ -688,17 +692,17 @@ def start_edge(env_file, foreground):
 @edge.command("stop")
 def stop_edge():
     """Stop the edge node service."""
-    from ..macos import is_macos
+    from ...macos import is_macos
 
     if is_macos():
-        from ..macos import stop_edge_core_service
+        from ...macos import stop_edge_core_service
 
         stop_edge_core_service()
         return
 
     import signal
 
-    from ..core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, stop_service
+    from ...core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, stop_service
 
     if _has_systemd() and SYSTEMD_UNIT_PATH.exists():
         stop_service()
@@ -708,7 +712,7 @@ def stop_edge():
         if not _ensure_macos_launchagent_installed():
             raise SystemExit(1)
 
-        from ..config import clean_subprocess_env
+        from ...config import clean_subprocess_env
 
         _domain, target = _macos_launchagent_target()
         try:
@@ -767,7 +771,7 @@ def restart_edge(env_file):
         sudo cyberwave edge restart
         cyberwave edge restart --env-file /path/to/.env
     """
-    from ..core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, load_launchagent_service, restart_service
+    from ...core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, load_launchagent_service, restart_service
 
     if _has_systemd() and SYSTEMD_UNIT_PATH.exists():
         restart_service()
@@ -804,7 +808,7 @@ def restart_edge(env_file):
         console.print("[dim]Pass --env-file or run from the directory containing .env[/dim]")
         return
 
-    from ..config import clean_subprocess_env
+    from ...config import clean_subprocess_env
 
     env = clean_subprocess_env()
     env["DOTENV_PATH"] = str(env_path)
@@ -833,10 +837,10 @@ def restart_edge(env_file):
 @edge.command("status")
 def status_edge():
     """Check edge node status."""
-    from ..core import EDGE_CORE_SPEC, SYSTEMD_UNIT_NAME, _is_macos
+    from ...core import EDGE_CORE_SPEC, SYSTEMD_UNIT_NAME, _is_macos
 
     if _is_macos():
-        from ..config import clean_subprocess_env
+        from ...config import clean_subprocess_env
 
         _domain, target = _macos_launchagent_target()
         result = subprocess.run(
@@ -918,7 +922,7 @@ def list_cameras(as_json: bool, save: bool):
     """
     import platform as _platform
 
-    from ..device_utils import discover_usb_cameras
+    from ...device_utils import discover_usb_cameras
 
     system = _platform.system()
     cameras = discover_usb_cameras()
@@ -952,253 +956,19 @@ def list_cameras(as_json: bool, save: bool):
             console.print()
 
     if save and cameras:
-        from ..config import CONFIG_DIR
-        from ..device_utils import write_cameras_json
+        from ...config import CONFIG_DIR
+        from ...device_utils import write_cameras_json
 
         write_cameras_json(cameras, CONFIG_DIR)
         console.print(f"[green]✓[/green] Saved to {CONFIG_DIR / 'cameras.json'}")
 
 
-@edge.group("driver")
-def driver():
-    """Manage edge driver containers."""
-    pass
+# =============================================================================
+# Driver Commands (containers.py)
+# =============================================================================
+from . import containers  # noqa: E402
 
-
-@driver.command("list")
-@click.option("--all", "show_all", is_flag=True, default=False, help="Also show exited driver containers.")
-def list_drivers(show_all: bool):
-    """List running driver containers."""
-    try:
-        cmd = [
-            "docker", "ps",
-            "--filter", "name=cyberwave-driver",
-            "--format", "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.ID}}",
-        ]
-        if show_all:
-            cmd.insert(2, "--all")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            console.print(f"[red]Error: {result.stderr.strip()}[/red]")
-            return
-
-        lines = result.stdout.strip().splitlines()
-        # Docker table output always has a header line; data rows follow it
-        if len(lines) <= 1:
-            console.print("[yellow]No running driver containers found[/yellow]")
-            return
-
-        console.print("\n".join(lines))
-
-    except FileNotFoundError:
-        console.print("[red]Error: docker not found — is Docker installed and running?[/red]")
-    except Exception as e:
-        console.print(f"[red]Error listing drivers: {e}[/red]")
-
-
-def _pick_driver_name(title: str = "Select a driver", *, stopped: bool = False) -> str | None:
-    """Interactively pick a cyberwave-driver container name.
-
-    When stopped=False (default) only running containers are listed.
-    When stopped=True only exited/stopped containers are listed.
-    """
-    from ..core import _select_with_arrows
-
-    if stopped:
-        filter_args = ["--filter", "status=exited"]
-    else:
-        filter_args = ["--filter", "status=running", "--filter", "status=restarting"]
-    try:
-        result = subprocess.run(
-            [
-                "docker", "ps", "-a",
-                "--filter", "name=cyberwave-driver",
-                *filter_args,
-                "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}",
-            ],
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError:
-        console.print("[red]Error: docker not found — is Docker installed and running?[/red]")
-        return None
-
-    lines = [l for l in result.stdout.strip().splitlines() if l]
-    if not lines:
-        kind = "stopped" if stopped else "running"
-        console.print(f"[yellow]No {kind} driver containers found[/yellow]")
-        return None
-
-    names = []
-    options = []
-    for line in lines:
-        parts = line.split("\t")
-        name  = parts[0]
-        image = parts[1] if len(parts) > 1 else ""
-        names.append(name)
-        options.append(f"{name} [{image}]")
-
-    idx = _select_with_arrows(title, options)
-    return names[idx]
-
-
-@driver.command("start")
-@click.argument("name", required=False, default=None)
-def start_driver(name: str | None):
-    """Start a stopped driver container.
-
-    If NAME is omitted, shows an interactive list of stopped driver containers
-    to pick from.
-
-    Note: this restarts an existing container that was previously stopped.
-    To launch a brand-new driver, use the edge-core service which manages
-    image selection and environment configuration.
-
-    \b
-    Examples:
-        cyberwave edge driver start
-        cyberwave edge driver start cyberwave-driver-624d7fe2
-    """
-    if name is None:
-        try:
-            name = _pick_driver_name("Select a driver to start", stopped=True)
-        except KeyboardInterrupt:
-            console.print("\n[dim]Aborted.[/dim]")
-            return
-        if name is None:
-            return
-
-    try:
-        inspect = subprocess.run(
-            ["docker", "inspect", "--format", "{{.State.Status}}", name],
-            capture_output=True,
-            text=True,
-        )
-        if inspect.returncode != 0:
-            console.print(f"[red]Container '{name}' not found[/red]")
-            return
-
-        status = inspect.stdout.strip()
-        if status == "running":
-            console.print(f"[yellow]Container '{name}' is already running[/yellow]")
-            return
-
-        console.print(f"[cyan]Starting driver container '{name}'...[/cyan]")
-
-        # Re-enable restart policy so the container recovers automatically on failure
-        subprocess.run(
-            ["docker", "update", "--restart=on-failure", name],
-            capture_output=True,
-            check=True,
-        )
-
-        result = subprocess.run(
-            ["docker", "start", name],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            console.print(f"[red]Failed to start container: {result.stderr.strip()}[/red]")
-            return
-
-        console.print(f"[green]✓ Started '{name}'[/green]")
-        console.print(f"[dim]Restart policy set to on-failure — container will retry automatically[/dim]")
-
-    except FileNotFoundError:
-        console.print("[red]Error: docker not found — is Docker installed and running?[/red]")
-    except Exception as e:
-        console.print(f"[red]Error starting driver: {e}[/red]")
-
-
-
-@driver.command("stop")
-@click.argument("name", required=False, default=None)
-def stop_driver(name: str | None):
-    """Stop a running driver container.
-
-    If NAME is omitted, shows an interactive list of running driver containers
-    to pick from.
-
-    Disables any Docker restart policy before stopping, so the container
-    does not come back automatically.
-
-    If the container is managed by a systemd service (e.g. on a Go2),
-    Docker stop alone is not enough — systemd will restart it. In that
-    case stop the backing service instead:
-
-    \b
-        sudo systemctl stop cyberwave-video-grabber.service
-
-    \b
-    Examples:
-        cyberwave edge driver stop
-        cyberwave edge driver stop cyberwave-driver-624d7fe2
-        cyberwave edge driver stop cyberwave-go2-driver
-    """
-    if name is None:
-        try:
-            name = _pick_driver_name("Select a driver to stop")
-        except KeyboardInterrupt:
-            console.print("\n[dim]Aborted.[/dim]")
-            return
-        if name is None:
-            return
-
-    try:
-        # Check the container exists and is running
-        inspect = subprocess.run(
-            ["docker", "inspect", "--format", "{{.State.Running}} {{.State.Restarting}} {{.HostConfig.RestartPolicy.Name}}", name],
-            capture_output=True,
-            text=True,
-        )
-        if inspect.returncode != 0:
-            console.print(f"[red]Container '{name}' not found[/red]")
-            return
-
-        parts = inspect.stdout.strip().split()
-        is_running = parts[0] == "true" if parts else False
-        is_restarting = parts[1] == "true" if len(parts) > 1 else False
-        restart_policy = parts[2] if len(parts) > 2 else "no"
-
-        if not is_running and not is_restarting:
-            console.print(f"[yellow]Container '{name}' is not running[/yellow]")
-            return
-
-        # Disable Docker restart policy if one is set, so it won't come back
-        if restart_policy not in ("no", ""):
-            console.print(f"[dim]Disabling Docker restart policy ({restart_policy})...[/dim]")
-            subprocess.run(
-                ["docker", "update", "--restart=no", name],
-                capture_output=True,
-                check=True,
-            )
-
-        console.print(f"[cyan]Stopping driver container '{name}'...[/cyan]")
-        result = subprocess.run(
-            ["docker", "stop", name],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            console.print(f"[red]Failed to stop container: {result.stderr.strip()}[/red]")
-            return
-
-        console.print(f"[green]✓ Stopped '{name}'[/green]")
-        console.print(
-            "[dim]Note: if this driver is managed by a systemd service it may restart.\n"
-            "      Check with: systemctl list-units 'cyberwave-*.service'[/dim]"
-        )
-
-    except FileNotFoundError:
-        console.print("[red]Error: docker not found — is Docker installed and running?[/red]")
-    except subprocess.CalledProcessError as e:
-        console.print(f"[red]Error: {e}[/red]")
-    except Exception as e:
-        console.print(f"[red]Error stopping driver: {e}[/red]")
+containers.register(edge)
 
 
 @edge.command("install-deps")
@@ -1254,8 +1024,8 @@ def show_logs(follow, lines):
             pass
         return
 
-    from ..config import clean_subprocess_env
-    from ..core import SYSTEMD_UNIT_NAME
+    from ...config import clean_subprocess_env
+    from ...core import SYSTEMD_UNIT_NAME
 
     service_name = SYSTEMD_UNIT_NAME.removesuffix(".service")
     cmd = [
@@ -1300,7 +1070,7 @@ def sync_workflows(twin_uuid):
     This command sends an MQTT message to the edge node to re-sync
     model bindings from active workflows in the backend.
     """
-    from ..utils import get_sdk_client, print_error
+    from ...utils import get_sdk_client, print_error
 
     client = get_sdk_client()
     if not client:
@@ -1312,7 +1082,7 @@ def sync_workflows(twin_uuid):
     try:
         # Publish command via MQTT
         client.mqtt.publish_command_message(twin_uuid, {"command": "sync_workflows"})
-        from ..utils import print_success
+        from ...utils import print_success
 
         print_success("Command sent. Check edge logs for results.")
         console.print(
@@ -1334,7 +1104,7 @@ def list_models(twin_uuid):
     import json
     import time
 
-    from ..utils import get_sdk_client, print_error
+    from ...utils import get_sdk_client, print_error
 
     client = get_sdk_client()
     if not client:
@@ -1366,7 +1136,7 @@ def list_models(twin_uuid):
             bindings = response_received["data"].get("model_bindings", [])
 
             if not bindings:
-                from ..utils import print_warning
+                from ...utils import print_warning
 
                 print_warning("No model bindings loaded on edge")
                 console.print(
@@ -1394,7 +1164,7 @@ def list_models(twin_uuid):
 
             console.print(table)
         else:
-            from ..utils import print_warning
+            from ...utils import print_warning
 
             print_warning("No response from edge node (is it running?)")
 
@@ -1433,674 +1203,9 @@ def whoami():
 
 
 # =============================================================================
-# Config Sync Commands
+# Config Sync Commands (pull.py / health.py)
 # =============================================================================
+from . import pull, health  # noqa: E402
 
-
-@edge.command("pull")
-@click.option("--twin-uuid", "-t", help="Twin UUID to pull config from (legacy)")
-@click.option("--environment-uuid", "-e", help="Environment UUID to pull all twins from (legacy)")
-@click.option("--target-dir", "-d", default=".", help="Directory to write .env file")
-@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
-def pull_config(twin_uuid: str | None, environment_uuid: str | None, target_dir: str, yes: bool):
-    """
-    Pull edge configuration from backend.
-
-    Uses the discovery API to fetch all twins bound to this edge device
-    along with their camera configurations.
-
-    \b
-    Examples:
-        # Pull all configs for this edge device
-        cyberwave edge pull
-
-        # Pull config for a specific twin (legacy)
-        cyberwave edge pull --twin-uuid abc-123
-
-        # Specify output directory
-        cyberwave edge pull -d ./my-edge
-    """
-    from cyberwave.fingerprint import generate_fingerprint
-    from ..utils import get_sdk_client, print_error
-
-    client = get_sdk_client()
-    if not client:
-        print_error("Not authenticated.", "Run 'cyberwave login' first.")
-        return
-
-    fingerprint = generate_fingerprint()
-    console.print(f"\nFingerprint: {fingerprint}\n")
-
-    try:
-        # Try new discovery API first
-        if not twin_uuid and not environment_uuid:
-            success = _pull_via_discovery_api(fingerprint, target_dir, yes)
-            if success:
-                return
-            # Fall through to legacy if discovery API fails
-            console.print("[dim]Discovery API not available, use --twin-uuid for legacy mode[/dim]")
-            return
-
-        # Legacy mode
-        if environment_uuid:
-            _pull_environment_configs(client, environment_uuid, fingerprint, target_dir, yes)
-        else:
-            _pull_single_twin_config(client, twin_uuid, fingerprint, target_dir, yes)
-    except Exception as e:
-        print_error(str(e))
-
-
-def _pull_via_discovery_api(fingerprint: str, target_dir: str, yes: bool) -> bool:
-    """
-    DEPRECATED: The core now handles discovery
-    Pull config via the new discovery API.
-
-    Returns True on success, False to fall back to legacy.
-    """
-    import platform
-    import httpx
-
-    from ..config import get_api_url
-    from ..credentials import load_credentials
-    from cyberwave.fingerprint import get_device_info
-    from ..utils import print_error, print_success, print_warning, write_edge_env
-
-    creds = load_credentials()
-    if not creds or not creds.token:
-        print_error("Not authenticated.", "Run 'cyberwave login' first.")
-        return False
-
-    base_url = get_api_url()
-    headers = {"Authorization": f"Bearer {creds.token}"}
-    device_info = get_device_info()
-
-    try:
-        # Call discovery API
-        discover_url = f"{base_url}/api/v1/edges/discover"
-        discover_payload = {
-            "fingerprint": fingerprint,
-            "hostname": device_info.get("hostname", ""),
-            "platform": f"{platform.system()}-{platform.machine()}",
-            "name": device_info.get("hostname", fingerprint[:20]),
-        }
-
-        with httpx.Client() as http_client:
-            response = http_client.post(
-                discover_url,
-                json=discover_payload,
-                headers=headers,
-                timeout=30.0,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-        edge_uuid = data.get("edge_uuid")
-        twins = data.get("twins", [])
-
-        console.print(f"[cyan]Edge UUID:[/cyan] {edge_uuid}")
-        console.print(f"[cyan]Bound twins:[/cyan] {len(twins)}\n")
-
-        if not twins:
-            print_warning("No twins bound to this edge device.")
-            console.print(
-                "[dim]Use 'cyberwave twin pair <twin_uuid>' to bind twins to this edge.[/dim]"
-            )
-            return True
-
-        # Display twins and collect configs
-        all_configs = []
-        primary_twin = None
-
-        for twin_info in twins:
-            twin_uuid = twin_info.get("twin_uuid")
-            twin_name = twin_info.get("twin_name", "Unknown")
-            edge_config = twin_info.get("camera_config", {})  # Backend still uses camera_config key
-
-            if not primary_twin:
-                primary_twin = twin_uuid
-
-            has_config = bool(edge_config)
-            status = "[green]✓[/green]" if has_config else "[yellow]○[/yellow]"
-
-            console.print(f"{status} {twin_name} ({twin_uuid[:8]}...)")
-
-            if edge_config:
-                config_entry = {
-                    "twin_uuid": twin_uuid,
-                    **edge_config,
-                }
-                all_configs.append(config_entry)
-
-        if not all_configs:
-            print_warning("No edge configurations found.")
-            console.print(
-                "[dim]Use 'cyberwave twin pair <twin_uuid>' with config options to set up twins.[/dim]"
-            )
-            return True
-
-        # Write .env file
-        write_edge_env(
-            target_dir=target_dir,
-            twin_uuid=primary_twin,
-            fingerprint=fingerprint,
-            edge_configs=all_configs,
-            generator="cyberwave edge pull",
-        )
-
-        print_success(f"Config pulled to {target_dir}/.env")
-        console.print(f"[dim]{len(all_configs)} config(s) from {len(twins)} twin(s)[/dim]")
-
-        console.print("\n[dim]Run: cyberwave edge start[/dim]")
-
-        return True
-
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            # API not available, fall back to legacy
-            return False
-        print_error(f"Discovery API error: {e}")
-        return False
-    except Exception as e:
-        console.print(f"[dim]Discovery API failed: {e}[/dim]")
-        return False
-
-
-def _pull_single_twin_config(
-    client: Any, twin_uuid: str, fingerprint: str, target_dir: str, yes: bool
-):
-    """
-    DEPRECATED: The core now handles this sync
-    Pull config from a single twin (legacy).
-    """
-    twin = client.twins.get(twin_uuid)
-    twin_name = getattr(twin, "name", "Unknown")
-    metadata = getattr(twin, "metadata", {}) or {}
-    edge_configs = metadata.get("edge_configs", {})
-
-    console.print(f"[cyan]Twin:[/cyan] {twin_name}")
-
-    my_config = _binding_for_fingerprint(edge_configs, fingerprint)
-
-    if my_config:
-        from ..utils import print_success
-
-        print_success("Found config for this device")
-        console.print(f"[dim]  Registered: {my_config.get('registered_at', 'unknown')}[/dim]")
-
-        cameras = my_config.get("cameras", [])
-        if cameras:
-            console.print(f"[dim]  Cameras: {len(cameras)} configured[/dim]")
-    else:
-        # No config for this fingerprint - check for other configs or default
-        available_bindings = _iter_edge_bindings(edge_configs)
-        if available_bindings:
-            from ..utils import print_warning
-
-            print_warning("No config for this device fingerprint")
-            console.print(f"\n[dim]Available configs from other devices:[/dim]")
-
-            for i, (fp, cfg) in enumerate(available_bindings, 1):
-                device_info = cfg.get("device_info", {})
-                hostname = device_info.get("hostname", "unknown")
-                registered = (
-                    cfg.get("registered_at", "unknown")[:10]
-                    if cfg.get("registered_at")
-                    else "unknown"
-                )
-                console.print(f"  {i}. {fp[:30]}... ({hostname}, {registered})")
-
-            if not yes:
-                choice = Prompt.ask(
-                    "\n[bold]Copy config from which device? (number or 'n' to skip)[/bold]",
-                    default="1",
-                )
-
-                if choice.lower() != "n":
-                    try:
-                        idx = int(choice) - 1
-                        source_fp, source_cfg = available_bindings[idx]
-                        my_config = source_cfg.copy()
-                        from ..utils import print_success
-
-                        print_success(f"Copying config from {source_fp[:20]}...")
-                    except (ValueError, IndexError):
-                        from ..utils import print_warning
-
-                        print_warning("Invalid choice, skipping")
-                        return
-        else:
-            # Check for default config
-            default_config = metadata.get("default_edge_config")
-            if default_config:
-                from ..utils import print_warning
-
-                print_warning("No config for this device, using default template")
-                my_config = default_config.copy()
-            else:
-                from ..utils import print_error
-
-                print_error(
-                    "No configuration found for this twin",
-                    "Use 'cyberwave twin create <asset> --pair' to set up this twin",
-                )
-                return
-
-    if not my_config:
-        return
-
-    # Extract edge config (remove internal fields)
-    edge_config = {
-        k: v
-        for k, v in my_config.items()
-        if k not in ("device_info", "registered_at", "last_sync", "cameras")
-    }
-
-    # For backward compat: if config has 'cameras' array, use first entry as edge_config
-    if not edge_config and my_config.get("cameras"):
-        cameras = my_config["cameras"]
-        if cameras:
-            edge_config = {k: v for k, v in cameras[0].items() if k != "camera_id"}
-
-    # Write .env file directly using shared utility
-    from ..utils import write_edge_env, print_success
-
-    write_edge_env(
-        target_dir=target_dir,
-        twin_uuid=twin_uuid,
-        fingerprint=fingerprint,
-        edge_config=edge_config,
-        generator="cyberwave edge pull",
-    )
-
-    print_success(f"Config pulled to {target_dir}/.env")
-    console.print("[dim]Run: cyberwave edge start[/dim]")
-
-
-def _pull_environment_configs(
-    client: Any, env_uuid: str, fingerprint: str, target_dir: str, yes: bool
-):
-    """
-    DEPRECATED: The core now handles this sync
-    Pull configs for all twins in an environment."""
-    # Get environment info
-    env = client.environments.get(env_uuid)
-    env_name = getattr(env, "name", "Unknown")
-
-    # Get twins in environment using SDK
-    twins = client.twins.list(environment_id=env_uuid)
-
-    if not twins:
-        from ..utils import print_warning
-
-        print_warning(f"No twins found in environment '{env_name}'")
-        return
-
-    console.print(f"[cyan]Environment:[/cyan] {env_name}")
-    console.print(f"[cyan]Found {len(twins)} twin(s):[/cyan]\n")
-
-    all_configs = []
-    twins_with_config = []
-    twins_without_config = []
-
-    for twin in twins:
-        twin_name = getattr(twin, "name", "Unknown")
-        twin_uuid = str(getattr(twin, "uuid", ""))
-        metadata = getattr(twin, "metadata", {}) or {}
-        edge_configs = metadata.get("edge_configs", {})
-
-        my_config = _binding_for_fingerprint(edge_configs, fingerprint)
-
-        if my_config:
-            twins_with_config.append((twin, my_config))
-            # Extract edge config (remove internal fields)
-            edge_config = {
-                k: v
-                for k, v in my_config.items()
-                if k not in ("device_info", "registered_at", "last_sync", "cameras")
-            }
-
-            # For backward compat: if config has 'cameras' array, use first entry
-            if not edge_config and my_config.get("cameras"):
-                cameras = my_config["cameras"]
-                if cameras:
-                    edge_config = {k: v for k, v in cameras[0].items() if k != "camera_id"}
-
-            config_entry = {
-                "twin_uuid": twin_uuid,
-                **edge_config,
-            }
-            all_configs.append(config_entry)
-            console.print(f"  [green]✓[/green] {twin_name} - configured")
-        else:
-            twins_without_config.append(twin)
-            console.print(f"  [yellow]○[/yellow] {twin_name} - no config for this device")
-
-    if not all_configs and not twins_without_config:
-        from ..utils import print_warning
-
-        print_warning("No configurations to pull")
-        return
-
-    if twins_without_config:
-        from ..utils import print_warning
-
-        print_warning(f"{len(twins_without_config)} twin(s) need configuration")
-
-    if not yes and not Confirm.ask("\nPull available configs?", default=True):
-        return
-
-    # Write .env file with all configs using shared utility
-    if all_configs:
-        from ..utils import write_edge_env, print_success
-
-        # Extract primary twin
-        primary_twin = all_configs[0].get("twin_uuid", "") if all_configs else ""
-
-        write_edge_env(
-            target_dir=target_dir,
-            twin_uuid=primary_twin,
-            fingerprint=fingerprint,
-            edge_configs=all_configs,
-            generator="cyberwave edge pull",
-        )
-
-        print_success(f"Config pulled to {target_dir}/.env")
-        console.print(
-            f"[dim]  {len(all_configs)} config(s) from {len(twins_with_config)} twin(s)[/dim]"
-        )
-        console.print("[dim]Run: cyberwave edge start[/dim]")
-    else:
-        from ..utils import print_warning
-
-        print_warning(
-            "No configs found. Use 'cyberwave twin create <asset> --pair' to set up twins."
-        )
-
-
-@edge.command("health")
-@click.option("--twin-uuid", "-t", required=True, help="Twin UUID to check health for")
-@click.option("--timeout", default=5, help="Timeout in seconds to wait for response")
-@click.option("--watch", "-w", is_flag=True, help="Continuously watch health status")
-def health(twin_uuid: str, timeout: int, watch: bool):
-    """
-    DEPRECATED: The core now handles this health check
-
-    Check edge health status via MQTT.
-
-    Queries the edge service for real-time health status including:
-    - Stream states (connected/failed/stale)
-    - Frame rates and counts
-    - WebRTC connection states
-    - Automatic recovery status
-
-    \b
-    Examples:
-        # One-time health check
-        cyberwave edge health --twin-uuid abc-123
-
-        # Watch health status continuously
-        cyberwave edge health --twin-uuid abc-123 --watch
-    """
-    import json
-    import time as time_module
-
-    from ..utils import get_sdk_client, print_error, print_warning
-
-    client = get_sdk_client()
-    if not client:
-        print_error("Not authenticated.", "Run 'cyberwave login' first.")
-        return
-
-    health_data: dict[str, Any] = {"received": False, "data": {}}
-
-    def on_health_message(data):
-        if isinstance(data, dict) and data.get("type") == "edge_health":
-            health_data["received"] = True
-            health_data["data"] = data
-
-    try:
-        # Subscribe to health topic
-        prefix = client.mqtt.topic_prefix
-        health_topic = f"{prefix}cyberwave/twin/{twin_uuid}/edge_health"
-
-        client.mqtt._client.subscribe(health_topic)
-        client.mqtt._client.on_message = lambda c, u, msg: on_health_message(
-            json.loads(msg.payload.decode()) if msg.payload else {}
-        )
-
-        if watch:
-            console.print(
-                f"[cyan]Watching health for twin {twin_uuid}... (Ctrl+C to stop)[/cyan]\n"
-            )
-            try:
-                while True:
-                    health_data["received"] = False
-
-                    # Wait for health message
-                    start = time_module.time()
-                    while not health_data["received"] and (time_module.time() - start) < timeout:
-                        time_module.sleep(0.1)
-
-                    if health_data["received"]:
-                        _display_health_status(health_data["data"])
-                    else:
-                        console.print("[yellow]No health data received (edge offline?)[/yellow]")
-
-                    time_module.sleep(max(1, timeout - 1))
-
-            except KeyboardInterrupt:
-                console.print("\n[dim]Stopped watching.[/dim]")
-        else:
-            console.print(f"[cyan]Checking health for twin {twin_uuid}...[/cyan]\n")
-
-            # Wait for health message with timeout
-            start = time_module.time()
-            while not health_data["received"] and (time_module.time() - start) < timeout:
-                time_module.sleep(0.1)
-
-            if health_data["received"]:
-                _display_health_status(health_data["data"])
-            else:
-                print_warning("No health data received within timeout.")
-                console.print(
-                    "[dim]The edge service may be offline or not publishing health status.[/dim]"
-                )
-                console.print(
-                    "[dim]Ensure the edge service is running with health publishing enabled.[/dim]"
-                )
-
-    except Exception as e:
-        print_error(str(e))
-
-
-def _display_health_status(data: dict):
-    """Display health status in a formatted table."""
-    from datetime import datetime
-
-    edge_id = data.get("edge_id", "unknown")
-    uptime = data.get("uptime_seconds", 0)
-    streams = data.get("streams", {})
-    stream_count = data.get("stream_count", 0)
-    healthy_count = data.get("healthy_streams", 0)
-    timestamp = data.get("timestamp", 0)
-
-    # Format uptime
-    hours = int(uptime // 3600)
-    minutes = int((uptime % 3600) // 60)
-    uptime_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
-
-    # Overall status
-    if stream_count == 0:
-        status = "[yellow]No streams[/yellow]"
-    elif healthy_count == stream_count:
-        status = "[green]Healthy[/green]"
-    elif healthy_count > 0:
-        status = "[yellow]Degraded[/yellow]"
-    else:
-        status = "[red]Unhealthy[/red]"
-
-    console.print(f"Edge ID:     {edge_id}")
-    console.print(f"Status:      {status}")
-    console.print(f"Uptime:      {uptime_str}")
-    console.print(f"Streams:     {healthy_count}/{stream_count} healthy")
-    console.print(f"Last update: {datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')}")
-
-    if streams:
-        console.print()
-        table = Table(title="Stream Status")
-        table.add_column("Camera", style="cyan")
-        table.add_column("State", style="green")
-        table.add_column("ICE", style="blue")
-        table.add_column("FPS", style="yellow")
-        table.add_column("Frames", style="magenta")
-        table.add_column("Restarts", style="red")
-        table.add_column("Stale", style="dim")
-
-        for camera_id, stream_info in streams.items():
-            conn_state = stream_info.get("connection_state", "unknown")
-            ice_state = stream_info.get("ice_connection_state", "unknown")
-            fps = stream_info.get("fps", 0)
-            frames = stream_info.get("frames_sent", 0)
-            restarts = stream_info.get("restart_count", 0)
-            is_stale = stream_info.get("is_stale", False)
-
-            # Color code connection state
-            if conn_state == "connected":
-                conn_display = f"[green]{conn_state}[/green]"
-            elif conn_state == "failed":
-                conn_display = f"[red]{conn_state}[/red]"
-            else:
-                conn_display = f"[yellow]{conn_state}[/yellow]"
-
-            # Color code ICE state
-            if ice_state in ("connected", "completed"):
-                ice_display = f"[green]{ice_state}[/green]"
-            elif ice_state == "failed":
-                ice_display = f"[red]{ice_state}[/red]"
-            else:
-                ice_display = f"[yellow]{ice_state}[/yellow]"
-
-            stale_display = "[red]Yes[/red]" if is_stale else "[green]No[/green]"
-
-            table.add_row(
-                camera_id,
-                conn_display,
-                ice_display,
-                f"{fps:.1f}",
-                str(frames),
-                str(restarts),
-                stale_display,
-            )
-
-        console.print(table)
-
-    console.print()
-
-
-@edge.command("remote-status")
-@click.option("--twin-uuid", "-t", required=True, help="Twin UUID to check status for")
-def remote_status(twin_uuid: str):
-    """
-    DEPRECATED: The core now handles this remote status check
-    Check edge status from twin metadata (heartbeat).
-
-    Queries the twin's metadata for the last heartbeat from this device's
-    fingerprint. Shows online/offline status, uptime, and stream info.
-
-    \b
-    Example:
-        cyberwave edge remote-status --twin-uuid abc-123
-    """
-    from cyberwave.fingerprint import generate_fingerprint
-    from ..utils import get_sdk_client, print_error
-
-    client = get_sdk_client()
-    if not client:
-        print_error("Not authenticated.", "Run 'cyberwave login' first.")
-        return
-
-    fingerprint = generate_fingerprint()
-
-    try:
-        twin = client.twins.get(twin_uuid)
-        twin_name = getattr(twin, "name", "Unknown")
-        metadata = getattr(twin, "metadata", {}) or {}
-        edge_configs = metadata.get("edge_configs", {})
-
-        my_config = _binding_for_fingerprint(edge_configs, fingerprint)
-
-        console.print(f'\n[bold]Edge Status for "{twin_name}"[/bold]')
-        console.print("━" * 40)
-        console.print(f"Fingerprint:    {fingerprint}")
-
-        if not my_config:
-            console.print(f"Status:         [yellow]Not registered[/yellow]")
-            console.print("\n[dim]This device hasn't connected to this twin yet.[/dim]")
-            console.print(
-                "[dim]Use 'cyberwave twin pair <uuid>' or 'cyberwave edge pull' first.[/dim]"
-            )
-            return
-
-        # Check last heartbeat
-        last_heartbeat = my_config.get("last_heartbeat")
-        last_status = my_config.get("last_status", {})
-
-        if last_heartbeat:
-            try:
-                hb_time = datetime.fromisoformat(last_heartbeat.replace("Z", "+00:00"))
-                now = datetime.now(timezone.utc)
-                delta = now - hb_time
-
-                if delta.total_seconds() < 60:
-                    status = "[green]Online[/green]"
-                    last_seen = f"{int(delta.total_seconds())} seconds ago"
-                elif delta.total_seconds() < 300:
-                    status = "[yellow]Stale[/yellow]"
-                    last_seen = f"{int(delta.total_seconds() / 60)} minutes ago"
-                else:
-                    status = "[red]Offline[/red]"
-                    last_seen = (
-                        f"{int(delta.total_seconds() / 3600)} hours ago"
-                        if delta.total_seconds() > 3600
-                        else f"{int(delta.total_seconds() / 60)} minutes ago"
-                    )
-
-                console.print(f"Status:         {status}")
-                console.print(f"Last heartbeat: {last_seen}")
-
-                # Show uptime if available
-                uptime = last_status.get("uptime_seconds")
-                if uptime:
-                    days = uptime // 86400
-                    hours = (uptime % 86400) // 3600
-                    if days > 0:
-                        console.print(f"Uptime:         {days} days, {hours} hours")
-                    else:
-                        console.print(f"Uptime:         {hours} hours")
-
-                # Show streams if available
-                streams = last_status.get("streams", {})
-                if streams:
-                    console.print(f"\nStreams:")
-                    for stream_id, stream_info in streams.items():
-                        stream_status = stream_info.get("status", "unknown")
-                        fps = stream_info.get("fps", "?")
-                        res = stream_info.get("resolution", "?")
-                        if stream_status == "streaming":
-                            console.print(
-                                f"  • {stream_id}: [green]{stream_status}[/green] ({fps} fps, {res})"
-                            )
-                        else:
-                            console.print(f"  • {stream_id}: [yellow]{stream_status}[/yellow]")
-
-            except Exception:
-                console.print(f"Last heartbeat: {last_heartbeat}")
-        else:
-            registered = my_config.get("registered_at", "unknown")
-            console.print(f"Status:         [yellow]Never connected[/yellow]")
-            console.print(f"Registered:     {registered}")
-
-        console.print()
-
-    except Exception as e:
-        print_error(str(e))
+pull.register(edge)
+health.register(edge)

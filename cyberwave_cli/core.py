@@ -10,7 +10,6 @@ import json
 import os
 import platform
 import plistlib
-import re
 import shlex
 import shutil
 import subprocess
@@ -18,15 +17,11 @@ import sys
 import tempfile
 import textwrap
 import time
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from cyberwave.fingerprint import generate_fingerprint
-from packaging.version import InvalidVersion, Version
-from packaging.utils import canonicalize_name, parse_sdist_filename, parse_wheel_filename
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
@@ -295,116 +290,8 @@ def _sudo_systemctl(action: str, unit: str, *, check: bool = True) -> subprocess
     return _run(cmd, check=check)
 
 
-def _select_with_arrows(title: str, options: list[str]) -> int:
-    """Interactive arrow-key selector. Falls back to numeric prompt."""
-    if not options:
-        raise ValueError("options cannot be empty")
-
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        console.print(f"\n[bold]{title}[/bold]")
-        for idx, option in enumerate(options, 1):
-            console.print(f"  {idx}. {option}")
-        while True:
-            raw = Prompt.ask("Select option number", default="1")
-            try:
-                chosen = int(raw) - 1
-                if 0 <= chosen < len(options):
-                    return chosen
-            except ValueError:
-                pass
-            console.print(f"[red]Please enter a number between 1 and {len(options)}[/red]")
-
-    try:
-        import termios
-        import tty
-    except ImportError:
-        # Non-POSIX fallback
-        console.print(f"\n[bold]{title}[/bold]")
-        for idx, option in enumerate(options, 1):
-            console.print(f"  {idx}. {option}")
-        while True:
-            raw = Prompt.ask("Select option number", default="1")
-            try:
-                chosen = int(raw) - 1
-                if 0 <= chosen < len(options):
-                    return chosen
-            except ValueError:
-                pass
-            console.print(f"[red]Please enter a number between 1 and {len(options)}[/red]")
-
-    selected = 0
-    scroll_offset = 0
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-
-    try:
-        term_height = shutil.get_terminal_size().lines
-    except Exception:
-        term_height = 24
-    # Reserve lines for: title(1) + instructions(1) + blank(1) + scroll indicators(2)
-    max_visible = max(5, term_height - 5)
-
-    def _tty_write(text: str) -> None:
-        """Write text in raw TTY mode using CRLF line endings."""
-        sys.stdout.write(text.replace("\n", "\r\n"))
-
-    def _render() -> None:
-        nonlocal scroll_offset
-        # Keep selected item within the visible viewport
-        if selected < scroll_offset:
-            scroll_offset = selected
-        elif selected >= scroll_offset + max_visible:
-            scroll_offset = selected - max_visible + 1
-
-        _tty_write("\x1b[2J\x1b[H")
-        _tty_write(f"{title}\n")
-        _tty_write("Use \u2191/\u2193 and press Enter, q/Ctrl-C to abort\n\n")
-
-        visible_end = min(scroll_offset + max_visible, len(options))
-
-        if scroll_offset > 0:
-            _tty_write(f"  \u2191 {scroll_offset} more above\n")
-
-        for idx in range(scroll_offset, visible_end):
-            prefix = "❯" if idx == selected else " "
-            _tty_write(f"{prefix} {options[idx]}\n")
-
-        remaining = len(options) - visible_end
-        if remaining > 0:
-            _tty_write(f"  \u2193 {remaining} more below\n")
-
-        sys.stdout.flush()
-
-    try:
-        tty.setraw(fd)
-        sys.stdout.write("\x1b[?25l")
-        _render()
-        while True:
-            char = sys.stdin.read(1)
-            if char in ("\r", "\n"):
-                return selected
-            if char in ("\x03", "q", "Q"):
-                raise KeyboardInterrupt
-            if char == "\x1b":
-                nxt = sys.stdin.read(1)
-                if nxt == "[":
-                    arrow = sys.stdin.read(1)
-                    if arrow == "A":
-                        selected = (selected - 1) % len(options)
-                        _render()
-                    elif arrow == "B":
-                        selected = (selected + 1) % len(options)
-                        _render()
-            elif char.lower() == "k":
-                selected = (selected - 1) % len(options)
-                _render()
-            elif char.lower() == "j":
-                selected = (selected + 1) % len(options)
-                _render()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        sys.stdout.write("\x1b[?25h")
-        sys.stdout.flush()
+# Re-exported from interactive_select for backward compat.
+from .interactive_select import _select_with_arrows, _select_multiple_with_arrows  # noqa: E402
 
 
 def _get_sdk_client(token: str, *, base_url: str | None = None):
@@ -826,145 +713,6 @@ def _select_or_create_environment(client: Any, workspace_uuid: str, *, skip_conf
         return environments[idx]
 
 
-def _select_multiple_with_arrows(title: str, options: list[str]) -> list[int]:
-    """Interactive multi-select. Toggle with Space, confirm with Enter."""
-    if not options:
-        return []
-
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        console.print(f"\n[bold]{title}[/bold]")
-        for idx, option in enumerate(options, 1):
-            console.print(f"  {idx}. {option}")
-        raw = Prompt.ask(
-            "Select one or more (comma-separated numbers, empty for none)",
-            default="",
-        ).strip()
-        if not raw:
-            return []
-        selected: list[int] = []
-        for part in raw.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                idx = int(part) - 1
-            except ValueError:
-                continue
-            if 0 <= idx < len(options) and idx not in selected:
-                selected.append(idx)
-        return selected
-
-    try:
-        import termios
-        import tty
-    except ImportError:
-        console.print(f"\n[bold]{title}[/bold]")
-        for idx, option in enumerate(options, 1):
-            console.print(f"  {idx}. {option}")
-        raw = Prompt.ask(
-            "Select one or more (comma-separated numbers, empty for none)",
-            default="",
-        ).strip()
-        if not raw:
-            return []
-        selected_fallback: list[int] = []
-        for part in raw.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                idx = int(part) - 1
-            except ValueError:
-                continue
-            if 0 <= idx < len(options) and idx not in selected_fallback:
-                selected_fallback.append(idx)
-        return selected_fallback
-
-    cursor = 0
-    scroll_offset = 0
-    selected: set[int] = set()
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-
-    try:
-        term_height = shutil.get_terminal_size().lines
-    except Exception:
-        term_height = 24
-    max_visible = max(5, term_height - 5)
-
-    def _tty_write(text: str) -> None:
-        """Write text in raw TTY mode using CRLF line endings."""
-        sys.stdout.write(text.replace("\n", "\r\n"))
-
-    def _render() -> None:
-        nonlocal scroll_offset
-        if cursor < scroll_offset:
-            scroll_offset = cursor
-        elif cursor >= scroll_offset + max_visible:
-            scroll_offset = cursor - max_visible + 1
-
-        _tty_write("\x1b[2J\x1b[H")
-        _tty_write(f"{title}\n")
-        _tty_write(
-            "Use \u2191/\u2193 to move, Space to toggle, Enter to confirm, q/Ctrl-C to abort\n\n"
-        )
-
-        visible_end = min(scroll_offset + max_visible, len(options))
-
-        if scroll_offset > 0:
-            _tty_write(f"  \u2191 {scroll_offset} more above\n")
-
-        for idx in range(scroll_offset, visible_end):
-            cursor_mark = "❯" if idx == cursor else " "
-            selected_mark = "[x]" if idx in selected else "[ ]"
-            _tty_write(f"{cursor_mark} {selected_mark} {options[idx]}\n")
-
-        remaining = len(options) - visible_end
-        if remaining > 0:
-            _tty_write(f"  \u2193 {remaining} more below\n")
-
-        sys.stdout.flush()
-
-    try:
-        tty.setraw(fd)
-        sys.stdout.write("\x1b[?25l")
-        _render()
-        while True:
-            char = sys.stdin.read(1)
-            if char in ("\x03", "q", "Q"):
-                raise KeyboardInterrupt
-            if char in ("\r", "\n"):
-                return sorted(selected)
-            if char == " ":
-                if cursor in selected:
-                    selected.remove(cursor)
-                else:
-                    selected.add(cursor)
-                _render()
-                continue
-            if char == "\x1b":
-                nxt = sys.stdin.read(1)
-                if nxt == "[":
-                    arrow = sys.stdin.read(1)
-                    if arrow == "A":
-                        cursor = (cursor - 1) % len(options)
-                        _render()
-                    elif arrow == "B":
-                        cursor = (cursor + 1) % len(options)
-                        _render()
-            elif char.lower() == "k":
-                cursor = (cursor - 1) % len(options)
-                _render()
-            elif char.lower() == "j":
-                cursor = (cursor + 1) % len(options)
-                _render()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        sys.stdout.write("\x1b[?25h")
-        _tty_write("\n")
-        sys.stdout.flush()
-
-
 def _select_connected_twins(client: Any, environment_uuid: str, *, skip_confirm: bool) -> list[str]:
     """List twins in environment and ask user which ones are connected."""
     twins = client.twins.list(environment_id=environment_uuid)
@@ -1384,107 +1132,18 @@ def _apt_get_install(
     return False
 
 
-def _normalize_service_channel(channel: str | None) -> str:
-    """Return a normalized service release channel."""
-    normalized_channel = (channel or "stable").strip().lower()
-    if normalized_channel not in {"stable", "dev", "staging"}:
-        raise ValueError(f"Unsupported channel: {normalized_channel}")
-    return normalized_channel
-
-
-def _pip_version_matches_channel(version: Version, channel: str) -> bool:
-    """Return whether ``version`` belongs to the selected release channel."""
-    normalized_channel = _normalize_service_channel(channel)
-    if normalized_channel == "stable":
-        return not version.is_prerelease and not version.is_devrelease
-    if normalized_channel == "dev":
-        return version.is_devrelease and version.pre is None
-    return version.pre is not None and version.pre[0] == "rc" and not version.is_devrelease
-
-
-def _validate_pip_channel_version(package_name: str, version_text: str, channel: str) -> Version:
-    """Parse and validate an explicit pip version against the selected channel."""
-    normalized_channel = _normalize_service_channel(channel)
-    try:
-        version = Version(version_text)
-    except InvalidVersion as exc:
-        raise ValueError(f"Invalid PEP 440 version '{version_text}' for {package_name}.") from exc
-
-    if not _pip_version_matches_channel(version, normalized_channel):
-        raise ValueError(
-            f"Version '{version}' does not match the selected '{normalized_channel}' channel "
-            f"for {package_name}."
-        )
-
-    return version
-
-
-def _buildkite_python_registry_index_url(registry_slug: str) -> str:
-    """Return the Buildkite Python simple index URL for ``registry_slug``."""
-    return f"https://packages.buildkite.com/cyberwave/{registry_slug}/pypi/simple"
-
-
-def _buildkite_python_registry_slug(package_name: str) -> str:
-    """Return the Buildkite Python registry slug for a package."""
-    return f"{package_name}-python"
-
-
-def _select_pip_version_for_channel(
-    versions: list[Version], *, package_name: str, channel: str
-) -> Version:
-    """Choose the highest available version that matches ``channel``."""
-    normalized_channel = _normalize_service_channel(channel)
-    matching_versions = [
-        version for version in versions if _pip_version_matches_channel(version, normalized_channel)
-    ]
-    if not matching_versions:
-        raise ValueError(
-            f"No versions matching the '{normalized_channel}' channel are available for "
-            f"{package_name}."
-        )
-    return max(matching_versions)
-
-
-def _extract_version_from_distribution_filename(filename: str, package_name: str) -> Version | None:
-    """Best-effort parse a PEP 440 version from a wheel or sdist filename."""
-    try:
-        if filename.endswith(".whl"):
-            parsed_name, parsed_version, _, _ = parse_wheel_filename(filename)
-        else:
-            parsed_name, parsed_version = parse_sdist_filename(filename)
-    except (InvalidVersion, ValueError):
-        return None
-
-    if canonicalize_name(parsed_name) != canonicalize_name(package_name):
-        return None
-    return parsed_version
-
-
-def _fetch_available_simple_index_versions(index_url: str, package_name: str) -> list[Version]:
-    """Fetch and parse available versions from a PEP 503-style simple index page."""
-    normalized_name = canonicalize_name(package_name)
-    project_url = f"{index_url.rstrip('/')}/{normalized_name}/"
-    try:
-        with urllib.request.urlopen(project_url) as response:
-            html = response.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Failed to query available versions for {package_name}: {exc}") from exc
-
-    hrefs = re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
-    parsed_versions: set[Version] = set()
-    for href in hrefs:
-        parsed_href = urllib.parse.urlsplit(href)
-        filename = urllib.parse.unquote(Path(parsed_href.path).name)
-        if not filename:
-            continue
-        parsed_version = _extract_version_from_distribution_filename(filename, package_name)
-        if parsed_version is not None:
-            parsed_versions.add(parsed_version)
-
-    if not parsed_versions:
-        raise RuntimeError(f"No valid PEP 440 versions were found for {package_name}.")
-
-    return sorted(parsed_versions)
+# Re-exported from pip_registry for backward compat.
+from .pip_registry import (  # noqa: E402
+    Version,
+    _buildkite_python_registry_index_url,
+    _buildkite_python_registry_slug,
+    _extract_version_from_distribution_filename,
+    _fetch_available_simple_index_versions,
+    _normalize_service_channel,
+    _pip_version_matches_channel,
+    _select_pip_version_for_channel,
+    _validate_pip_channel_version,
+)
 
 
 def _describe_pip_install_target(

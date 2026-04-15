@@ -544,7 +544,7 @@ def worker_monitor(update: float, container: str | None) -> None:
         cyberwave worker monitor --update 1
         cyberwave worker monitor -c cyberwave-worker-abc12345
     """
-    from .monitor import (
+    from ..monitor import (
         RateTracker,
         WorkerSnapshot,
         ZenohStatsReader,

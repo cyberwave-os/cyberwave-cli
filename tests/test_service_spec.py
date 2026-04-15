@@ -2,6 +2,7 @@
 import plistlib
 from pathlib import Path
 
+import cyberwave_cli.pip_registry as pip_registry
 from tests._core_module_loader import load_core_module
 
 
@@ -491,7 +492,7 @@ def test_fetch_available_versions_from_simple_index_parses_buildkite_links(monke
 
     captured_urls: list[str] = []
     monkeypatch.setattr(
-        core.urllib.request,
+        pip_registry.urllib.request,
         "urlopen",
         lambda url: captured_urls.append(url) or FakeResponse(),
     )

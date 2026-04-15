@@ -57,9 +57,11 @@ commands_package = ModuleType("cyberwave_cli.commands")
 commands_package.__path__ = [str(commands_dir)]
 sys.modules.setdefault("cyberwave_cli.commands", commands_package)
 
+edge_pkg_dir = commands_dir / "edge"
 edge_spec = importlib.util.spec_from_file_location(
     "cyberwave_cli.commands.edge",
-    commands_dir / "edge.py",
+    edge_pkg_dir / "__init__.py",
+    submodule_search_locations=[str(edge_pkg_dir)],
 )
 assert edge_spec is not None and edge_spec.loader is not None
 edge_module = importlib.util.module_from_spec(edge_spec)
