@@ -9,12 +9,14 @@ Provides:
 
 from __future__ import annotations
 
+import atexit
 import json
 import platform
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -269,8 +271,6 @@ def get_container_uptime(container_name: str) -> str:
             timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
-            from datetime import datetime, timezone
-
             started_str = result.stdout.strip()
             # Docker timestamps: 2024-01-15T10:30:00.123456789Z
             # Truncate nanoseconds to microseconds for parsing.
@@ -300,6 +300,7 @@ def get_container_uptime(container_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 _collector_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="cw-collect")
+atexit.register(_collector_pool.shutdown, wait=False)
 
 
 def collect_host_metrics(
