@@ -395,7 +395,7 @@ def worker_logs(follow: bool, tail: int, container: str | None) -> None:
         cyberwave worker logs --tail 100
         cyberwave worker logs --no-follow
     """
-    container_name = container or _find_worker_container()
+    container_name = container or _find_worker_container(include_stopped=True)
 
     if not container_name:
         console.print("[red]✗[/red] Worker container not found.")
@@ -558,10 +558,18 @@ def worker_monitor(update: float, container: str | None) -> None:
     container_name = container or _find_worker_container()
 
     if not container_name:
-        console.print("[red]✗[/red] Worker container not found.")
-        console.print(
-            "[dim]Start the worker container with: cyberwave worker start[/dim]"
-        )
+        stopped = _find_worker_container(include_stopped=True)
+        if stopped:
+            console.print(f"[red]✗[/red] Worker container '{stopped}' exists but is not running.")
+            console.print(
+                f"[dim]Check exit reason with: cyberwave worker logs\n"
+                f"Restart with: cyberwave worker restart[/dim]"
+            )
+        else:
+            console.print("[red]✗[/red] Worker container not found.")
+            console.print(
+                "[dim]Start the worker container with: cyberwave worker start[/dim]"
+            )
         raise click.Abort()
 
     console.print(
@@ -628,6 +636,18 @@ def worker_start() -> None:
         cyberwave worker start
     """
     wm = _get_worker_manager()
+
+    workers_dir = wm._config_dir / "workers"
+    has_workers = workers_dir.exists() and any(workers_dir.glob("*.py"))
+    if not has_workers:
+        console.print("[yellow]⚠[/yellow] No worker files found.")
+        console.print(
+            f"[dim]Workers directory: {workers_dir}\n"
+            "Sync workers from the cloud with: cyberwave workflow sync\n"
+            "Or place .py worker files in the directory above.[/dim]"
+        )
+        return
+
     ok = wm.start()
     if ok:
         console.print(
