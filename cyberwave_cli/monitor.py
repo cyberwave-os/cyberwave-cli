@@ -681,6 +681,23 @@ class _RunningAverage:
         return self._sum / self._count
 
 
+class _ExponentialMovingAverage:
+    """Exponential moving average for smoothing noisy sensor readings."""
+
+    __slots__ = ("_alpha", "_value")
+
+    def __init__(self, alpha: float = 0.3) -> None:
+        self._alpha = alpha
+        self._value: float | None = None
+
+    def add(self, value: float) -> float:
+        if self._value is None:
+            self._value = value
+        else:
+            self._value = self._alpha * value + (1.0 - self._alpha) * self._value
+        return self._value
+
+
 class MacMonReader:
     """Read temperature and power from ``macmon pipe`` on Apple Silicon.
 
@@ -768,6 +785,8 @@ class LinuxThermalReader:
     All data comes from the kernel's sysfs interface -- no external tools.
     """
 
+    _CPU_ZONE_TYPES = {"x86_pkg_temp", "coretemp", "cpu-thermal", "cpu_thermal", "soc_thermal"}
+
     def __init__(self) -> None:
         self._thermal_zones: list[str] = []
         self._rapl_path: str | None = None
@@ -776,18 +795,31 @@ class LinuxThermalReader:
         self._prev_energy_uj: int | None = None
         self._prev_energy_ts: float = 0.0
         self._avg = _RunningAverage()
+        self._temp_ema = _ExponentialMovingAverage(alpha=0.3)
         self._available = False
 
     def start(self) -> bool:
         from pathlib import Path
 
-        # -- Discover thermal zones --
+        # -- Discover thermal zones (prefer CPU-specific ones) --
         thermal_base = Path("/sys/class/thermal")
+        cpu_zones: list[str] = []
+        all_zones: list[str] = []
         if thermal_base.exists():
             for zone in sorted(thermal_base.glob("thermal_zone*")):
                 temp_file = zone / "temp"
-                if temp_file.exists():
-                    self._thermal_zones.append(str(temp_file))
+                if not temp_file.exists():
+                    continue
+                all_zones.append(str(temp_file))
+                type_file = zone / "type"
+                if type_file.exists():
+                    try:
+                        zone_type = type_file.read_text().strip().lower()
+                    except OSError:
+                        continue
+                    if zone_type in self._CPU_ZONE_TYPES or "cpu" in zone_type:
+                        cpu_zones.append(str(temp_file))
+        self._thermal_zones = cpu_zones if cpu_zones else all_zones
 
         # -- Discover power source (priority order) --
         # 1. RAPL (x86)
@@ -852,7 +884,7 @@ class LinuxThermalReader:
         )
 
     def _read_thermal_zones(self) -> float:
-        """Return the highest thermal zone reading in Celsius."""
+        """Return the smoothed highest CPU thermal zone reading in Celsius."""
         max_temp = 0.0
         for path in self._thermal_zones:
             try:
@@ -863,6 +895,8 @@ class LinuxThermalReader:
                     max_temp = temp_c
             except (OSError, ValueError):
                 continue
+        if max_temp > 0:
+            return self._temp_ema.add(max_temp)
         return max_temp
 
     def _read_power(self) -> float:
