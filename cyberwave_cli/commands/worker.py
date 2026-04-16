@@ -34,7 +34,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
-from ..config import CONFIG_DIR
+from ..config import CONFIG_DIR, ensure_edge_core_importable
 from ..utils import colorize_log_line
 
 logger = logging.getLogger(__name__)
@@ -116,6 +116,7 @@ def _get_worker_manager():  # type: ignore[no-untyped-def]
     error and exits when the package is missing.
     """
     try:
+        ensure_edge_core_importable()
         from cyberwave_edge_core.startup import (
             _list_linked_twin_uuids_for_fingerprint,
             get_or_create_fingerprint,
@@ -711,6 +712,7 @@ def worker_health() -> None:
         cyberwave worker health
     """
     try:
+        ensure_edge_core_importable()
         from cyberwave_edge_core.worker_health import WorkerHealthMonitor
     except ImportError:
         console.print(

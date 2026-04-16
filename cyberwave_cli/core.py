@@ -31,6 +31,7 @@ from .config import (
     LEGACY_SYSTEM_CONFIG_DIR,
     chown_to_sudo_user,
     clean_subprocess_env,
+    ensure_edge_core_importable,
     get_api_url,
 )
 from .credentials import (
@@ -1887,6 +1888,7 @@ def _resolve_worker_image() -> str:
     during initial ``cyberwave edge install``).
     """
     try:
+        ensure_edge_core_importable()
         from cyberwave_edge_core.worker_manager import resolve_worker_image
 
         return resolve_worker_image()

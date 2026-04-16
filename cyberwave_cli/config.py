@@ -102,6 +102,23 @@ def get_api_url() -> str:
     return os.getenv("CYBERWAVE_BASE_URL", DEFAULT_BASE_URL)
 
 
+_EDGE_CORE_DEB_PYTHON_PATH = "/usr/lib/cyberwave-edge-core/python"
+
+
+def ensure_edge_core_importable() -> None:
+    """Make ``cyberwave_edge_core`` importable when installed via deb.
+
+    The deb package ships the Python source tree under
+    ``/usr/lib/cyberwave-edge-core/python/cyberwave_edge_core/``.
+    This path is not on ``sys.path`` by default, so we add it once.
+    """
+    if _EDGE_CORE_DEB_PYTHON_PATH not in sys.path:
+        if os.path.isdir(
+            os.path.join(_EDGE_CORE_DEB_PYTHON_PATH, "cyberwave_edge_core")
+        ):
+            sys.path.insert(0, _EDGE_CORE_DEB_PYTHON_PATH)
+
+
 def clean_subprocess_env() -> dict[str, str]:
     """Return a copy of os.environ safe for child processes.
 

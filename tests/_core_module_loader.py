@@ -74,6 +74,7 @@ def load_core_module(monkeypatch):
     cli_config_module.get_api_url = lambda: "https://api.example.test"
     cli_config_module._resolve_sudo_user_home = lambda: None
     cli_config_module.chown_to_sudo_user = lambda *_paths: None
+    cli_config_module.ensure_edge_core_importable = lambda: None
 
     credentials_module = ModuleType("cyberwave_cli.credentials")
     credentials_module.Credentials = object
