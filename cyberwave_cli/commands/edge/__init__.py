@@ -891,6 +891,37 @@ def restart_edge(env_file):
         console.print("[dim]Run 'cyberwave edge install' to reinstall it.[/dim]")
 
 
+def _inspect_container_twin_uuid(container_name: str) -> str:
+    """Extract CYBERWAVE_TWIN_UUID from a driver container's env vars."""
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "--format", "{{range .Config.Env}}{{println .}}{{end}}", container_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if line.startswith("CYBERWAVE_TWIN_UUID="):
+                return line.split("=", 1)[1].strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return ""
+
+
+def _inspect_container_twin_uuids(container_name: str) -> list[str]:
+    """Extract CYBERWAVE_TWIN_UUIDS from a worker container's env vars."""
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "--format", "{{range .Config.Env}}{{println .}}{{end}}", container_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if line.startswith("CYBERWAVE_TWIN_UUIDS="):
+                csv = line.split("=", 1)[1].strip()
+                return [t.strip() for t in csv.split(",") if t.strip()]
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return []
+
+
 @edge.command("status")
 def status_edge():
     """Check edge node status."""
@@ -937,9 +968,8 @@ def status_edge():
     try:
         result = subprocess.run(
             [
-                "docker", "ps",
+                "docker", "ps", "-a",
                 "--filter", "name=cyberwave-driver",
-                "--filter", "status=running",
                 "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}",
             ],
             capture_output=True,
@@ -947,19 +977,65 @@ def status_edge():
         )
         lines = [ln for ln in result.stdout.strip().splitlines() if ln]
         if lines:
-            console.print(f"[green]Driver containers running: {len(lines)}[/green]")
+            running_count = sum(1 for ln in lines if "Up " in ln.split("\t", 2)[-1])
+            console.print(
+                f"[green]Driver containers: {running_count}/{len(lines)} running[/green]"
+            )
             for line in lines:
                 parts = line.split("\t")
                 name = parts[0]
                 image = parts[1] if len(parts) > 1 else ""
                 status = parts[2] if len(parts) > 2 else ""
-                console.print(f"   [cyan]{name}[/cyan]  [dim]{image}[/dim]  [dim]{status}[/dim]")
+                is_running = "Up " in status
+                twin_uuid = _inspect_container_twin_uuid(name)
+                twin_label = f" twin={twin_uuid[:12]}…" if twin_uuid else ""
+                color = "cyan" if is_running else "red"
+                console.print(
+                    f"   [{color}]{name}[/{color}]{twin_label}"
+                    f"  [dim]{image}[/dim]  [dim]{status}[/dim]"
+                )
         else:
-            console.print("[yellow]No driver containers running[/yellow]")
+            console.print("[yellow]No driver containers found[/yellow]")
     except FileNotFoundError:
         console.print("[dim]docker not found — skipping driver container check.[/dim]")
     except Exception as e:
         console.print(f"[red]Error checking driver containers: {e}[/red]")
+
+    # --- worker container ---
+    try:
+        result = subprocess.run(
+            [
+                "docker", "ps", "-a",
+                "--filter", "name=cyberwave-worker",
+                "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        lines = [ln for ln in result.stdout.strip().splitlines() if ln]
+        if lines:
+            for line in lines:
+                parts = line.split("\t")
+                name = parts[0]
+                image = parts[1] if len(parts) > 1 else ""
+                status = parts[2] if len(parts) > 2 else ""
+                is_running = "Up " in status
+                twin_uuids = _inspect_container_twin_uuids(name)
+                twin_label = ""
+                if twin_uuids:
+                    twin_label = f" twins={','.join(t[:8] for t in twin_uuids)}"
+                color = "green" if is_running else "red"
+                icon = "✓" if is_running else "✗"
+                console.print(
+                    f"[{color}]{icon} Worker {name}[/{color}]{twin_label}"
+                    f"  [dim]{image}[/dim]  [dim]{status}[/dim]"
+                )
+        else:
+            console.print("[dim]No worker container found[/dim]")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        console.print(f"[red]Error checking worker container: {e}[/red]")
 
 
 @edge.command("cameras")
