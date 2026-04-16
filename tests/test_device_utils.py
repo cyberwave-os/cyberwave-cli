@@ -14,8 +14,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cyberwave_cli.device_utils import (
+    CameraDevice,
     _get_v4l2_device_info,
     _parse_v4l2_list_devices,
+    camera_likelihood_score,
+    discover_usb_cameras,
     discover_usb_cameras_v4l2,
 )
 
@@ -157,3 +160,76 @@ def test_discover_v4l2_no_pyinstaller_passes_env_unchanged(mock_run, _mock_perms
 
     env = mock_run.call_args.kwargs.get("env", {})
     assert env.get("LD_LIBRARY_PATH") == normal_ld
+
+
+# ---------------------------------------------------------------------------
+# camera_likelihood_score
+# ---------------------------------------------------------------------------
+
+def test_camera_score_usb_webcam_high():
+    cam = CameraDevice(card="HD Pro Webcam C920", bus_info="usb-0000:01:00.0-1.2",
+                       paths=["/dev/video0"], driver="uvcvideo")
+    assert camera_likelihood_score(cam) >= 70
+
+
+def test_camera_score_codec_low():
+    cam = CameraDevice(card="bcm2835-codec-decode", bus_info="platform:bcm2835-codec",
+                       paths=["/dev/video10"])
+    assert camera_likelihood_score(cam) < 40
+
+
+def test_camera_score_isp_low():
+    cam = CameraDevice(card="bcm2835-isp", bus_info="platform:bcm2835-isp",
+                       paths=["/dev/video13"])
+    assert camera_likelihood_score(cam) < 40
+
+
+def test_camera_score_rpivid_low():
+    cam = CameraDevice(card="rpivid", bus_info="platform:rpivid",
+                       paths=["/dev/video19"])
+    assert camera_likelihood_score(cam) < 40
+
+
+def test_camera_score_generic_usb():
+    """A USB device with no special keywords still scores higher than platform devices."""
+    cam = CameraDevice(card="Unknown USB Device", bus_info="usb-0000:01:00.0-1.3",
+                       paths=["/dev/video4"])
+    assert camera_likelihood_score(cam) >= 50
+
+
+# ---------------------------------------------------------------------------
+# Exclusion and sorting integration
+# ---------------------------------------------------------------------------
+
+@patch("cyberwave_cli.device_utils.shutil.which", return_value="/usr/bin/v4l2-ctl")
+@patch("cyberwave_cli.device_utils._ensure_video_device_permissions")
+@patch("cyberwave_cli.device_utils._get_v4l2_device_info", return_value={})
+@patch("cyberwave_cli.device_utils.subprocess.run")
+def test_discover_v4l2_excludes_broadcom_platform_devices(mock_run, _info, _perms, _which):
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout=(
+            "bcm2835-codec-decode (platform:bcm2835-codec):\n"
+            "\t/dev/video10\n"
+            "\n"
+            "HD Pro Webcam C920 (usb-0000:01:00.0-1.2):\n"
+            "\t/dev/video0\n"
+        ),
+        stderr="",
+    )
+    devices = discover_usb_cameras_v4l2()
+    assert len(devices) == 1
+    assert devices[0].card == "HD Pro Webcam C920"
+
+
+@patch("cyberwave_cli.device_utils.discover_usb_cameras_v4l2")
+def test_discover_sorts_real_cameras_first(mock_v4l2):
+    """Real cameras should appear before platform devices in the returned list."""
+    mock_v4l2.return_value = [
+        CameraDevice(card="SomeCodec", bus_info="platform:codec", paths=["/dev/video10"]),
+        CameraDevice(card="HD Pro Webcam C920", bus_info="usb-0000:01:00.0-1.2",
+                     paths=["/dev/video0"], driver="uvcvideo"),
+    ]
+    devices = discover_usb_cameras()
+    assert len(devices) == 2
+    assert devices[0].card == "HD Pro Webcam C920"

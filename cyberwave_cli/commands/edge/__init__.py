@@ -998,18 +998,25 @@ def list_cameras(as_json: bool, save: bool):
         else:
             console.print(f"[yellow]Camera discovery not supported on {system}.[/yellow]")
     else:
+        from ...device_utils import camera_likelihood_score
+
         console.print(f"\n[bold]Detected {len(cameras)} camera(s):[/bold]\n")
         for i, cam in enumerate(cameras):
             idx_str = cam.index if cam.index is not None else i
-            console.print(f"  [bold cyan]{idx_str}[/bold cyan])  {cam.card}")
+            score = camera_likelihood_score(cam)
+            dim = score < 40
+            style_open = "[dim]" if dim else ""
+            style_close = "[/dim]" if dim else ""
+            tag = "  (probably not a camera)" if dim else ""
+            console.print(f"  {style_open}[bold cyan]{idx_str}[/bold cyan])  {cam.card}{tag}{style_close}")
             if cam.primary_path:
-                console.print(f"       Device: {cam.primary_path}")
+                console.print(f"  {style_open}     Device: {cam.primary_path}{style_close}")
             if cam.bus_info:
-                console.print(f"       Bus:    {cam.bus_info}")
+                console.print(f"  {style_open}     Bus:    {cam.bus_info}{style_close}")
             if cam.driver:
-                console.print(f"       Driver: {cam.driver}")
+                console.print(f"  {style_open}     Driver: {cam.driver}{style_close}")
             if cam.serial:
-                console.print(f"       Serial: {cam.serial}")
+                console.print(f"  {style_open}     Serial: {cam.serial}{style_close}")
             console.print()
 
     if save and cameras:

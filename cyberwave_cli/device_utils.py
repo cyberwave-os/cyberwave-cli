@@ -19,8 +19,87 @@ from .config import clean_subprocess_env
 
 logger = logging.getLogger(__name__)
 
-# Raspberry Pi platform devices that v4l2-ctl lists but are not actual cameras
-EXCLUDED_CAMERA_CARDS = frozenset({"pispbe", "rpi-hevc-dec"})
+# Raspberry Pi / Broadcom platform devices that v4l2-ctl lists but are not
+# actual cameras.  These are video codec, ISP, and decoder engines.
+EXCLUDED_CAMERA_CARDS = frozenset({
+    "pispbe",
+    "rpi-hevc-dec",
+    "rpivid",
+    "bcm2835-codec-decode",
+    "bcm2835-codec-encode",
+    "bcm2835-codec-isp",
+    "bcm2835-isp",
+})
+
+# Substrings in card names that indicate a hardware codec/ISP rather than a
+# real capture device.  Checked case-insensitively.
+_NON_CAMERA_SUBSTRINGS = (
+    "codec",
+    "-isp",
+    "rpivid",
+    "hevc",
+    "h264",
+    "h.264",
+    "decoder",
+    "encoder",
+)
+
+# Known USB camera drivers reported by v4l2-ctl --all
+_REAL_CAMERA_DRIVERS = frozenset({"uvcvideo", "v4l2 loopback"})
+
+# Substrings (case-insensitive) in card names that strongly suggest a real camera
+_REAL_CAMERA_KEYWORDS = (
+    "webcam",
+    "camera",
+    "logitech",
+    "c920",
+    "c922",
+    "c930",
+    "c270",
+    "brio",
+    "streamcam",
+    "razer",
+    "elgato",
+    "obsbot",
+    "insta360",
+    "depstech",
+    "arducam",
+    "see3cam",
+    "e-con",
+)
+
+
+def camera_likelihood_score(cam: "CameraDevice") -> int:
+    """Score a CameraDevice by how likely it is to be an actual capture device.
+
+    Higher score = more likely a real camera.  Used to sort the camera list so
+    that the best candidate appears first (and becomes the default selection).
+    """
+    score = 50  # neutral baseline
+
+    card_lower = (cam.card or "").lower()
+    driver_lower = (cam.driver or "").lower()
+    bus_lower = (cam.bus_info or "").lower()
+
+    # Strong positive signals
+    if "usb" in bus_lower:
+        score += 30
+    if driver_lower in _REAL_CAMERA_DRIVERS:
+        score += 25
+    for kw in _REAL_CAMERA_KEYWORDS:
+        if kw in card_lower:
+            score += 20
+            break
+
+    # Strong negative signals
+    for sub in _NON_CAMERA_SUBSTRINGS:
+        if sub in card_lower:
+            score -= 40
+            break
+    if "platform" in bus_lower:
+        score -= 30
+
+    return score
 
 
 @dataclass
@@ -56,6 +135,7 @@ class CameraDevice:
             "index": self.index,
             "driver": self.driver,
             "serial": self.serial,
+            "likelihood_score": camera_likelihood_score(self),
         }
 
 
@@ -200,7 +280,7 @@ def discover_usb_cameras_v4l2() -> list[CameraDevice]:
         # before failing on an inaccessible one (e.g. unplugged /dev/video0)
         devices = _parse_v4l2_list_devices(result.stdout or "")
 
-        # Exclude Raspberry Pi platform devices (pispbe, rpi-hevc-dec) - not actual cameras
+        # Exclude known non-camera platform devices (codecs, ISPs, decoders)
         devices = [
             d
             for d in devices
@@ -261,15 +341,18 @@ def discover_usb_cameras() -> list[CameraDevice]:
 
     system = platform.system()
     if system == "Linux":
-        return discover_usb_cameras_v4l2()
+        cameras = discover_usb_cameras_v4l2()
     elif system == "Darwin":
-        return _discover_cameras_avfoundation()
+        cameras = _discover_cameras_avfoundation()
     elif system == "Windows":
         logger.warning("Windows camera discovery not yet implemented")
         return []
     else:
         logger.warning("Unsupported platform for camera discovery: %s", system)
         return []
+
+    cameras.sort(key=camera_likelihood_score, reverse=True)
+    return cameras
 
 
 def list_serial_ports() -> list[str]:

@@ -1669,7 +1669,7 @@ def _detect_and_select_cameras() -> None:
 
     Best-effort: failures are logged but never block installation.
     """
-    from .device_utils import CameraDevice, discover_usb_cameras, write_cameras_json
+    from .device_utils import CameraDevice, camera_likelihood_score, discover_usb_cameras, write_cameras_json
 
     cameras = discover_usb_cameras()
     if not cameras:
@@ -1687,7 +1687,12 @@ def _detect_and_select_cameras() -> None:
         for i, cam in enumerate(cameras):
             idx = cam.index if cam.index is not None else i
             valid_indices[idx] = cam
-            console.print(f"  [bold cyan]{idx}[/bold cyan])  {cam.card}  [dim]{cam.primary_path}[/dim]")
+            score = camera_likelihood_score(cam)
+            if score >= 40:
+                label = f"  [bold cyan]{idx}[/bold cyan])  {cam.card}  [dim]{cam.primary_path}[/dim]"
+            else:
+                label = f"  [dim]{idx})  {cam.card}  {cam.primary_path}  (probably not a camera)[/dim]"
+            console.print(label)
 
         default_idx = cameras[0].index if cameras[0].index is not None else 0
         console.print()
