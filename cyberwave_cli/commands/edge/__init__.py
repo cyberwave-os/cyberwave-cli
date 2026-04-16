@@ -1262,7 +1262,8 @@ def whoami():
 # =============================================================================
 # Config Sync Commands (pull.py / health.py)
 # =============================================================================
-from . import pull, health  # noqa: E402
+from . import bench, pull, health  # noqa: E402
 
+bench.register(edge)
 pull.register(edge)
 health.register(edge)
