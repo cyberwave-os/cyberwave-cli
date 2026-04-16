@@ -21,7 +21,6 @@ Example usage:
 """
 
 import datetime
-import logging
 import re
 import shutil
 import subprocess
@@ -34,10 +33,8 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
-from ..config import CONFIG_DIR, ensure_edge_core_importable
+from ..config import CONFIG_DIR
 from ..utils import colorize_log_line
-
-logger = logging.getLogger(__name__)
 
 console = Console()
 
@@ -109,60 +106,51 @@ def _find_worker_container(*, include_stopped: bool = False) -> str | None:
     return None
 
 
-def _get_worker_manager():  # type: ignore[no-untyped-def]
-    """Build a WorkerManager from the current edge configuration.
+_EDGE_CORE_BINARY = "cyberwave-edge-core"
 
-    Requires ``cyberwave-edge-core`` to be installed.  Prints a helpful
-    error and exits when the package is missing.
+
+def _find_edge_core_binary() -> str | None:
+    """Locate the cyberwave-edge-core binary on this system.
+
+    Search order:
+      1. The same bin directory as the running Python interpreter (covers
+         pipx venvs, isolated venvs, and pip --user installs on macOS).
+      2. System PATH via ``shutil.which``.
+      3. Well-known system paths (apt-installed on Linux).
     """
-    try:
-        ensure_edge_core_importable()
-        from cyberwave_edge_core.startup import (
-            _list_linked_twin_uuids_for_fingerprint,
-            get_or_create_fingerprint,
-            load_environment_uuid,
-            load_token,
-        )
-        from cyberwave_edge_core.startup import CONFIG_DIR as EDGE_CONFIG_DIR
-        from cyberwave_edge_core.worker_manager import WorkerManager, resolve_worker_image
-    except ImportError:
+    venv_candidate = Path(sys.executable).parent / _EDGE_CORE_BINARY
+    if venv_candidate.is_file():
+        return str(venv_candidate)
+
+    found = shutil.which(_EDGE_CORE_BINARY)
+    if found:
+        return found
+
+    for candidate in ("/usr/bin/cyberwave-edge-core", "/usr/local/bin/cyberwave-edge-core"):
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def _delegate_to_edge_core(*args: str) -> None:
+    """Run a cyberwave-edge-core subcommand, forwarding output and exit code."""
+    binary = _find_edge_core_binary()
+    if not binary:
         console.print(
             "[red]✗[/red] cyberwave-edge-core is required for this command.\n"
             "  Install it with: [bold]cyberwave edge install[/bold]"
         )
         sys.exit(1)
 
-    token = load_token()
-    if not token:
-        console.print("[red]✗[/red] No credentials found. Run [bold]cyberwave login[/bold] first.")
+    try:
+        result = subprocess.run([binary, *args])
+        if result.returncode != 0:
+            sys.exit(result.returncode)
+    except OSError as exc:
+        console.print(f"[red]✗[/red] Failed to run cyberwave-edge-core: {exc}")
         sys.exit(1)
-
-    environment_uuid = load_environment_uuid()
-    if not environment_uuid:
-        console.print(
-            "[red]✗[/red] No linked environment found. "
-            "Run [bold]cyberwave link[/bold] to associate this edge with an environment."
-        )
-        sys.exit(1)
-
-    twin_uuids: list[str] = []
-    if environment_uuid:
-        try:
-            fingerprint = get_or_create_fingerprint()
-            if fingerprint:
-                twin_uuids = _list_linked_twin_uuids_for_fingerprint(
-                    token, environment_uuid, fingerprint
-                )
-        except Exception:
-            logger.debug("Failed to resolve twin UUIDs for environment", exc_info=True)
-
-    return WorkerManager(
-        config_dir=EDGE_CONFIG_DIR,
-        environment_uuid=environment_uuid,
-        token=token,
-        twin_uuids=twin_uuids,
-        image=resolve_worker_image(),
-    )
+    except KeyboardInterrupt:
+        pass
 
 
 @click.group()
@@ -642,10 +630,8 @@ def worker_start() -> None:
     Examples:
         cyberwave worker start
     """
-    wm = _get_worker_manager()
-
-    workers_dir = wm._config_dir / "workers"
-    has_workers = workers_dir.exists() and any(workers_dir.glob("*.py"))
+    workers_dir = _get_workers_dir()
+    has_workers = any(workers_dir.glob("*.py"))
     if not has_workers:
         console.print("[yellow]⚠[/yellow] No worker files found.")
         console.print(
@@ -655,14 +641,7 @@ def worker_start() -> None:
         )
         return
 
-    ok = wm.start()
-    if ok:
-        console.print(f"[green]✓[/green] Worker container [bold]{wm.container_name}[/bold] started")
-    else:
-        console.print(
-            f"[red]✗[/red] Failed to start worker container [bold]{wm.container_name}[/bold]"
-        )
-        sys.exit(1)
+    _delegate_to_edge_core("worker", "start")
 
 
 @worker.command("stop")
@@ -673,13 +652,7 @@ def worker_stop() -> None:
     Examples:
         cyberwave worker stop
     """
-    wm = _get_worker_manager()
-    ok = wm.stop()
-    if ok:
-        console.print(f"[green]✓[/green] Worker container [bold]{wm.container_name}[/bold] stopped")
-    else:
-        console.print("[red]✗[/red] Failed to stop worker container")
-        sys.exit(1)
+    _delegate_to_edge_core("worker", "stop")
 
 
 @worker.command("restart")
@@ -692,15 +665,7 @@ def worker_restart() -> None:
     Examples:
         cyberwave worker restart
     """
-    wm = _get_worker_manager()
-    ok = wm.restart()
-    if ok:
-        console.print(
-            f"[green]✓[/green] Worker container [bold]{wm.container_name}[/bold] restarted"
-        )
-    else:
-        console.print("[red]✗[/red] Failed to restart worker container")
-        sys.exit(1)
+    _delegate_to_edge_core("worker", "restart")
 
 
 @worker.command("health")
@@ -711,68 +676,4 @@ def worker_health() -> None:
     Examples:
         cyberwave worker health
     """
-    try:
-        ensure_edge_core_importable()
-        from cyberwave_edge_core.worker_health import WorkerHealthMonitor
-    except ImportError:
-        console.print(
-            "[red]✗[/red] cyberwave-edge-core is required for this command.\n"
-            "  Install it with: [bold]cyberwave edge install[/bold]"
-        )
-        sys.exit(1)
-
-    wm = _get_worker_manager()
-    health_monitor = WorkerHealthMonitor(container_name=wm.container_name)
-    wm.set_health_monitor(health_monitor)
-    ws = wm.status()
-    hs = ws.health_state
-
-    console.print(f"\n[bold]Worker Health — {wm.container_name}[/bold]\n")
-
-    status_color = (
-        "green"
-        if ws.status == "running"
-        else ("yellow" if ws.status in {"restarting", "created"} else "red")
-    )
-    console.print(f"  Container status: [{status_color}]{ws.status}[/{status_color}]")
-
-    if hs is not None:
-        healthy_label = "[green]healthy[/green]" if hs.is_healthy else "[red]unhealthy[/red]"
-        ready_label = "[green]ready[/green]" if hs.is_ready else "[yellow]not ready[/yellow]"
-        console.print(f"  Health:           {healthy_label}")
-        console.print(f"  Readiness:        {ready_label}")
-
-        if hs.uptime_seconds is not None:
-            console.print(f"  Uptime:           {hs.uptime_seconds:.0f}s")
-
-        console.print("\n  [bold]Restart accounting:[/bold]")
-        console.print(f"    Total:    {hs.restart_count}")
-        console.print(f"    Recent:   {hs.recent_restarts} (5-min window)")
-
-        if hs.circuit_breaker_tripped:
-            import datetime
-
-            tripped_ts = (
-                datetime.datetime.fromtimestamp(hs.circuit_breaker_tripped_at).isoformat()
-                if hs.circuit_breaker_tripped_at
-                else "unknown"
-            )
-            console.print(f"\n  [bold red]Circuit-breaker: TRIPPED[/bold red] at {tripped_ts}")
-            console.print("  Automatic restarts are suppressed until the 5-minute window clears.")
-        else:
-            console.print("\n  Circuit-breaker: [green]closed[/green]")
-
-        if hs.restart_records:
-            console.print(f"\n  [bold]Restart history ({len(hs.restart_records)} events):[/bold]")
-            import datetime
-
-            for rec in hs.restart_records[-10:]:
-                ts = datetime.datetime.fromtimestamp(rec.timestamp).strftime("%H:%M:%S")
-                ok_label = "[green]ok[/green]" if rec.success else "[red]failed[/red]"
-                console.print(f"    {ts}  {rec.reason:<30} {ok_label}")
-        else:
-            console.print("\n  [dim]No restarts recorded in this session[/dim]")
-    else:
-        console.print("\n  [dim]Health monitor not available[/dim]")
-
-    console.print()
+    _delegate_to_edge_core("worker", "health")
