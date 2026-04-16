@@ -23,6 +23,7 @@ classifiers = [
 
 dependencies = [
     "click>=8.1.0",
+    "eclipse-zenoh>=1.0.0",
     "httpx>=0.25.0",
     "packaging>=26.0",
     "rich>=13.0.0",
@@ -30,9 +31,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-monitor = [
-    "eclipse-zenoh>=1.0.0",
-]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",

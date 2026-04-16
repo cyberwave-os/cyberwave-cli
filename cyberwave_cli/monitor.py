@@ -16,7 +16,6 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -256,41 +255,30 @@ def get_gpu_stats(container_name: str) -> GpuStats:
 
 
 def get_container_uptime(container_name: str) -> str:
-    """Return a human-readable uptime string for the container."""
+    """Return a human-readable uptime string for the container.
+
+    Uses ``docker ps --format '{{.Status}}'`` so the uptime comes from the
+    Docker daemon's own monotonic clock rather than comparing timestamps
+    against the host clock (which can drift on devices without an RTC,
+    such as Raspberry Pi).
+    """
     try:
         result = subprocess.run(
             [
                 "docker",
-                "inspect",
+                "ps",
+                "--filter",
+                f"name={container_name}",
                 "--format",
-                "{{.State.StartedAt}}",
-                container_name,
+                "{{.Status}}",
             ],
             capture_output=True,
             text=True,
             timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
-            started_str = result.stdout.strip()
-            # Docker timestamps: 2024-01-15T10:30:00.123456789Z
-            # Truncate nanoseconds to microseconds for parsing.
-            if "." in started_str:
-                base, frac = started_str.split(".", 1)
-                frac = frac.rstrip("Z")[:6]
-                started_str = f"{base}.{frac}+00:00"
-            started = datetime.fromisoformat(started_str)
-            delta = datetime.now(timezone.utc) - started
-            total_s = int(delta.total_seconds())
-            if total_s < 0:
-                return "just started"
-            hours, remainder = divmod(total_s, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            if hours > 0:
-                return f"{hours}h {minutes}m"
-            if minutes > 0:
-                return f"{minutes}m {seconds}s"
-            return f"{seconds}s"
-    except Exception:
+            return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return "unknown"
 

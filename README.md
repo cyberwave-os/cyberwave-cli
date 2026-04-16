@@ -218,7 +218,6 @@ Opens a live-updating dashboard showing:
 - **Model inference** — per-model latency (avg / P95 / P99) and inference count
 
 The dashboard connects to the worker's Zenoh data bus for runtime metrics.
-If `eclipse-zenoh` is not installed on the host, only Docker-level metrics are shown.
 
 **Options:**
 

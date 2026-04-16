@@ -568,8 +568,8 @@ def worker_monitor(update: float, container: str | None) -> None:
     zenoh_ok = zenoh_reader.start(container_name=container_name)
     if not zenoh_ok:
         console.print(
-            "[dim]Zenoh not available — showing Docker metrics only. "
-            "Install eclipse-zenoh for full throughput data.[/dim]\n"
+            "[dim]Zenoh connection failed — showing Docker metrics only. "
+            "The worker container may not be exposing the Zenoh listener yet.[/dim]\n"
         )
 
     if _platform.system() == "Darwin":
