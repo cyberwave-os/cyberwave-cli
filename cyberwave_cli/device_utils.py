@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .config import clean_subprocess_env
+
 logger = logging.getLogger(__name__)
 
 # Raspberry Pi platform devices that v4l2-ctl lists but are not actual cameras
@@ -115,6 +117,7 @@ def _get_v4l2_device_info(device_path: str) -> dict:
             capture_output=True,
             text=True,
             timeout=5,
+            env=clean_subprocess_env(),
         )
         if result.returncode != 0:
             return {}
@@ -185,6 +188,7 @@ def discover_usb_cameras_v4l2() -> list[CameraDevice]:
             capture_output=True,
             text=True,
             timeout=10,
+            env=clean_subprocess_env(),
         )
         if result.returncode != 0 and result.stderr:
             logger.warning(
