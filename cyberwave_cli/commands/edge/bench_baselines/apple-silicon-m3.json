@@ -1,0 +1,18 @@
+{
+  "device_class": "apple-silicon-m3",
+  "recorded_at": "2026-04-17T00:00:00Z",
+  "cyberwave_cli_version": null,
+  "cyberwave_version": null,
+  "provisional": true,
+  "note": "Provisional baseline for the Apple M3 tier (M3 / M3 Pro / M3 Max / M3 Ultra). Extrapolated at ~1.30x the M1 tier. Re-bless on real M3 hardware with `cyberwave edge bench --save-baseline apple-silicon-m3.json`.",
+  "metrics": {
+    "header_pack":      {"ops_per_s": 50960,    "ns_per_op": 19623},
+    "decode_zero_copy": {"ops_per_s": 43160,    "ns_per_op": 23169},
+    "decode_with_copy": {"ops_per_s": 23270,    "ns_per_op": 42974},
+    "stats_lockfree":   {"ops_per_s": 13704600, "ns_per_op": 73},
+    "stats_locked":     {"ops_per_s": 4951700,  "ns_per_op": 202},
+    "seq_itertools":    {"ops_per_s": 20780500, "ns_per_op": 48},
+    "seq_locked":       {"ops_per_s": 6016400,  "ns_per_op": 166},
+    "decode_mb_s":      39776
+  }
+}

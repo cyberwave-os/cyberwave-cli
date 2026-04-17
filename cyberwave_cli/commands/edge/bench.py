@@ -110,7 +110,8 @@ def _detect_device_class() -> str:
     system = platform.system().lower()
     if system == "darwin":
         if arch in ("arm64", "aarch64"):
-            return "apple-silicon"
+            tier = _apple_silicon_chip_tier()
+            return f"apple-silicon-{tier}" if tier else "apple-silicon"
         return "apple-intel"
     if system == "linux":
         if arch in ("x86_64", "amd64"):
@@ -131,6 +132,32 @@ def _has_battery() -> bool:
     except Exception:
         pass
     return False
+
+
+def _apple_silicon_chip_tier() -> str | None:
+    """Return the Apple Silicon chip generation slug (e.g. ``m1``, ``m4``).
+
+    Uses ``sysctl -n machdep.cpu.brand_string``, which on Apple Silicon
+    reports strings like ``"Apple M1"``, ``"Apple M1 Pro"``, ``"Apple M2 Max"``,
+    ``"Apple M4 Pro"``.  Only the numeric generation is extracted — Pro/Max/
+    Ultra variants share a tier (and therefore a baseline file) for now.
+    Returns ``None`` when detection fails, so the caller falls back to the
+    generic ``apple-silicon`` slug.
+    """
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    brand = (out.stdout or "").strip().lower()
+    match = re.match(r"apple m(\d+)", brand)
+    if not match:
+        return None
+    return f"m{match.group(1)}"
 
 
 def _cpu_model() -> str:
@@ -182,11 +209,127 @@ def _ram_gb() -> float | None:
             return round(int(match.group(1)) / 1024 / 1024, 1)
     except Exception:
         pass
+    # macOS / *BSD: ask the kernel directly. `hw.memsize` returns total RAM
+    # in bytes as a decimal string (e.g. "25769803776" for a 24 GB machine).
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        if out.returncode == 0 and out.stdout.strip().isdigit():
+            return round(int(out.stdout.strip()) / 1024**3, 1)
+    except Exception:
+        pass
     try:
         import psutil  # type: ignore
         return round(psutil.virtual_memory().total / 1024**3, 1)
     except Exception:
         pass
+    return None
+
+
+def _storage() -> dict[str, Any]:
+    """Best-effort description of the root filesystem's backing storage.
+
+    Returns capacity via the stdlib (portable) and a coarse ``kind`` slug —
+    ``"nvme"`` / ``"ssd"`` / ``"sd"`` / ``"emmc"`` / ``"hdd"`` — derived from
+    platform-specific hints.  This is *descriptive* context for the run
+    fingerprint, not a throughput measurement; the bench itself never touches
+    the disk.
+    """
+    info: dict[str, Any] = {"total_gb": None, "free_gb": None, "kind": None}
+    try:
+        import shutil
+        usage = shutil.disk_usage("/")
+        info["total_gb"] = round(usage.total / 1024**3, 1)
+        info["free_gb"] = round(usage.free / 1024**3, 1)
+    except Exception:
+        pass
+    info["kind"] = _storage_kind()
+    return info
+
+
+def _storage_kind() -> str | None:
+    """Classify the block device backing ``/`` as nvme / ssd / sd / emmc / hdd."""
+    system = platform.system().lower()
+
+    if system == "darwin":
+        try:
+            out = subprocess.run(
+                ["diskutil", "info", "/"],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+        except Exception:
+            return None
+        if out.returncode != 0:
+            return None
+        text = out.stdout
+        solid_match = re.search(r"Solid State:\s*(\w+)", text)
+        solid = bool(solid_match and solid_match.group(1).lower() == "yes")
+        if not solid:
+            return "hdd"
+        proto_match = re.search(r"Protocol:\s*(.+)", text)
+        proto = proto_match.group(1).strip().lower() if proto_match else ""
+        if "apple fabric" in proto or "pci-express" in proto or "nvme" in proto:
+            return "nvme"
+        return "ssd"
+
+    if system == "linux":
+        dev = _linux_root_block_device()
+        if not dev:
+            return None
+        if dev.startswith("nvme"):
+            return "nvme"
+        if dev.startswith("mmcblk"):
+            # Distinguish onboard eMMC from removable SD: eMMC reports type "MMC",
+            # removable SD reports "SD" in /sys/block/{dev}/device/type on recent
+            # kernels; fall back to "sd" when the attribute is unavailable.
+            try:
+                text = Path(f"/sys/block/{dev}/device/type").read_text(errors="ignore").strip()
+                if text.upper() == "MMC":
+                    return "emmc"
+                if text.upper() == "SD":
+                    return "sd"
+            except Exception:
+                pass
+            return "sd"
+        try:
+            rotational = Path(f"/sys/block/{dev}/queue/rotational").read_text(
+                errors="ignore"
+            ).strip()
+            if rotational == "1":
+                return "hdd"
+            if rotational == "0":
+                return "ssd"
+        except Exception:
+            pass
+        return None
+
+    return None
+
+
+def _linux_root_block_device() -> str | None:
+    """Return the whole-disk block device name (e.g. ``nvme0n1``) backing ``/``."""
+    try:
+        text = Path("/proc/mounts").read_text(errors="ignore")
+    except Exception:
+        return None
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[1] != "/" or not parts[0].startswith("/dev/"):
+            continue
+        name = parts[0][len("/dev/"):]
+        # Strip partition suffix to get the whole-disk device.
+        m = re.match(r"^(nvme\d+n\d+)p\d+$", name)
+        if m:
+            return m.group(1)
+        m = re.match(r"^(mmcblk\d+)p\d+$", name)
+        if m:
+            return m.group(1)
+        m = re.match(r"^([a-z]+)\d+$", name)
+        if m:
+            return m.group(1)
+        return name
     return None
 
 
@@ -267,6 +410,7 @@ def _collect_fingerprint() -> dict[str, Any]:
             "arch": platform.machine(),
         },
         "ram_gb": _ram_gb(),
+        "storage": _storage(),
         "accelerator": _accelerator(),
         "os": {
             "name": platform.system(),
@@ -296,6 +440,19 @@ def _render_fingerprint_header(fp: dict[str, Any]) -> None:
     ram = fp["ram_gb"]
     ram_str = f"{ram} GB" if ram else "? GB"
 
+    storage = fp.get("storage") or {}
+    total_gb = storage.get("total_gb")
+    free_gb = storage.get("free_gb")
+    kind = storage.get("kind")
+    storage_parts: list[str] = []
+    if total_gb:
+        storage_parts.append(f"{total_gb:.0f} GB")
+    if kind:
+        storage_parts.append(kind.upper())
+    if free_gb is not None and total_gb:
+        storage_parts.append(f"({free_gb:.0f} GB free)")
+    storage_str = " ".join(storage_parts) if storage_parts else "?"
+
     versions = fp["versions"]
 
     table = Table(
@@ -309,6 +466,7 @@ def _render_fingerprint_header(fp: dict[str, Any]) -> None:
     table.add_row("hostname", str(fp.get("hostname", "?")))
     table.add_row("CPU", f"{cpu.get('model', '?')}  {cores_str} {freq_str}".strip())
     table.add_row("RAM", ram_str)
+    table.add_row("storage", storage_str)
     table.add_row("accelerator", accel_str)
     table.add_row("OS", f"{fp['os']['name']} {fp['os']['release']}")
     table.add_row(
@@ -436,13 +594,43 @@ def _load_baseline(
             return None, f"error:{path}"
 
     arch = platform.machine().lower() or "unknown"
-    candidates = [f"{device_class}.json", f"generic-{arch}.json"]
-
-    for name in candidates:
+    for name in _baseline_candidate_files(device_class, arch):
         loaded = _load_packaged_baseline(name)
         if loaded is not None:
             return loaded, f"package:{name}"
     return None, "not_found"
+
+
+def _baseline_candidate_files(device_class: str, arch: str) -> list[str]:
+    """Return the ordered list of baseline filenames to try for a device class.
+
+    Walks the slug from most specific to least specific by stripping trailing
+    ``-segment`` suffixes, then appends the architecture-generic fallback.  For
+    example, ``apple-silicon-m4`` yields
+    ``["apple-silicon-m4.json", "apple-silicon.json", "generic-arm64.json"]``,
+    while ``jetson-orin-nano`` yields
+    ``["jetson-orin-nano.json", "jetson-orin.json", "generic-aarch64.json"]``.
+    Single-segment roots (``apple``, ``jetson``, ``rpi``) are intentionally
+    skipped — they are never shipped as standalone baselines.  Missing files in
+    the chain are silently ignored by the loader, so shipping only the
+    specific-tier file (or only the parent file) both work.
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+    slug = device_class
+    while slug and slug not in seen:
+        seen.add(slug)
+        candidates.append(f"{slug}.json")
+        if "-" not in slug:
+            break
+        parent = slug.rsplit("-", 1)[0]
+        if "-" not in parent:
+            break
+        slug = parent
+    generic = f"generic-{arch}.json"
+    if generic not in candidates:
+        candidates.append(generic)
+    return candidates
 
 
 def _load_packaged_baseline(filename: str) -> dict[str, Any] | None:
@@ -515,6 +703,46 @@ def _status_style(status: str) -> str:
         "ok":        "green",
         "n/a":       "dim",
     }.get(status, "")
+
+
+def _delta_style(delta: float | None, threshold: float) -> str:
+    """Choose a Rich style for a delta value ("Scheme B" gradient).
+
+    Uses a noise floor at ``threshold / 3`` so tiny run-to-run jitter doesn't
+    light up the table.  With the default ``--threshold 0.15`` the bands are:
+
+    * ``|Δ| ≤ 5%``              -> ``dim``         (within measurement noise)
+    * ``-15% <  Δ <  -5%``      -> ``yellow``      (trending below baseline)
+    * ``Δ ≤ -15%``              -> ``bold red``    (regressed beyond tolerance)
+    * ``5% <  Δ ≤ 15%``         -> ``green``       (modest speedup)
+    * ``Δ >  15%``              -> ``bold green``  (clear improvement)
+    * baseline missing          -> ``dim``         (no signal)
+
+    Colors are display-only; the JSON written by ``--output`` / ``--save-baseline``
+    is unaffected.
+    """
+    if delta is None:
+        return "dim"
+    # Nudge the noise floor by a tiny epsilon so values like -0.05 with a
+    # threshold of 0.15 (where threshold/3 == 0.049999...) land on the "dim"
+    # side of the comparison instead of leaking into "yellow" / "green".
+    noise = threshold / 3 + 1e-9
+    if -noise <= delta <= noise:
+        return "dim"
+    if delta <= -threshold:
+        return "bold red"
+    if delta < -noise:
+        return "yellow"
+    if delta >= threshold:
+        return "bold green"
+    return "green"
+
+
+def _render_delta_cell(delta: float | None, threshold: float) -> str:
+    """Return the Rich-markup string for a single ``Delta`` cell."""
+    text = _format_delta(delta)
+    style = _delta_style(delta, threshold)
+    return f"[{style}]{text}[/{style}]" if style else text
 
 
 # ---------------------------------------------------------------------------
@@ -769,6 +997,7 @@ def bench(
         baseline_source=baseline_source,
         deltas=deltas,
         statuses=statuses,
+        threshold=threshold,
     )
 
     _render_report_card(
@@ -828,6 +1057,7 @@ def _render_results_table(
     baseline_source: str,
     deltas: dict[str, float | None],
     statuses: dict[str, str],
+    threshold: float,
 ) -> None:
     comparing = baseline is not None
     title = "Results"
@@ -856,7 +1086,7 @@ def _render_results_table(
             f"{r['ops']:,.0f}",
             f"{r['ns']:,.0f}",
             f"{base_ops:,.0f}" if base_ops is not None else "-",
-            _format_delta(deltas.get(key)),
+            _render_delta_cell(deltas.get(key), threshold),
             f"[{_status_style(status)}]{status}[/{_status_style(status)}]"
             if _status_style(status) else status,
         )
@@ -868,7 +1098,7 @@ def _render_results_table(
         f"{decode_mb_s:,.0f}",
         "-",
         f"{decode_mb_baseline:,.0f}" if decode_mb_baseline is not None else "-",
-        _format_delta(deltas.get("decode_mb_s")),
+        _render_delta_cell(deltas.get("decode_mb_s"), threshold),
         f"[{_status_style(decode_mb_status)}]{decode_mb_status}"
         f"[/{_status_style(decode_mb_status)}]"
         if _status_style(decode_mb_status) else decode_mb_status,

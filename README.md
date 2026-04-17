@@ -540,11 +540,21 @@ cyberwave edge bench --no-compare
 **How the "device" is resolved**
 
 The command auto-detects a `device_class` slug (e.g. `jetson-orin-nano`,
-`rpi-5`, `x86-laptop`, `apple-silicon`) from `/proc/device-tree/model`,
-`/etc/nv_tegra_release`, `platform.machine()`, and (on Linux x86_64) whether
-a battery is present. It then loads `bench_baselines/{device_class}.json`
-from the CLI package, falling back to `generic-{arch}.json` when there is no
-exact match. Use `--baseline <path>` to override.
+`rpi-5`, `x86-laptop`, `apple-silicon-m4`) from `/proc/device-tree/model`,
+`/etc/nv_tegra_release`, `sysctl -n machdep.cpu.brand_string` (macOS),
+`platform.machine()`, and (on Linux x86_64) whether a battery is present.
+On Apple Silicon the chip generation is parsed from the brand string
+(`"Apple M1"`, `"Apple M1 Pro"`, `"Apple M4 Max"`, …) and emitted as
+`apple-silicon-m1`, `apple-silicon-m2`, `apple-silicon-m3`,
+`apple-silicon-m4`; Pro/Max/Ultra variants share a tier.
+
+It then loads `bench_baselines/{device_class}.json` from the CLI package,
+falling back through parent slugs and finally `generic-{arch}.json`. The
+chain is built by stripping trailing `-segment` suffixes, so
+`apple-silicon-m4` tries `apple-silicon-m4.json` → `apple-silicon.json` →
+`generic-arm64.json`. Missing files are silently skipped, so a newer
+generation without a dedicated file still gets a sensible comparison. Use
+`--baseline <path>` to override.
 
 **Blessing a baseline for a new device class**
 
@@ -562,7 +572,10 @@ cyberwave edge bench \
 
 The saved file uses the same schema the bench consumes. Set
 `"provisional": false` once you are happy with the numbers. The file name
-must match the `device_class` slug the fingerprint reports.
+must match the `device_class` slug the fingerprint reports (e.g.
+`apple-silicon-m4.json` on an M4 / M4 Pro / M4 Max MacBook). On macOS the
+`--pin` flag is a no-op; plug in power, disable Low Power Mode, and close
+background apps before blessing to avoid thermal throttling.
 
 **Options**
 

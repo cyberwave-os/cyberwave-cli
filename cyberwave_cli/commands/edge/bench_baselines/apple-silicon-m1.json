@@ -1,10 +1,10 @@
 {
-  "device_class": "apple-silicon",
+  "device_class": "apple-silicon-m1",
   "recorded_at": "2026-04-17T00:00:00Z",
   "cyberwave_cli_version": null,
   "cyberwave_version": null,
   "provisional": true,
-  "note": "Fallback baseline for Apple Silicon when the chip tier cannot be resolved (or when a newer generation has no dedicated file yet). Mirrors the conservative M1 numbers and is extrapolated at ~1.15x the x86-laptop reference. Prefer the tier-specific apple-silicon-m{1,2,3,4}.json files; re-bless them on real hardware with `cyberwave edge bench --save-baseline apple-silicon-m{N}.json`.",
+  "note": "Provisional baseline for the Apple M1 tier (M1 / M1 Pro / M1 Max / M1 Ultra). Mirrors the conservative apple-silicon fallback; re-bless on real M1 hardware with `cyberwave edge bench --save-baseline apple-silicon-m1.json`.",
   "metrics": {
     "header_pack":      {"ops_per_s": 39200,    "ns_per_op": 25510},
     "decode_zero_copy": {"ops_per_s": 33200,    "ns_per_op": 30120},

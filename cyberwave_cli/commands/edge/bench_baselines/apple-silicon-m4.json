@@ -1,0 +1,58 @@
+{
+  "device_class": "apple-silicon-m4",
+  "recorded_at": "2026-04-17T10:56:43.517912+00:00",
+  "cyberwave_cli_version": "0.12.3",
+  "cyberwave_version": "0.4.0",
+  "provisional": false,
+  "note": "Blessed on Apple M4 Pro (14-core, 48 GB, NVMe). Covers M4 / M4 Pro / M4 Max.",
+   "source_device": {
+    "hostname": "Mac",
+    "cpu": "Apple M4 Pro",
+    "accelerator": null
+  },
+  "metrics": {
+    "header_pack": {
+      "ops_per_s": 88980.4,
+      "ns_per_op": 11238.43,
+      "best_ops_per_s": 90369.94,
+      "stdev_ops_per_s": 1082.67
+    },
+    "decode_zero_copy": {
+      "ops_per_s": 72770.88,
+      "ns_per_op": 13741.76,
+      "best_ops_per_s": 73424.58,
+      "stdev_ops_per_s": 495.14
+    },
+    "decode_with_copy": {
+      "ops_per_s": 38303.5,
+      "ns_per_op": 26107.28,
+      "best_ops_per_s": 38635.11,
+      "stdev_ops_per_s": 166.74
+    },
+    "stats_lockfree": {
+      "ops_per_s": 18165260.2,
+      "ns_per_op": 55.05,
+      "best_ops_per_s": 18470182.45,
+      "stdev_ops_per_s": 435660.94
+    },
+    "stats_locked": {
+      "ops_per_s": 8405844.25,
+      "ns_per_op": 118.96,
+      "best_ops_per_s": 8423773.07,
+      "stdev_ops_per_s": 61616.39
+    },
+    "seq_itertools": {
+      "ops_per_s": 31235724.29,
+      "ns_per_op": 32.01,
+      "best_ops_per_s": 31309463.53,
+      "stdev_ops_per_s": 100063.29
+    },
+    "seq_locked": {
+      "ops_per_s": 10483605.23,
+      "ns_per_op": 95.39,
+      "best_ops_per_s": 10540832.56,
+      "stdev_ops_per_s": 83520.14
+    },
+    "decode_mb_s": 67065.65
+  }
+}
