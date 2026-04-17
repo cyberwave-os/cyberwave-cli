@@ -37,6 +37,24 @@ def test_specs_have_distinct_process_match(monkeypatch):
     assert core.CLOUD_NODE_SPEC.process_match != core.EDGE_CORE_SPEC.process_match
 
 
+def test_resolve_deb_registry_urls_uses_internal_registry_for_dev(monkeypatch):
+    core = load_core_module(monkeypatch)
+
+    repo_url, key_url = core._resolve_deb_registry_urls(core.EDGE_CORE_SPEC, "dev")
+
+    assert repo_url == "https://packages.buildkite.com/cyberwave/cyberwave-internal-deb/any/"
+    assert key_url == "https://packages.buildkite.com/cyberwave/cyberwave-internal-deb/gpgkey"
+
+
+def test_resolve_deb_registry_urls_uses_public_registry_for_stable(monkeypatch):
+    core = load_core_module(monkeypatch)
+
+    repo_url, key_url = core._resolve_deb_registry_urls(core.CLOUD_NODE_SPEC, "stable")
+
+    assert repo_url == "https://packages.buildkite.com/cyberwave/cyberwave-cloud-node/any/"
+    assert key_url == "https://packages.buildkite.com/cyberwave/cyberwave-cloud-node/gpgkey"
+
+
 def test_stop_service_uses_spec_unit_name(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
     run_calls: list[list[str]] = []
@@ -202,8 +220,8 @@ def test_clear_service_override_removes_file_and_reloads(monkeypatch, tmp_path):
 
 
 def _make_apt_recorder(calls):
-    def _fake_apt(spec, *, package_name, package_version):
-        calls.append((package_name, package_version))
+    def _fake_apt(spec, *, package_name, package_version, channel="stable"):
+        calls.append((package_name, package_version, channel))
         return True
 
     return _fake_apt
@@ -215,7 +233,7 @@ def _apt_which(name):
 
 def test_install_service_package_uses_cloud_node_spec(monkeypatch):
     core = load_core_module(monkeypatch)
-    calls: list[tuple[str, str | None]] = []
+    calls: list[tuple[str, str | None, str]] = []
 
     monkeypatch.setattr(core, "_is_linux", lambda: True)
     monkeypatch.setattr(core.shutil, "which", _apt_which)
@@ -223,12 +241,12 @@ def test_install_service_package_uses_cloud_node_spec(monkeypatch):
 
     result = core.install_service_package(core.CLOUD_NODE_SPEC, channel="stable", version=None)
     assert result is True
-    assert calls == [("cyberwave-cloud-node", None)]
+    assert calls == [("cyberwave-cloud-node", None, "stable")]
 
 
 def test_install_service_package_dev_channel_for_cloud_node(monkeypatch):
     core = load_core_module(monkeypatch)
-    calls: list[tuple[str, str | None]] = []
+    calls: list[tuple[str, str | None, str]] = []
 
     monkeypatch.setattr(core, "_is_linux", lambda: True)
     monkeypatch.setattr(core.shutil, "which", _apt_which)
@@ -236,20 +254,181 @@ def test_install_service_package_dev_channel_for_cloud_node(monkeypatch):
 
     result = core.install_service_package(core.CLOUD_NODE_SPEC, channel="dev", version="1.2.3")
     assert result is True
-    assert calls == [("cyberwave-cloud-node-dev", "1.2.3")]
+    assert calls == [("cyberwave-cloud-node-dev", "1.2.3", "dev")]
 
 
 def test_install_edge_core_alias_still_works(monkeypatch):
     """install_edge_core() must remain callable for backward compat."""
     core = load_core_module(monkeypatch)
-    calls: list[tuple[str, str | None]] = []
+    calls: list[tuple[str, str | None, str]] = []
 
     monkeypatch.setattr(core, "_is_linux", lambda: True)
     monkeypatch.setattr(core.shutil, "which", _apt_which)
     monkeypatch.setattr(core, "_apt_get_install", _make_apt_recorder(calls))
 
     assert core.install_edge_core() is True
-    assert calls == [("cyberwave-edge-core", None)]
+    assert calls == [("cyberwave-edge-core", None, "stable")]
+
+
+def test_apt_get_install_uses_internal_registry_for_dev(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    run_calls: list[list[str]] = []
+
+    keyring_path = tmp_path / "cyberwave-cloud-node.gpg"
+    keyring_path.write_text("existing-key")
+    sources_list_path = tmp_path / "cyberwave-cloud-node.list"
+    binary_path = tmp_path / "cyberwave-cloud-node"
+
+    def fake_run(cmd, **_kw):
+        run_calls.append(cmd)
+        if cmd[:3] == ["apt-get", "install", "-y"]:
+            binary_path.write_text("#!/bin/sh\n")
+
+    monkeypatch.setattr(
+        core,
+        "_resolve_deb_registry_paths",
+        lambda spec, channel="stable": (keyring_path, sources_list_path),
+    )
+    monkeypatch.setattr(
+        core,
+        "_resolve_deb_registry_auth_conf_path",
+        lambda spec, channel="stable": tmp_path / "cyberwave-cloud-node.auth.conf",
+    )
+    monkeypatch.setenv("CYBERWAVE_INTERNAL_DEB_READ_TOKEN", "test-read-token")
+    monkeypatch.setattr(core.CLOUD_NODE_SPEC, "binary_path", binary_path)
+    monkeypatch.setattr(core, "_run", fake_run)
+
+    result = core._apt_get_install(
+        core.CLOUD_NODE_SPEC,
+        package_name="cyberwave-cloud-node-dev",
+        package_version=None,
+        channel="dev",
+    )
+
+    assert result is True
+    assert "cyberwave-internal-deb" in sources_list_path.read_text(encoding="utf-8")
+
+
+
+def test_apt_get_install_dev_requires_internal_token(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    messages: list[str] = []
+    keyring_path = tmp_path / "cyberwave-cloud-node.gpg"
+    keyring_path.write_text("existing-key")
+    sources_list_path = tmp_path / "cyberwave-cloud-node.list"
+    auth_conf_path = tmp_path / "cyberwave-cloud-node.auth.conf"
+
+    monkeypatch.delenv("CYBERWAVE_INTERNAL_DEB_READ_TOKEN", raising=False)
+    monkeypatch.setattr(
+        core,
+        "_resolve_deb_registry_paths",
+        lambda spec, channel="stable": (keyring_path, sources_list_path),
+    )
+    monkeypatch.setattr(
+        core,
+        "_resolve_deb_registry_auth_conf_path",
+        lambda spec, channel="stable": auth_conf_path,
+    )
+    monkeypatch.setattr(core.console, "print", lambda msg="", *a, **kw: messages.append(str(msg)))
+
+    result = core._apt_get_install(
+        core.CLOUD_NODE_SPEC,
+        package_name="cyberwave-cloud-node-dev",
+        package_version=None,
+        channel="dev",
+    )
+
+    assert result is False
+    assert any("CYBERWAVE_INTERNAL_DEB_READ_TOKEN" in message for message in messages)
+    assert not auth_conf_path.exists()
+
+
+def test_apt_get_install_writes_private_auth_for_dev(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    run_calls: list[list[str]] = []
+    keyring_path = tmp_path / "cyberwave-cloud-node.gpg"
+    keyring_path.write_text("existing-key")
+    sources_list_path = tmp_path / "cyberwave-cloud-node.list"
+    auth_conf_path = tmp_path / "cyberwave-cloud-node.auth.conf"
+    binary_path = tmp_path / "cyberwave-cloud-node"
+
+    def fake_run(cmd, **_kw):
+        run_calls.append(cmd)
+        if cmd[:3] == ["apt-get", "install", "-y"]:
+            binary_path.write_text("#!/bin/sh\n")
+
+    monkeypatch.setenv("CYBERWAVE_INTERNAL_DEB_READ_TOKEN", "test-read-token")
+    monkeypatch.setattr(
+        core,
+        "_resolve_deb_registry_paths",
+        lambda spec, channel="stable": (keyring_path, sources_list_path),
+    )
+    monkeypatch.setattr(
+        core,
+        "_resolve_deb_registry_auth_conf_path",
+        lambda spec, channel="stable": auth_conf_path,
+    )
+    monkeypatch.setattr(core.CLOUD_NODE_SPEC, "binary_path", binary_path)
+    monkeypatch.setattr(core, "_run", fake_run)
+
+    result = core._apt_get_install(
+        core.CLOUD_NODE_SPEC,
+        package_name="cyberwave-cloud-node-dev",
+        package_version=None,
+        channel="dev",
+    )
+
+    assert result is True
+    assert "password test-read-token" in auth_conf_path.read_text(encoding="utf-8")
+    assert any(
+        cmd[:2] == ["chmod", "600"] and str(auth_conf_path) in cmd
+        for cmd in run_calls
+    )
+
+
+def test_apt_get_install_uses_saved_internal_token(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    run_calls: list[list[str]] = []
+    keyring_path = tmp_path / "cyberwave-cloud-node.gpg"
+    keyring_path.write_text("existing-key")
+    sources_list_path = tmp_path / "cyberwave-cloud-node.list"
+    auth_conf_path = tmp_path / "cyberwave-cloud-node.auth.conf"
+    binary_path = tmp_path / "cyberwave-cloud-node"
+
+    def fake_run(cmd, **_kw):
+        run_calls.append(cmd)
+        if cmd[:3] == ["apt-get", "install", "-y"]:
+            binary_path.write_text("#!/bin/sh\n")
+
+    saved_creds = type(
+        "SavedCreds",
+        (),
+        {"token": "api-token", "internal_deb_read_token": "saved-deb-token"},
+    )()
+    monkeypatch.delenv("CYBERWAVE_INTERNAL_DEB_READ_TOKEN", raising=False)
+    monkeypatch.setattr(core, "load_credentials", lambda: saved_creds)
+    monkeypatch.setattr(
+        core,
+        "_resolve_deb_registry_paths",
+        lambda spec, channel="stable": (keyring_path, sources_list_path),
+    )
+    monkeypatch.setattr(
+        core,
+        "_resolve_deb_registry_auth_conf_path",
+        lambda spec, channel="stable": auth_conf_path,
+    )
+    monkeypatch.setattr(core.CLOUD_NODE_SPEC, "binary_path", binary_path)
+    monkeypatch.setattr(core, "_run", fake_run)
+
+    result = core._apt_get_install(
+        core.CLOUD_NODE_SPEC,
+        package_name="cyberwave-cloud-node-dev",
+        package_version=None,
+        channel="dev",
+    )
+
+    assert result is True
+    assert "saved-deb-token" in auth_conf_path.read_text(encoding="utf-8")
 
 
 def _raise_assertion(msg=""):
@@ -463,8 +642,8 @@ def test_buildkite_python_registry_index_url_uses_registry_slug(monkeypatch):
     core = load_core_module(monkeypatch)
 
     assert (
-        core._buildkite_python_registry_index_url("cyberwave-edge-core-python")
-        == "https://packages.buildkite.com/cyberwave/cyberwave-edge-core-python/pypi/simple"
+        core._buildkite_python_registry_index_url("cyberwave-internal-python")
+        == "https://packages.buildkite.com/cyberwave/cyberwave-internal-python/pypi/simple"
     )
 
 
@@ -598,6 +777,34 @@ def test_pip_install_dev_lists_buildkite_versions_and_installs_latest_match(monk
 
     result = core._pip_install(core.EDGE_CORE_SPEC, channel="dev")
 
+    assert result is False
+    assert run_calls == []
+    assert any("CYBERWAVE_INTERNAL_PYTHON_READ_TOKEN" in message for message in messages)
+
+
+def test_pip_install_dev_uses_private_internal_python_registry(monkeypatch):
+    core = load_core_module(monkeypatch)
+    run_calls: list[list[str]] = []
+    messages: list[str] = []
+    monkeypatch.setenv("CYBERWAVE_INTERNAL_PYTHON_READ_TOKEN", "test-python-token")
+    monkeypatch.setattr(
+        core.console,
+        "print",
+        lambda msg="", *args, **kwargs: messages.append(str(msg)),
+    )
+    monkeypatch.setattr(
+        core,
+        "_fetch_available_simple_index_versions",
+        lambda index_url, package_name: [
+            core.Version("0.1.2.dev7"),
+            core.Version("0.1.2.dev12"),
+            core.Version("0.1.2rc2"),
+        ],
+    )
+    monkeypatch.setattr(core, "_run", lambda cmd, **_kw: run_calls.append(cmd))
+
+    result = core._pip_install(core.EDGE_CORE_SPEC, channel="dev")
+
     assert result is True
     assert run_calls == [
         [
@@ -607,7 +814,7 @@ def test_pip_install_dev_lists_buildkite_versions_and_installs_latest_match(monk
             "install",
             "--pre",
             "--extra-index-url",
-            "https://packages.buildkite.com/cyberwave/cyberwave-edge-core-python/pypi/simple",
+            "https://buildkite:test-python-token@packages.buildkite.com/cyberwave/cyberwave-internal-python/pypi/simple",
             "cyberwave-edge-core==0.1.2.dev12",
         ]
     ]
@@ -651,6 +858,30 @@ def test_pip_install_prerelease_explicit_version_uses_buildkite_index(monkeypatc
         package_version="0.2.24rc7",
     )
 
+    assert result is False
+    assert run_calls == []
+    assert any("CYBERWAVE_INTERNAL_PYTHON_READ_TOKEN" in message for message in messages)
+
+
+def test_pip_install_prerelease_explicit_version_uses_private_index(monkeypatch):
+    core = load_core_module(monkeypatch)
+    run_calls: list[list[str]] = []
+    messages: list[str] = []
+
+    monkeypatch.setenv("CYBERWAVE_INTERNAL_PYTHON_READ_TOKEN", "test-python-token")
+    monkeypatch.setattr(
+        core.console,
+        "print",
+        lambda msg="", *args, **kwargs: messages.append(str(msg)),
+    )
+    monkeypatch.setattr(core, "_run", lambda cmd, **_kw: run_calls.append(cmd))
+
+    result = core._pip_install(
+        core.CLOUD_NODE_SPEC,
+        channel="staging",
+        package_version="0.2.24rc7",
+    )
+
     assert result is True
     assert run_calls == [
         [
@@ -660,11 +891,45 @@ def test_pip_install_prerelease_explicit_version_uses_buildkite_index(monkeypatc
             "install",
             "--pre",
             "--extra-index-url",
-            "https://packages.buildkite.com/cyberwave/cyberwave-cloud-node-python/pypi/simple",
+            "https://buildkite:test-python-token@packages.buildkite.com/cyberwave/cyberwave-internal-python/pypi/simple",
             "cyberwave-cloud-node==0.2.24rc7",
         ]
     ]
     assert any("Buildkite" in message for message in messages)
+
+
+def test_pip_install_uses_saved_internal_python_token(monkeypatch):
+    core = load_core_module(monkeypatch)
+    run_calls: list[list[str]] = []
+    messages: list[str] = []
+
+    saved_creds = type(
+        "SavedCreds",
+        (),
+        {"token": "api-token", "internal_python_read_token": "saved-python-token"},
+    )()
+    monkeypatch.delenv("CYBERWAVE_INTERNAL_PYTHON_READ_TOKEN", raising=False)
+    monkeypatch.setattr(core, "load_credentials", lambda: saved_creds)
+    monkeypatch.setattr(
+        core.console,
+        "print",
+        lambda msg="", *args, **kwargs: messages.append(str(msg)),
+    )
+    monkeypatch.setattr(
+        core,
+        "_fetch_available_simple_index_versions",
+        lambda index_url, package_name: [
+            core.Version("0.1.2.dev7"),
+            core.Version("0.1.2.dev12"),
+            core.Version("0.1.2rc2"),
+        ],
+    )
+    monkeypatch.setattr(core, "_run", lambda cmd, **_kw: run_calls.append(cmd))
+
+    result = core._pip_install(core.EDGE_CORE_SPEC, channel="dev")
+
+    assert result is True
+    assert run_calls[0][6] == "https://buildkite:saved-python-token@packages.buildkite.com/cyberwave/cyberwave-internal-python/pypi/simple"
 
 
 def test_install_service_package_uses_pip_for_nonstable_non_apt_channel(monkeypatch):

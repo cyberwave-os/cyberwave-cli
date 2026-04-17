@@ -14,6 +14,9 @@ from pathlib import Path
 from packaging.utils import canonicalize_name, parse_sdist_filename, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
+BUILDKITE_ORG_SLUG = "cyberwave"
+INTERNAL_PYTHON_REGISTRY_SLUG = "cyberwave-internal-python"
+
 
 def _normalize_service_channel(channel: str | None) -> str:
     """Return a normalized service release channel."""
@@ -50,14 +53,27 @@ def _validate_pip_channel_version(package_name: str, version_text: str, channel:
     return version
 
 
-def _buildkite_python_registry_index_url(registry_slug: str) -> str:
+def _buildkite_python_registry_index_url(registry_slug: str, read_token: str | None = None) -> str:
     """Return the Buildkite Python simple index URL for ``registry_slug``."""
-    return f"https://packages.buildkite.com/cyberwave/{registry_slug}/pypi/simple"
+    if read_token:
+        return (
+            f"https://buildkite:{read_token}@packages.buildkite.com/"
+            f"{BUILDKITE_ORG_SLUG}/{registry_slug}/pypi/simple"
+        )
+    return f"https://packages.buildkite.com/{BUILDKITE_ORG_SLUG}/{registry_slug}/pypi/simple"
 
 
 def _buildkite_python_registry_slug(package_name: str) -> str:
     """Return the Buildkite Python registry slug for a package."""
     return f"{package_name}-python"
+
+
+def _resolve_buildkite_python_registry_slug(package_name: str, channel: str) -> str:
+    """Return the shared prerelease registry slug or per-package stable slug."""
+    normalized_channel = _normalize_service_channel(channel)
+    if normalized_channel == "stable":
+        return _buildkite_python_registry_slug(package_name)
+    return INTERNAL_PYTHON_REGISTRY_SLUG
 
 
 def _select_pip_version_for_channel(

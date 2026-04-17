@@ -205,33 +205,46 @@ Streams logs from the edge worker container (requires Docker).
 ### `cyberwave worker doctor`
 
 ```bash
-cyberwave worker doctor              # run local sanity checks + 2s bus probe
-cyberwave worker doctor --verbose    # also show hints for passing checks
-cyberwave worker doctor --no-probe   # skip the Zenoh bus probe
+cyberwave worker doctor                 # static + runtime checks (default)
+cyberwave worker doctor --verbose       # show hints for passing checks too
+cyberwave worker doctor --no-runtime    # skip the live-bus probe
+cyberwave worker doctor --window 6      # longer runtime probe (seconds)
 ```
 
 Diagnoses the common silent failure modes where a worker container looks
-healthy but hooks report `frames: 0`. Checks include:
+healthy but hooks report `frames: 0`. The doctor runs two groups of checks.
+
+**Static ("paperwork") checks:**
 
 - `cyberwave-edge-core` is installed;
 - worker files in `{CONFIG_DIR}/workers/` are world-readable (UID 1001 needs to read them);
 - at least one `cyberwave-driver-*` container is running on this host;
-- `CYBERWAVE_ENVIRONMENT` and `ZENOH_CONNECT` agree between the host and any
-  running driver containers;
-- **key-expression intersection probe**: opens a short Zenoh session (2 s by
-  default), collects keys observed under `cw/**`, and warns when an
-  `@cw.on_frame` hook's subscribe key doesn't match anything being
-  published. Catches the classic "hook pins `sensor='default'` but the
-  driver publishes `frames/color_camera` because the twin asset declares
-  the sensor as `color_camera`" drift.
-- **one-driver ⇄ one-twin invariant**: while the probe is running, the
-  twin UUIDs seen on the bus are compared against `CYBERWAVE_TWIN_UUID`
-  on each running driver container. Warns if two drivers are bound to
-  the same twin, or if keys are being published under a twin that no
-  driver on this host is bound to.
+- `CYBERWAVE_ENVIRONMENT`, `ZENOH_CONNECT`, `CYBERWAVE_DATA_BACKEND` and
+  `ZENOH_SHARED_MEMORY` agree between the running driver and worker containers;
+- no known legacy env-var spellings slip through — currently
+  `ZENOH_SHM_ENABLED` (superseded by `ZENOH_SHARED_MEMORY`). Other
+  legacy names may be added as they're discovered; the check is
+  deliberately conservative and only flags names we've explicitly
+  mapped.
 
-`cyberwave worker start` now invokes the same checks as a pre-flight; pass
-`--skip-preflight` to bypass them.
+**Runtime checks** — open a short Zenoh subscription to `**` and compare
+live traffic against every `@cw.on_*(<twin>)` hook declared in the worker
+files. Three distinct diagnoses are emitted:
+
+- **Sensor mismatch** — hook listens on `sensor="default"` but the driver
+  publishes on another sensor name (or vice-versa).
+- **Wrong twin** — the channel is flowing, but under a different twin
+  UUID than the hook expects.
+- **Unscoped keys** — a publisher is putting to e.g. `frames/color_camera`
+  without the canonical `cw/<twin>/data/...` prefix; twin-scoped hooks
+  silently drop these.
+
+Requires `eclipse-zenoh` on the host (`pip install --user eclipse-zenoh`).
+When missing, the runtime section degrades to an info message.
+
+`cyberwave worker start` still invokes only the static checks as a
+pre-flight (no bus probe, to keep startup fast); pass `--skip-preflight`
+to bypass them.
 
 ### `cyberwave worker monitor`
 
@@ -750,8 +763,15 @@ Set API credentials directly without the interactive login flow. Useful when you
 ```bash
 cyberwave configure --token YOUR_TOKEN
 cyberwave configure --token YOUR_TOKEN --base-url http://localhost:8000
+cyberwave configure --internal-deb-read-token YOUR_BUILDKITE_DEB_TOKEN
+cyberwave configure --internal-python-read-token YOUR_BUILDKITE_PYTHON_TOKEN
 cyberwave configure --show
 ```
+
+Private Buildkite read tokens are stored alongside the API credentials in `credentials.json`.
+When prerelease (`dev`/`staging`) installs need access to `cyberwave-internal-deb` or
+`cyberwave-internal-python`, the CLI prefers explicit environment variables first and then
+falls back to those saved tokens.
 
 ## Configuration
 
@@ -766,7 +786,7 @@ Run `cyberwave config-dir` to see which directory is active.
 
 **Files inside the config directory:**
 
-- `credentials.json` — API token and workspace info (permissions `600`)
+- `credentials.json` — API token, workspace info, runtime env overrides, and optional private Buildkite registry read tokens (permissions `600`)
 - `environment.json` — selected workspace, environment, and twin bindings
 - `fingerprint.json` — unique edge device identifier
 
