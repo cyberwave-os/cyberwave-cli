@@ -59,6 +59,18 @@ cyberwave edge install
 
 This command will guide you to your first-time setup of your edge device.
 
+## Global Options
+
+| Flag        | Description                          |
+| ----------- | ------------------------------------ |
+| `--version` | Print the CLI version and exit       |
+| `--help`    | Show help for any command            |
+
+```bash
+cyberwave --version
+# cyberwave, version 0.x.y
+```
+
 ## Commands
 
 | Command       | Description                                                   |
