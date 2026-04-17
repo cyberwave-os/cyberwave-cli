@@ -20,6 +20,7 @@ Example usage:
     cyberwave worker monitor                # Live resource/throughput dashboard
 """
 
+import ast
 import datetime
 import json
 import re
@@ -28,7 +29,9 @@ import stat
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import click
 from rich.console import Console
@@ -803,7 +806,22 @@ def _inspect_container_env(container_name: str) -> dict[str, str]:
         return {}
 
 
-_ENV_KEYS_TO_COMPARE = ("CYBERWAVE_ENVIRONMENT", "ZENOH_CONNECT")
+_ENV_KEYS_TO_COMPARE = (
+    "CYBERWAVE_ENVIRONMENT",
+    "ZENOH_CONNECT",
+    # Mismatches here silently put driver and worker on different transports.
+    "CYBERWAVE_DATA_BACKEND",
+    "ZENOH_SHARED_MEMORY",
+)
+
+_LEGACY_ENV_VARS: dict[str, str] = {
+    # Canonical name is ``ZENOH_SHARED_MEMORY`` (see
+    # ``cyberwave-edge-core/cyberwave_edge_core/zenoh_config.py``). A few
+    # older docs and snippets referred to ``ZENOH_SHM_ENABLED``; if it shows
+    # up in a container env it is silently ignored, producing a TCP-loopback
+    # fallback that the operator didn't ask for.
+    "ZENOH_SHM_ENABLED": "ZENOH_SHARED_MEMORY",
+}
 
 
 def _collect_preflight_checks(workers_dir: Path) -> list[_Check]:
@@ -1000,7 +1018,32 @@ def _collect_preflight_checks(workers_dir: Path) -> list[_Check]:
             )
         )
 
-    # 6. twin binding: drivers with no twin env publish on undefined keys.
+    # 6. legacy / typo'd env var names. The canonical name is
+    # ``ZENOH_SHARED_MEMORY`` but older docs leaked ``ZENOH_SHM_ENABLED``;
+    # if either side picked up the legacy spelling the transport silently
+    # degrades to TCP loopback.
+    legacy_sightings: list[str] = []
+    for cname, env in {**driver_envs, **worker_envs}.items():
+        for legacy, canonical in _LEGACY_ENV_VARS.items():
+            if legacy in env:
+                legacy_sightings.append(
+                    f"{cname}: {legacy}={env[legacy]!r} (use {canonical})"
+                )
+    if legacy_sightings:
+        checks.append(
+            _Check(
+                "env-legacy-names",
+                "warn",
+                "Non-canonical env var names detected — will be ignored",
+                hint=(
+                    "Cyberwave reads only the canonical name. "
+                    "Rename these on the affected containers:\n  "
+                    + "\n  ".join(legacy_sightings)
+                ),
+            )
+        )
+
+    # 7. twin binding: drivers with no twin env publish on undefined keys.
     missing_twin: list[str] = [
         name
         for name, env in driver_envs.items()
@@ -1018,6 +1061,600 @@ def _collect_preflight_checks(workers_dir: Path) -> list[_Check]:
                 ),
             )
         )
+
+    return checks
+
+
+# ---------------------------------------------------------------------------
+# Runtime probes — actually join the Zenoh bus and compare hook key-expressions
+# against live publisher traffic. These complement the static checks above
+# (which only verify "paperwork") with a ground-truth view of what is flowing.
+# ---------------------------------------------------------------------------
+
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+# Canonical key shape: ``cw/<twin-uuid>/data/<channel>[/<sensor>]``. Anything
+# else is considered "unscoped" and won't match twin-scoped hook subscriptions.
+# See cyberwave-sdks/cyberwave-python/cyberwave/data/keys.py for the spec.
+_CANONICAL_KEY_RE = re.compile(
+    r"^cw/"
+    r"(?P<twin>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/"
+    r"data/"
+    r"(?P<channel>[a-z][a-z0-9_]*)"
+    r"(?:/(?P<sensor>[a-z][a-z0-9_]*))?$"
+)
+
+
+@dataclass(frozen=True)
+class _ParsedKey:
+    """Parsed canonical key, or ``None`` at call sites for non-canonical keys."""
+
+    twin: str
+    channel: str
+    sensor: str | None
+
+
+def _parse_canonical_key(key: str) -> _ParsedKey | None:
+    """Return a :class:`_ParsedKey` or ``None`` if *key* isn't canonical."""
+    m = _CANONICAL_KEY_RE.match(key)
+    if not m:
+        return None
+    return _ParsedKey(
+        twin=m.group("twin"), channel=m.group("channel"), sensor=m.group("sensor")
+    )
+
+
+# Maps @cw.on_<method> to (channel base name, whether the channel carries an
+# optional "sensor" qualifier). Mirrors HookRegistry in
+# cyberwave-sdks/cyberwave-python/cyberwave/workers/hooks.py.
+_HOOK_METHOD_MAP: dict[str, tuple[str, bool]] = {
+    "on_frame": ("frames", True),
+    "on_depth": ("depth", True),
+    "on_audio": ("audio", True),
+    "on_pointcloud": ("pointcloud", True),
+    "on_lidar": ("lidar", True),
+    "on_imu": ("imu", False),
+    "on_force_torque": ("force_torque", False),
+    "on_joint_states": ("joint_states", False),
+    "on_attitude": ("attitude", False),
+    "on_gps": ("gps", False),
+    "on_end_effector_pose": ("end_effector_pose", False),
+    "on_gripper_state": ("gripper_state", False),
+    "on_map": ("map", False),
+    "on_battery": ("battery", False),
+    "on_temperature": ("temperature", False),
+}
+
+
+@dataclass(frozen=True)
+class _HookBinding:
+    """One scanned @cw.on_* registration from a worker file."""
+
+    file: str
+    hook_name: str
+    method: str
+    twin_uuid: str
+    channel: str
+    sensor: str | None
+
+    @property
+    def expected_key(self) -> str:
+        # Keys look like ``cw/<uuid>/data/<channel>[/<sensor>]`` — see
+        # cyberwave/data/keys.py. Generic ``on_data`` is skipped by the
+        # scanner (its second positional arg is the channel name and we
+        # don't try to resolve it through the ast).
+        if self.sensor:
+            return f"cw/{self.twin_uuid}/data/{self.channel}/{self.sensor}"
+        return f"cw/{self.twin_uuid}/data/{self.channel}"
+
+    @property
+    def label(self) -> str:
+        return f"{self.file}:{self.hook_name}"
+
+
+def _resolve_str_constant(
+    node: ast.expr, symbols: dict[str, str]
+) -> str | None:
+    """Best-effort resolution of *node* to a str at parse time."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return symbols.get(node.id)
+    return None
+
+
+def _collect_module_symbols(tree: ast.Module) -> dict[str, str]:
+    """Build a symbol table of module-level ``name = "<literal str>"``.
+
+    Covers plain ``ast.Assign`` and annotated ``ast.AnnAssign``. Returns a
+    best-effort map — anything that isn't a trivial literal is skipped.
+    """
+    symbols: dict[str, str] = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    symbols[target.id] = node.value.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            symbols[node.target.id] = node.value.value
+    return symbols
+
+
+def _scan_hook_registrations(filepath: Path) -> list[_HookBinding]:
+    """Statically extract ``@cw.on_*(twin, ...)`` decorators from *filepath*.
+
+    The scanner is deliberately conservative: it resolves twin UUIDs from
+    module-level string literals (plain or annotated assigns). Anything
+    else — dynamically built UUIDs, attribute accesses, function calls,
+    tuple unpacking — is skipped rather than guessed.
+    """
+    try:
+        source = filepath.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+    except (OSError, SyntaxError):
+        return []
+
+    symbols = _collect_module_symbols(tree)
+
+    bindings: list[_HookBinding] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            if not isinstance(dec, ast.Call):
+                continue
+            method = (
+                dec.func.attr
+                if isinstance(dec.func, ast.Attribute)
+                else (dec.func.id if isinstance(dec.func, ast.Name) else None)
+            )
+            if method not in _HOOK_METHOD_MAP or not dec.args:
+                continue
+            channel_base, has_sensor = _HOOK_METHOD_MAP[method]
+            twin_uuid = _resolve_str_constant(dec.args[0], symbols)
+            if not twin_uuid or not _UUID_RE.match(twin_uuid):
+                continue
+            sensor: str | None = "default" if has_sensor else None
+            for kw in dec.keywords:
+                if (
+                    kw.arg == "sensor"
+                    and isinstance(kw.value, ast.Constant)
+                    and isinstance(kw.value.value, str)
+                ):
+                    sensor = kw.value.value
+            bindings.append(
+                _HookBinding(
+                    file=filepath.name,
+                    hook_name=node.name,
+                    method=method,
+                    twin_uuid=twin_uuid,
+                    channel=channel_base,
+                    sensor=sensor,
+                )
+            )
+    return bindings
+
+
+def _listen_to_loopback_connect(listen: str) -> str | None:
+    """Rewrite a container's ``ZENOH_LISTEN`` into a connectable endpoint.
+
+    The doctor runs on the host; container-side listeners that bind
+    ``0.0.0.0`` / ``[::]`` must be rewritten to a loopback address so a
+    host-side Zenoh session can reach them. Non-TCP endpoints are skipped
+    — Zenoh supports ``udp/``, ``quic/``, ``ws/``, etc., but loopback
+    fallback only makes sense for TCP. Comma-separated lists (Zenoh
+    accepts JSON arrays too) are not handled here and skipped.
+    """
+    listen = listen.strip()
+    if not listen or "," in listen or not listen.startswith("tcp/"):
+        return None
+    return listen.replace("tcp/0.0.0.0", "tcp/127.0.0.1").replace(
+        "tcp/[::]", "tcp/[::1]"
+    )
+
+
+def _zenoh_probe_endpoint(
+    driver_containers: list[str], worker_containers: list[str]
+) -> list[str] | None:
+    """Pick a reasonable ``connect/endpoints`` list for the doctor's session.
+
+    We try, in order:
+      1. Any ``ZENOH_LISTEN`` value declared on a running worker/driver
+         container (most accurate on bridge-networked setups).
+      2. The container's bridge IP at port 7447.
+      3. Fall back to ``tcp/127.0.0.1:7447`` — correct when the
+         driver/worker use host networking (the common Linux edge case).
+
+    Returns ``None`` when no running container could be used. The caller
+    is then expected to leave multicast discovery enabled so distant
+    peers on the same network can still be picked up.
+    """
+    from ..monitor import get_container_ip
+
+    candidates = worker_containers + driver_containers
+    for name in candidates:
+        env = _inspect_container_env(name)
+        listen = env.get("ZENOH_LISTEN", "")
+        conn = _listen_to_loopback_connect(listen)
+        if conn:
+            return [conn]
+    for name in candidates:
+        # get_container_ip is only correct for bridge networks — host-mode
+        # containers return no IP, and loopback is the right answer there.
+        ip = get_container_ip(name)
+        if ip:
+            return [f"tcp/{ip}:7447"]
+    if candidates:
+        return ["tcp/127.0.0.1:7447"]
+    return None
+
+
+def _probe_zenoh_bus(
+    *, duration: float, connect: list[str] | None
+) -> tuple[bool, dict[str, int], str | None]:
+    """Subscribe to ``**`` for *duration* seconds. Returns (ok, counts, err).
+
+    When *connect* is ``None`` we leave multicast scouting enabled so the
+    probe has a chance of discovering peers we couldn't enumerate via
+    Docker. When *connect* is set we disable multicast (the endpoint list
+    is authoritative, multicast would just add latency).
+    """
+    try:
+        import zenoh
+    except ImportError:
+        return False, {}, "missing-dep:eclipse-zenoh"
+
+    seen: dict[str, int] = {}
+    session: Any = None
+    subscription: Any = None
+    try:
+        cfg = zenoh.Config()
+        cfg.insert_json5("transport/shared_memory/enabled", "false")
+        if connect:
+            cfg.insert_json5("connect/endpoints", json.dumps(connect))
+            cfg.insert_json5("scouting/multicast/enabled", "false")
+        session = zenoh.open(cfg)
+
+        def _on_sample(sample: Any) -> None:
+            try:
+                key = str(sample.key_expr)
+            except Exception:
+                return
+            seen[key] = seen.get(key, 0) + 1
+
+        subscription = session.declare_subscriber("**", _on_sample)
+        # Give the session ~200ms to complete the TCP handshake before we
+        # start the listening window, so --window 1 actually gives ~1s of
+        # sampling rather than ~0.5s.
+        time.sleep(0.2)
+        time.sleep(max(0.5, duration))
+        return True, seen, None
+    except Exception as exc:  # noqa: BLE001 — zenoh raises many shapes
+        return False, seen, str(exc)
+    finally:
+        if subscription is not None:
+            try:
+                subscription.undeclare()
+            except Exception:
+                pass
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+
+def _diagnose_binding(
+    binding: _HookBinding,
+    seen: dict[str, int],
+    parsed_by_key: dict[str, _ParsedKey],
+) -> tuple[str, str | None]:
+    """Classify *binding* against the observed bus traffic.
+
+    Returns ``(reason, example_key)`` where *reason* is one of:
+
+    * ``"ok"``             — at least one publication matches the hook exactly.
+    * ``"sensor_mismatch"`` — same twin + same base channel, different sensor.
+    * ``"wrong_twin"``     — same base channel + sensor, different twin UUID.
+    * ``"no_publisher"``   — nothing on the bus looks anything like this hook.
+    """
+    expected = binding.expected_key
+    if expected in seen:
+        return "ok", expected
+
+    same_twin_channel = [
+        k
+        for k, p in parsed_by_key.items()
+        if p.twin == binding.twin_uuid and p.channel == binding.channel
+    ]
+    if same_twin_channel:
+        return "sensor_mismatch", same_twin_channel[0]
+
+    wrong_twin = [
+        k
+        for k, p in parsed_by_key.items()
+        if p.channel == binding.channel
+        and p.sensor == binding.sensor
+        and p.twin != binding.twin_uuid
+    ]
+    if wrong_twin:
+        return "wrong_twin", wrong_twin[0]
+
+    return "no_publisher", None
+
+
+def _collect_runtime_checks(
+    workers_dir: Path, *, duration: float
+) -> list[_Check]:
+    """Join the Zenoh bus for a few seconds and compare actual traffic
+    against worker hook key-expressions."""
+    checks: list[_Check] = []
+
+    drivers = _running_driver_containers()
+    workers = _running_worker_containers()
+    connect = _zenoh_probe_endpoint(drivers, workers)
+
+    ok, seen, err = _probe_zenoh_bus(duration=duration, connect=connect)
+
+    if not ok and err == "missing-dep:eclipse-zenoh":
+        checks.append(
+            _Check(
+                "zenoh-liveness",
+                "info",
+                "Runtime probe skipped — eclipse-zenoh not installed on the host",
+                hint=(
+                    "Install it so the doctor can join the bus and verify "
+                    "traffic flow: pip install --user eclipse-zenoh"
+                ),
+            )
+        )
+        return checks
+    if not ok:
+        checks.append(
+            _Check(
+                "zenoh-liveness",
+                "warn",
+                f"Could not open a Zenoh session ({err or 'unknown error'})",
+                hint=(
+                    "The doctor couldn't join the bus, so runtime probes "
+                    "are disabled. Verify a worker/driver container is "
+                    "running and exposing ZENOH_LISTEN (default "
+                    "tcp/0.0.0.0:7447).\n"
+                    f"Attempted connect: {connect or 'default/multicast'}"
+                ),
+            )
+        )
+        return checks
+
+    # Classify every observed key once, up-front. Canonical keys are the
+    # only ones that can possibly feed a twin-scoped hook; everything else
+    # is categorized for reporting.
+    parsed_by_key: dict[str, _ParsedKey] = {}
+    unscoped_keys: list[str] = []
+    monitor_keys: list[str] = []
+    admin_keys: list[str] = []
+    for k in seen:
+        parsed = _parse_canonical_key(k)
+        if parsed is not None:
+            parsed_by_key[k] = parsed
+        elif k.startswith("cw/_monitor/"):
+            monitor_keys.append(k)
+        elif k.startswith("@/"):
+            # Zenoh admin/liveliness keys. Not actionable for users, but
+            # worth counting separately so they don't crowd data in the
+            # top-keys display.
+            admin_keys.append(k)
+        else:
+            unscoped_keys.append(k)
+
+    def _msg_count(keys: list[str] | dict[str, Any]) -> int:
+        return sum(seen[k] for k in keys)
+
+    data_msgs = _msg_count(parsed_by_key)
+    monitor_msgs = _msg_count(monitor_keys)
+    unscoped_msgs = _msg_count(unscoped_keys)
+    admin_msgs = _msg_count(admin_keys)
+    app_msgs = data_msgs + monitor_msgs + unscoped_msgs
+
+    # Silent bus: report once and early-return. Running alignment here
+    # would just duplicate the warning with "no matching publisher
+    # traffic", which the user already knows.
+    #
+    # "Silent" means: no application-level traffic. Zenoh admin/liveliness
+    # keys (``@/...``) alone don't count — they're just peer discovery
+    # heartbeats and prove nothing about whether drivers are publishing.
+    if app_msgs == 0:
+        hint_lines = [
+            "Either no publisher is putting frames, or the doctor can't "
+            "reach the bus from this host. Next steps:",
+            "  • Confirm a driver container is running "
+            "(docker ps --filter name=cyberwave-driver-)",
+            "  • Check the driver isn't disabled via "
+            "CYBERWAVE_PUBLISH_MODE=off",
+            "  • Run `cyberwave worker monitor` for live rates",
+        ]
+        if admin_msgs:
+            hint_lines.append(
+                f"  • Saw {admin_msgs} Zenoh admin message(s) — the bus "
+                "is reachable but no publisher is putting to it."
+            )
+        if not drivers and not workers:
+            hint_lines.append(
+                "  • No cyberwave-driver-* / cyberwave-worker-* containers "
+                "are running locally; the probe used "
+                f"{connect or 'default multicast discovery'}."
+            )
+        checks.append(
+            _Check(
+                "zenoh-liveness",
+                "warn",
+                f"No application traffic seen in {duration:.0f}s"
+                + (f" ({admin_msgs} admin msg(s) only)" if admin_msgs else ""),
+                hint="\n".join(hint_lines),
+            )
+        )
+        return checks
+
+    # Rank top keys with data first (the user cares about what hooks will
+    # see), then monitor + unscoped, then admin as last resort. Within
+    # each tier, sort by message count.
+    def _ranked(keys: list[str] | dict[str, Any]) -> list[tuple[str, int]]:
+        return sorted(((k, seen[k]) for k in keys), key=lambda kv: -kv[1])
+
+    top = (
+        _ranked(parsed_by_key)
+        + _ranked(monitor_keys)
+        + _ranked(unscoped_keys)
+        + _ranked(admin_keys)
+    )[:5]
+    top_lines = [f"{n:>6} msg(s)  {k}" for k, n in top]
+    app_key_count = len(parsed_by_key) + len(monitor_keys) + len(unscoped_keys)
+    summary = (
+        f"{app_msgs} app msg(s) across {app_key_count} key(s) in "
+        f"{duration:.0f}s  ({len(parsed_by_key)} data, "
+        f"{len(monitor_keys)} monitor, {len(unscoped_keys)} unscoped"
+        + (f"; +{len(admin_keys)} admin" if admin_keys else "")
+        + ")"
+    )
+    checks.append(
+        _Check(
+            "zenoh-liveness",
+            "ok",
+            summary,
+            hint="Top keys:\n  " + "\n  ".join(top_lines),
+        )
+    )
+
+    # Flag keys that don't follow the canonical ``cw/<twin>/data/...``
+    # schema. These will never be delivered to a twin-scoped hook, no
+    # matter how many messages they carry. Includes both bare keys
+    # (``frames/color_camera``) and ``cw/``-prefixed but malformed ones
+    # (``cw/camera/frames``).
+    if unscoped_keys:
+        uniq_unscoped = sorted(set(unscoped_keys))
+        sample = uniq_unscoped[:5]
+        checks.append(
+            _Check(
+                "keyexpr-scoping",
+                "warn",
+                f"{len(uniq_unscoped)} key(s) published outside the "
+                "canonical 'cw/<twin>/data/<channel>[/<sensor>]' schema",
+                hint=(
+                    "Twin-scoped worker hooks won't match these keys, so "
+                    "their messages are silently ignored. Fix the publisher "
+                    "to use the canonical schema (build keys with "
+                    "cyberwave.data.keys.build_key).\n"
+                    f"Example keys: {', '.join(sample)}"
+                ),
+            )
+        )
+
+    # Hook alignment: diagnose each @cw.on_* binding individually.
+    bindings: list[_HookBinding] = []
+    if workers_dir.is_dir():
+        for f in sorted(workers_dir.glob("*.py")):
+            bindings.extend(_scan_hook_registrations(f))
+
+    if not bindings:
+        checks.append(
+            _Check(
+                "keyexpr-alignment",
+                "info",
+                "No resolvable @cw.on_* hooks found in worker files",
+                hint=(
+                    "Either no hooks are declared, or the twin UUIDs are "
+                    "not string literals / module-level constants. The "
+                    "scanner only resolves static UUIDs."
+                ),
+            )
+        )
+        return checks
+
+    diagnoses = [
+        (b, *_diagnose_binding(b, seen, parsed_by_key)) for b in bindings
+    ]
+    n_matched = sum(1 for d in diagnoses if d[1] == "ok")
+    unmatched = [d for d in diagnoses if d[1] != "ok"]
+
+    if not unmatched:
+        checks.append(
+            _Check(
+                "keyexpr-alignment",
+                "ok",
+                f"All {n_matched} hook(s) see matching publisher traffic",
+            )
+        )
+        return checks
+
+    # Build a per-hook diagnostic block. Group by reason so users see the
+    # structural bug (sensor mismatch vs wrong twin vs no publisher at all)
+    # instead of a wall of expected-key lines.
+    sections: list[str] = []
+    by_reason: dict[str, list[tuple[_HookBinding, str | None]]] = {
+        "sensor_mismatch": [],
+        "wrong_twin": [],
+        "no_publisher": [],
+    }
+    for b, reason, example in unmatched:
+        by_reason[reason].append((b, example))
+
+    if by_reason["sensor_mismatch"]:
+        sections.append(
+            "Sensor mismatch — hook and publisher agree on the twin and "
+            "channel but not the sensor qualifier:"
+        )
+        for b, ex in by_reason["sensor_mismatch"]:
+            parsed_ex = _parse_canonical_key(ex or "") if ex else None
+            pub_sensor = parsed_ex.sensor if parsed_ex else None
+            hook_sensor_repr = repr(b.sensor) if b.sensor else "(none)"
+            pub_sensor_repr = repr(pub_sensor) if pub_sensor else "(none)"
+            sections.append(
+                f"  {b.label}  hook sensor={hook_sensor_repr}, "
+                f"publisher sensor={pub_sensor_repr}  "
+                f"(expected {b.expected_key}, bus has {ex})"
+            )
+    if by_reason["wrong_twin"]:
+        sections.append(
+            "Wrong twin — channel is flowing, but under a different twin UUID:"
+        )
+        for b, ex in by_reason["wrong_twin"]:
+            sections.append(
+                f"  {b.label}  expects {b.expected_key}  →  bus has {ex}"
+            )
+    if by_reason["no_publisher"]:
+        sections.append(
+            "No publisher — no key on the bus comes close to this hook:"
+        )
+        for b, _ in by_reason["no_publisher"]:
+            sections.append(f"  {b.label}  expects {b.expected_key}")
+
+    sections.append(
+        "Compare to the 'zenoh-liveness' top-keys list above and verify "
+        "the twin/sensor the driver publishes under match @cw.on_*()."
+    )
+
+    checks.append(
+        _Check(
+            "keyexpr-alignment",
+            "warn",
+            f"{len(unmatched)} of {len(bindings)} hook(s) have no "
+            "matching publisher traffic",
+            hint="\n".join(sections),
+        )
+    )
 
     return checks
 
@@ -1047,28 +1684,66 @@ def _print_preflight_checks(checks: list[_Check], *, verbose: bool) -> None:
     is_flag=True,
     help="Show hints for passing checks too",
 )
-def worker_doctor(verbose: bool) -> None:
+@click.option(
+    "--runtime/--no-runtime",
+    default=True,
+    show_default=True,
+    help=(
+        "Run the live-bus probe: subscribe to Zenoh for a few seconds and "
+        "compare actual traffic against worker hook key-expressions. "
+        "Disable with --no-runtime for a pure-paperwork check."
+    ),
+)
+@click.option(
+    "--window",
+    default=3.0,
+    type=float,
+    show_default=True,
+    help="Seconds to listen on the Zenoh bus during the runtime probe",
+)
+def worker_doctor(verbose: bool, runtime: bool, window: float) -> None:
     """Diagnose why a worker may not receive frames.
 
-    Runs a set of fast, local checks against the edge host and reports the
-    most common silent failure modes: missing edge-core, worker files the
-    container user can't read, absent co-located drivers, and environment
-    variable drift between driver and worker containers.
+    Runs two groups of checks:
+
+    \b
+    1. Static (paperwork): edge-core/docker present, worker files readable,
+       co-located drivers running, env-var agreement between driver and
+       worker containers, twin bindings.
+    2. Runtime (actual traffic): opens a short Zenoh subscription to '**',
+       counts keys seen, and checks that every @cw.on_* hook declared in
+       your worker files has a matching publisher on the bus. Catches the
+       main 'paperwork OK, nothing flowing' failure mode.
 
     \b
     Examples:
         cyberwave worker doctor
         cyberwave worker doctor --verbose
+        cyberwave worker doctor --no-runtime      # skip the 3s bus probe
+        cyberwave worker doctor --window 6        # longer runtime probe
     """
     workers_dir = _get_workers_dir()
     console.print("\n[bold]Cyberwave worker doctor[/bold]\n")
     console.print(f"[dim]Workers directory: {workers_dir}[/dim]\n")
 
-    checks = _collect_preflight_checks(workers_dir)
-    _print_preflight_checks(checks, verbose=verbose)
+    console.print("[bold]Static checks[/bold]")
+    static_checks = _collect_preflight_checks(workers_dir)
+    _print_preflight_checks(static_checks, verbose=verbose)
 
-    errors = sum(1 for c in checks if c.level == "error")
-    warnings = sum(1 for c in checks if c.level == "warn")
+    runtime_checks: list[_Check] = []
+    if runtime:
+        console.print(
+            "\n[bold]Runtime checks[/bold]  "
+            f"[dim](probing Zenoh for {window:.0f}s)[/dim]"
+        )
+        runtime_checks = _collect_runtime_checks(workers_dir, duration=window)
+        _print_preflight_checks(runtime_checks, verbose=verbose)
+    else:
+        console.print("\n[dim]Runtime checks skipped (--no-runtime).[/dim]")
+
+    all_checks = static_checks + runtime_checks
+    errors = sum(1 for c in all_checks if c.level == "error")
+    warnings = sum(1 for c in all_checks if c.level == "warn")
     console.print()
     if errors:
         console.print(f"[red]{errors} blocking issue(s)[/red], {warnings} warning(s)")
@@ -1076,4 +1751,4 @@ def worker_doctor(verbose: bool) -> None:
     if warnings:
         console.print(f"[yellow]{warnings} warning(s)[/yellow] — worker may still run")
         return
-    console.print("[green]All pre-flight checks passed.[/green]")
+    console.print("[green]All checks passed.[/green]")

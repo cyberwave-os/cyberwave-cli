@@ -327,7 +327,7 @@ def test_doctor_exits_nonzero_on_blocking_issue() -> None:
             patch.object(wm, "_find_edge_core_binary", return_value=None),
             patch.object(wm.shutil, "which", return_value=None),
         ):
-            result = runner.invoke(wm.worker, ["doctor"])
+            result = runner.invoke(wm.worker, ["doctor", "--no-runtime"])
         assert result.exit_code == 1, result.output
         assert "edge-core" in result.output
 
@@ -348,5 +348,469 @@ def test_doctor_exits_zero_when_only_warnings() -> None:
                 patch.object(wm, "_find_edge_core_binary", return_value="/usr/bin/cwec")
             )
             _apply_docker_patches(stack, wm, drivers=[])
-            result = runner.invoke(wm.worker, ["doctor"])
+            result = runner.invoke(wm.worker, ["doctor", "--no-runtime"])
         assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
+# doctor: legacy env var detection
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_flags_legacy_zenoh_shm_env() -> None:
+    """The canonical env is ``ZENOH_SHARED_MEMORY``. If a container has
+    the legacy/typo'd ``ZENOH_SHM_ENABLED`` we must surface a warning."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        (wd / "w.py").write_text("import cw\n")
+        (wd / "w.py").chmod(0o644)
+        envs = {
+            "cyberwave-driver-a": {
+                "CYBERWAVE_ENVIRONMENT": "prod",
+                "ZENOH_SHM_ENABLED": "true",
+            },
+        }
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch.object(wm, "_find_edge_core_binary", return_value="/usr/bin/cwec")
+            )
+            _apply_docker_patches(stack, wm, drivers=list(envs), envs=envs)
+            checks = wm._collect_preflight_checks(wd)
+        named = {c.name: c for c in checks}
+        assert named.get("env-legacy-names") is not None
+        assert named["env-legacy-names"].level == "warn"
+        assert "ZENOH_SHARED_MEMORY" in (named["env-legacy-names"].hint or "")
+
+
+# ---------------------------------------------------------------------------
+# doctor: hook scanner (static AST scan of worker files)
+# ---------------------------------------------------------------------------
+
+
+_TWIN_A = "11111111-1111-1111-1111-111111111111"
+_TWIN_B = "22222222-2222-2222-2222-222222222222"
+
+
+def test_hook_scanner_resolves_literal_uuid_and_sensor() -> None:
+    """Literal UUIDs and the ``sensor=`` kwarg flow through to the expected key."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / "w.py"
+        f.write_text(
+            f"""
+import cw
+
+@cw.on_frame("{_TWIN_A}", sensor="front")
+def handle(frame, ctx):
+    pass
+"""
+        )
+        bindings = wm._scan_hook_registrations(f)
+    assert len(bindings) == 1
+    b = bindings[0]
+    assert b.twin_uuid == _TWIN_A
+    assert b.channel == "frames"
+    assert b.sensor == "front"
+    assert b.expected_key == f"cw/{_TWIN_A}/data/frames/front"
+
+
+def test_hook_scanner_resolves_module_level_constant() -> None:
+    """UUID bound to a module-level string constant must be resolved."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / "w.py"
+        f.write_text(
+            f"""
+import cw
+
+TWIN = "{_TWIN_A}"
+
+@cw.on_joint_states(TWIN)
+def handle(js, ctx):
+    pass
+"""
+        )
+        bindings = wm._scan_hook_registrations(f)
+    assert len(bindings) == 1
+    assert bindings[0].expected_key == f"cw/{_TWIN_A}/data/joint_states"
+
+
+def test_hook_scanner_skips_unresolvable_uuids() -> None:
+    """Non-literal, non-module-level UUIDs are skipped (rather than guessed)."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / "w.py"
+        f.write_text(
+            """
+import os
+import cw
+
+@cw.on_frame(os.environ["TWIN"])
+def handle(frame, ctx):
+    pass
+"""
+        )
+        bindings = wm._scan_hook_registrations(f)
+    assert bindings == []
+
+
+# ---------------------------------------------------------------------------
+# doctor: runtime checks (keyexpr alignment with mocked zenoh probe)
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_checks_flag_wrong_twin_publisher() -> None:
+    """If the driver publishes on a different twin than the hook listens on,
+    keyexpr-alignment must warn with a root-cause pointer."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        (wd / "w.py").write_text(
+            f'''import cw
+
+@cw.on_frame("{_TWIN_A}", sensor="default")
+def handle(frame, ctx):
+    pass
+'''
+        )
+
+        seen = {
+            # Driver is putting frames under a DIFFERENT twin UUID.
+            f"cw/{_TWIN_B}/data/frames/default": 150,
+            "cw/_monitor/worker_stats": 3,
+        }
+        with (
+            patch.object(wm, "_probe_zenoh_bus", return_value=(True, seen, None)),
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+            patch.object(wm, "_running_worker_containers", return_value=[]),
+        ):
+            checks = wm._collect_runtime_checks(wd, duration=0.1)
+    named = {c.name: c for c in checks}
+    assert named["zenoh-liveness"].level == "ok"
+    assert named["keyexpr-alignment"].level == "warn"
+    # The hint must surface the "same channel, different twin" diagnosis.
+    hint = named["keyexpr-alignment"].hint or ""
+    assert _TWIN_B in hint or "different twin" in hint
+
+
+def test_runtime_checks_pass_when_hook_sees_traffic() -> None:
+    """Matching publisher traffic must produce an OK keyexpr-alignment check."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        (wd / "w.py").write_text(
+            f'''import cw
+
+@cw.on_frame("{_TWIN_A}")
+def handle(frame, ctx):
+    pass
+'''
+        )
+
+        seen = {f"cw/{_TWIN_A}/data/frames/default": 120}
+        with (
+            patch.object(wm, "_probe_zenoh_bus", return_value=(True, seen, None)),
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+            patch.object(wm, "_running_worker_containers", return_value=[]),
+        ):
+            checks = wm._collect_runtime_checks(wd, duration=0.1)
+    named = {c.name: c for c in checks}
+    assert named["keyexpr-alignment"].level == "ok"
+
+
+def test_runtime_checks_flag_unscoped_keys() -> None:
+    """A publisher putting to ``frames/color_camera`` (no twin prefix) must
+    be called out, because twin-scoped hooks will silently drop it."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        seen = {"frames/color_camera": 90}
+        with (
+            patch.object(wm, "_probe_zenoh_bus", return_value=(True, seen, None)),
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+            patch.object(wm, "_running_worker_containers", return_value=[]),
+        ):
+            checks = wm._collect_runtime_checks(wd, duration=0.1)
+    named = {c.name: c for c in checks}
+    assert named["keyexpr-scoping"].level == "warn"
+    assert "frames/color_camera" in (named["keyexpr-scoping"].hint or "")
+
+
+def test_runtime_checks_warn_on_silent_bus() -> None:
+    """Zero messages in the probe window is a warning, not a pass."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        with (
+            patch.object(wm, "_probe_zenoh_bus", return_value=(True, {}, None)),
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+            patch.object(wm, "_running_worker_containers", return_value=[]),
+        ):
+            checks = wm._collect_runtime_checks(wd, duration=0.1)
+    named = {c.name: c for c in checks}
+    assert named["zenoh-liveness"].level == "warn"
+
+
+def test_runtime_checks_info_when_zenoh_not_installed() -> None:
+    """Missing eclipse-zenoh should degrade gracefully to an info check."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        with (
+            patch.object(
+                wm,
+                "_probe_zenoh_bus",
+                return_value=(False, {}, "missing-dep:eclipse-zenoh"),
+            ),
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+            patch.object(wm, "_running_worker_containers", return_value=[]),
+        ):
+            checks = wm._collect_runtime_checks(wd, duration=0.1)
+    named = {c.name: c for c in checks}
+    assert named["zenoh-liveness"].level == "info"
+
+
+def test_runtime_checks_warn_on_session_open_error() -> None:
+    """A Zenoh connect error (session open failure) must warn, not crash."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        with (
+            patch.object(
+                wm,
+                "_probe_zenoh_bus",
+                return_value=(False, {}, "Connection refused"),
+            ),
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+            patch.object(wm, "_running_worker_containers", return_value=[]),
+        ):
+            checks = wm._collect_runtime_checks(wd, duration=0.1)
+    named = {c.name: c for c in checks}
+    assert named["zenoh-liveness"].level == "warn"
+    assert "Connection refused" in (named["zenoh-liveness"].message or "")
+    # And no downstream keyexpr-* checks (the probe failed).
+    assert "keyexpr-alignment" not in named
+    assert "keyexpr-scoping" not in named
+
+
+def test_runtime_checks_admin_only_bus_is_silent() -> None:
+    """A bus with only Zenoh admin/liveliness traffic (``@/...``) is
+    effectively silent — no driver is publishing — and must be flagged
+    as such rather than showing an "ok" liveness with admin keys in the
+    top-5 list."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        seen = {
+            "@/liveliness/router/abc": 8,
+            "@/meta/keyexpr/defs": 2,
+        }
+        with (
+            patch.object(wm, "_probe_zenoh_bus", return_value=(True, seen, None)),
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+            patch.object(wm, "_running_worker_containers", return_value=[]),
+        ):
+            checks = wm._collect_runtime_checks(wd, duration=0.1)
+    named = {c.name: c for c in checks}
+    assert named["zenoh-liveness"].level == "warn"
+    # Admin-only scenario must be called out explicitly so the user knows
+    # "reachable but no publisher".
+    assert "admin" in (named["zenoh-liveness"].hint or "").lower()
+    # No bogus keyexpr-* checks when there's no app traffic.
+    assert "keyexpr-alignment" not in named
+    assert "keyexpr-scoping" not in named
+
+
+def test_runtime_checks_top_keys_prioritize_data_over_admin() -> None:
+    """Data keys must show up at the top of the liveness display even when
+    admin heartbeats are noisier."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        seen = {
+            "@/liveliness/router/abc": 500,  # very chatty admin
+            f"cw/{_TWIN_A}/data/frames/default": 10,  # real data, lower count
+        }
+        with (
+            patch.object(wm, "_probe_zenoh_bus", return_value=(True, seen, None)),
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+            patch.object(wm, "_running_worker_containers", return_value=[]),
+        ):
+            checks = wm._collect_runtime_checks(wd, duration=0.1)
+    named = {c.name: c for c in checks}
+    assert named["zenoh-liveness"].level == "ok"
+    hint = named["zenoh-liveness"].hint or ""
+    # The data key comes first in Top keys, above the admin key, despite
+    # the admin key having 50x the traffic.
+    data_pos = hint.find(f"cw/{_TWIN_A}/data/frames/default")
+    admin_pos = hint.find("@/liveliness/router/abc")
+    assert data_pos != -1 and admin_pos != -1
+    assert data_pos < admin_pos, hint
+
+
+def test_runtime_checks_silent_bus_skips_alignment() -> None:
+    """Silent bus must short-circuit — a duplicate "no matching publisher"
+    warning would just add noise."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        (wd / "w.py").write_text(
+            f'''import cw
+
+@cw.on_frame("{_TWIN_A}")
+def handle(frame, ctx):
+    pass
+'''
+        )
+        with (
+            patch.object(wm, "_probe_zenoh_bus", return_value=(True, {}, None)),
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+            patch.object(wm, "_running_worker_containers", return_value=[]),
+        ):
+            checks = wm._collect_runtime_checks(wd, duration=0.1)
+    named = {c.name: c for c in checks}
+    assert named["zenoh-liveness"].level == "warn"
+    assert "keyexpr-alignment" not in named
+    assert "keyexpr-scoping" not in named
+
+
+def test_runtime_checks_require_exact_key_match() -> None:
+    """Subscribers attach to literal keys — extra trailing segments on the
+    published key must NOT count as a match (the SDK wouldn't deliver it)."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        (wd / "w.py").write_text(
+            f'''import cw
+
+@cw.on_frame("{_TWIN_A}", sensor="default")
+def handle(frame, ctx):
+    pass
+'''
+        )
+
+        # Publisher puts on a *longer* key than the hook expects. Zenoh
+        # literal-key subscriptions would silently drop this, so alignment
+        # must flag it as unmatched.
+        seen = {f"cw/{_TWIN_A}/data/frames/default/extra": 90}
+        with (
+            patch.object(wm, "_probe_zenoh_bus", return_value=(True, seen, None)),
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+            patch.object(wm, "_running_worker_containers", return_value=[]),
+        ):
+            checks = wm._collect_runtime_checks(wd, duration=0.1)
+    named = {c.name: c for c in checks}
+    assert named["keyexpr-alignment"].level == "warn"
+
+
+def test_runtime_checks_flag_sensor_mismatch() -> None:
+    """The user's original bug: hook listens on default sensor, driver
+    publishes on color_camera. Must be diagnosed specifically."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        (wd / "w.py").write_text(
+            f'''import cw
+
+@cw.on_frame("{_TWIN_A}")
+def handle(frame, ctx):
+    pass
+'''
+        )
+
+        seen = {f"cw/{_TWIN_A}/data/frames/color_camera": 120}
+        with (
+            patch.object(wm, "_probe_zenoh_bus", return_value=(True, seen, None)),
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+            patch.object(wm, "_running_worker_containers", return_value=[]),
+        ):
+            checks = wm._collect_runtime_checks(wd, duration=0.1)
+    named = {c.name: c for c in checks}
+    assert named["keyexpr-alignment"].level == "warn"
+    hint = named["keyexpr-alignment"].hint or ""
+    assert "Sensor mismatch" in hint
+    assert f"cw/{_TWIN_A}/data/frames/color_camera" in hint
+
+
+def test_canonical_key_parser_accepts_valid_and_rejects_invalid() -> None:
+    """Unit guard around _parse_canonical_key / _CANONICAL_KEY_RE."""
+    wm = _module()
+    p = wm._parse_canonical_key(f"cw/{_TWIN_A}/data/frames/default")
+    assert p is not None
+    assert p.twin == _TWIN_A and p.channel == "frames" and p.sensor == "default"
+
+    p_nosens = wm._parse_canonical_key(f"cw/{_TWIN_A}/data/joint_states")
+    assert p_nosens is not None
+    assert p_nosens.sensor is None
+
+    # Too many trailing segments — not canonical.
+    assert (
+        wm._parse_canonical_key(f"cw/{_TWIN_A}/data/frames/default/extra") is None
+    )
+    # Non-UUID "twin".
+    assert wm._parse_canonical_key("cw/camera/data/frames") is None
+    # Bare key (the case that caused the user's silent failure).
+    assert wm._parse_canonical_key("frames/color_camera") is None
+    # Uppercase channel — not canonical per the SDK's validator.
+    assert wm._parse_canonical_key(f"cw/{_TWIN_A}/data/Frames") is None
+
+
+def test_listen_to_loopback_connect_handles_variants() -> None:
+    """ZENOH_LISTEN parsing: TCP IPv4/IPv6 get rewritten, others bail out."""
+    wm = _module()
+    assert (
+        wm._listen_to_loopback_connect("tcp/0.0.0.0:7447")
+        == "tcp/127.0.0.1:7447"
+    )
+    assert (
+        wm._listen_to_loopback_connect("tcp/[::]:7447") == "tcp/[::1]:7447"
+    )
+    assert (
+        wm._listen_to_loopback_connect("tcp/192.168.1.4:7447")
+        == "tcp/192.168.1.4:7447"
+    )
+    # Non-TCP and empty/comma-list inputs are skipped — we can't safely
+    # rewrite them to a loopback form.
+    assert wm._listen_to_loopback_connect("udp/0.0.0.0:7447") is None
+    assert wm._listen_to_loopback_connect("quic/0.0.0.0:7447") is None
+    assert wm._listen_to_loopback_connect("") is None
+    assert (
+        wm._listen_to_loopback_connect(
+            "tcp/0.0.0.0:7447,tcp/192.168.1.4:7447"
+        )
+        is None
+    )
+
+
+def test_scanner_resolves_annotated_module_constant() -> None:
+    """``TWIN: str = "uuid"`` (PEP 526 annotation) must still be resolved."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / "w.py"
+        f.write_text(
+            f"""
+import cw
+
+TWIN: str = "{_TWIN_A}"
+
+@cw.on_frame(TWIN, sensor="color_camera")
+def handle(frame, ctx):
+    pass
+"""
+        )
+        bindings = wm._scan_hook_registrations(f)
+    assert len(bindings) == 1
+    assert bindings[0].expected_key == f"cw/{_TWIN_A}/data/frames/color_camera"

@@ -205,21 +205,46 @@ Streams logs from the edge worker container (requires Docker).
 ### `cyberwave worker doctor`
 
 ```bash
-cyberwave worker doctor              # run a set of local sanity checks
-cyberwave worker doctor --verbose    # also show hints for passing checks
+cyberwave worker doctor                 # static + runtime checks (default)
+cyberwave worker doctor --verbose       # show hints for passing checks too
+cyberwave worker doctor --no-runtime    # skip the live-bus probe
+cyberwave worker doctor --window 6      # longer runtime probe (seconds)
 ```
 
 Diagnoses the common silent failure modes where a worker container looks
-healthy but hooks report `frames: 0`. Checks include:
+healthy but hooks report `frames: 0`. The doctor runs two groups of checks.
+
+**Static ("paperwork") checks:**
 
 - `cyberwave-edge-core` is installed;
 - worker files in `{CONFIG_DIR}/workers/` are world-readable (UID 1001 needs to read them);
 - at least one `cyberwave-driver-*` container is running on this host;
-- `CYBERWAVE_ENVIRONMENT` and `ZENOH_CONNECT` agree between the host and any
-  running driver containers.
+- `CYBERWAVE_ENVIRONMENT`, `ZENOH_CONNECT`, `CYBERWAVE_DATA_BACKEND` and
+  `ZENOH_SHARED_MEMORY` agree between the running driver and worker containers;
+- no known legacy env-var spellings slip through — currently
+  `ZENOH_SHM_ENABLED` (superseded by `ZENOH_SHARED_MEMORY`). Other
+  legacy names may be added as they're discovered; the check is
+  deliberately conservative and only flags names we've explicitly
+  mapped.
 
-`cyberwave worker start` now invokes the same checks as a pre-flight; pass
-`--skip-preflight` to bypass them.
+**Runtime checks** — open a short Zenoh subscription to `**` and compare
+live traffic against every `@cw.on_*(<twin>)` hook declared in the worker
+files. Three distinct diagnoses are emitted:
+
+- **Sensor mismatch** — hook listens on `sensor="default"` but the driver
+  publishes on another sensor name (or vice-versa).
+- **Wrong twin** — the channel is flowing, but under a different twin
+  UUID than the hook expects.
+- **Unscoped keys** — a publisher is putting to e.g. `frames/color_camera`
+  without the canonical `cw/<twin>/data/...` prefix; twin-scoped hooks
+  silently drop these.
+
+Requires `eclipse-zenoh` on the host (`pip install --user eclipse-zenoh`).
+When missing, the runtime section degrades to an info message.
+
+`cyberwave worker start` still invokes only the static checks as a
+pre-flight (no bus probe, to keep startup fast); pass `--skip-preflight`
+to bypass them.
 
 ### `cyberwave worker monitor`
 
