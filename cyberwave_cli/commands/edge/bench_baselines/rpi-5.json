@@ -1,0 +1,18 @@
+{
+  "device_class": "rpi-5",
+  "recorded_at": "2026-04-17T00:00:00Z",
+  "cyberwave_cli_version": null,
+  "cyberwave_version": null,
+  "provisional": true,
+  "note": "Provisional baseline for Raspberry Pi 5 (8 GB). Extrapolated at ~0.20x the x86-laptop reference. Re-bless on real hardware with active cooling using `cyberwave edge bench --save-baseline rpi-5.json`.",
+  "metrics": {
+    "header_pack":      {"ops_per_s": 6820,    "ns_per_op": 146628},
+    "decode_zero_copy": {"ops_per_s": 5780,    "ns_per_op": 173010},
+    "decode_with_copy": {"ops_per_s": 3120,    "ns_per_op": 320512},
+    "stats_lockfree":   {"ops_per_s": 1833000, "ns_per_op": 546},
+    "stats_locked":     {"ops_per_s": 662000,  "ns_per_op": 1510},
+    "seq_itertools":    {"ops_per_s": 2780000, "ns_per_op": 360},
+    "seq_locked":       {"ops_per_s": 805000,  "ns_per_op": 1242},
+    "decode_mb_s":      5321
+  }
+}

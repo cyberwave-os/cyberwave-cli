@@ -80,6 +80,7 @@ This command will guide you to your first-time setup of your edge device.
 | `camera`      | Bootstrap a camera edge project                               |
 | `so101`       | Bootstrap an SO-101 robot arm project                         |
 | `manifest`    | Validate `cyberwave.yml` manifests                            |
+| `edge bench`  | Benchmark Zenoh SDK hot paths vs a per-device baseline        |
 
 ## `cyberwave twin`
 
@@ -511,6 +512,76 @@ cyberwave edge driver stop cyberwave-driver-624d7fe2    # directly by name
 ```bash
 sudo systemctl stop cyberwave-video-grabber.service
 ```
+
+### `cyberwave edge bench`
+
+Micro-benchmark the Zenoh SDK hot paths (header pack, sample decode, stats
+accounting, sequence numbering) and compare every metric against a per-device
+baseline shipped with the CLI. Prints a device fingerprint, a results table
+with `Baseline ops/s` / `Delta` / `Status` columns, and a pass/fail report
+card. Exits with code `2` when any metric regresses beyond the threshold, so
+CI on a reference device can gate merges.
+
+```bash
+# Default run (~30s on a modern laptop): 100k rounds, 2k warmup, 3 repeats,
+# 15% regression threshold, auto-selected baseline.
+cyberwave edge bench
+
+# Tighter threshold + capture the full run result for later diffing.
+cyberwave edge bench --threshold 0.10 --output /tmp/bench.json
+
+# Pin to CPU 0 on Linux for quieter numbers.
+cyberwave edge bench --pin
+
+# Skip baseline comparison (just print raw numbers).
+cyberwave edge bench --no-compare
+```
+
+**How the "device" is resolved**
+
+The command auto-detects a `device_class` slug (e.g. `jetson-orin-nano`,
+`rpi-5`, `x86-laptop`, `apple-silicon`) from `/proc/device-tree/model`,
+`/etc/nv_tegra_release`, `platform.machine()`, and (on Linux x86_64) whether
+a battery is present. It then loads `bench_baselines/{device_class}.json`
+from the CLI package, falling back to `generic-{arch}.json` when there is no
+exact match. Use `--baseline <path>` to override.
+
+**Blessing a baseline for a new device class**
+
+Ship-level baselines live inside the CLI package. To replace a provisional
+baseline with real numbers captured on reference hardware:
+
+```bash
+# On the reference device (stable load, active cooling / MAXN power mode):
+cyberwave edge bench \
+    --rounds 500000 --warmup 20000 --repeat 5 --pin \
+    --save-baseline ./jetson-orin-nano.json
+
+# Then move the file into the package and commit.
+```
+
+The saved file uses the same schema the bench consumes. Set
+`"provisional": false` once you are happy with the numbers. The file name
+must match the `device_class` slug the fingerprint reports.
+
+**Options**
+
+| Flag | Default | Purpose |
+| ---- | ------- | ------- |
+| `-n, --rounds` | `100000` | Iterations per timed pass. |
+| `--warmup` | `2000` | Un-timed warmup iterations before timing. |
+| `--repeat` | `3` | Timed passes per benchmark; the median is reported. |
+| `--threshold` | `0.15` | Regression threshold (fraction). |
+| `--baseline PATH` | - | Override the auto-selected baseline file. |
+| `--save-baseline PATH` | - | Write this run's metrics as a baseline file. |
+| `--output PATH` | - | Write the full run result (fingerprint + metrics + deltas) as JSON. |
+| `--pin` | `false` | Pin the bench to CPU 0 (Linux). |
+| `--no-compare` | `false` | Skip baseline lookup and comparison. |
+
+**Exit codes**: `0` when every metric is within threshold (or no baseline is
+available), `2` when one or more metrics regress.
+
+<!-- End of edge bench -->
 
 ## `cyberwave compute`
 

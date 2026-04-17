@@ -1,0 +1,33 @@
+{
+  "device_class": "x86-laptop",
+  "recorded_at": "2026-04-17T09:21:49Z",
+  "cyberwave_cli_version": null,
+  "cyberwave_version": null,
+  "provisional": false,
+  "note": "Reference baseline captured on a 2018 mobile workstation (Intel i7-8850H, 12 logical cores @ 4.3 GHz, 15 GB RAM, Linux 6.17, Python 3.12, NumPy 1.26). Older than a modern laptop on purpose so new/faster x86 laptops naturally show up as 'improved'. Re-bless on a newer dev machine when we have one.",
+  "bench_config": {
+    "rounds": 500000,
+    "warmup": 20000,
+    "repeat": 5,
+    "pin": true
+  },
+  "source_device": {
+    "hostname": "blade",
+    "cpu": "Intel(R) Core(TM) i7-8850H CPU @ 2.60GHz",
+    "cpu_cores_logical": 12,
+    "cpu_freq_mhz_max": 4300,
+    "ram_gb": 15.2,
+    "accelerator": "NVIDIA Quadro P3200 with Max-Q Design",
+    "os": "Linux 6.17.0-19-generic"
+  },
+  "metrics": {
+    "header_pack":      {"ops_per_s": 34100,    "ns_per_op": 29311},
+    "decode_zero_copy": {"ops_per_s": 28900,    "ns_per_op": 34639},
+    "decode_with_copy": {"ops_per_s": 15600,    "ns_per_op": 64190},
+    "stats_lockfree":   {"ops_per_s": 9167000,  "ns_per_op": 109},
+    "stats_locked":     {"ops_per_s": 3312000,  "ns_per_op": 302},
+    "seq_itertools":    {"ops_per_s": 13900000, "ns_per_op": 72},
+    "seq_locked":       {"ops_per_s": 4024000,  "ns_per_op": 248},
+    "decode_mb_s":      26606
+  }
+}
