@@ -27,8 +27,10 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import click
 from rich.console import Console
@@ -68,6 +70,26 @@ _CW_MODELS_LOAD_RE = re.compile(
 )
 
 
+_UUID_PATTERN = (
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+# Match ``@cw.on_frame(<uuid>, sensor='<name>'?)``.  Covers the common forms
+# produced by the workflow codegen and handwritten workers; uses a permissive
+# body matcher on the decorator call so extra kwargs (fps=, etc.) don't break
+# parsing.  Fancy cases (dynamic twin UUIDs, multi-line decorators) are
+# ignored — the probe is a best-effort static check.
+_CW_ON_FRAME_RE = re.compile(
+    r"""@cw\.on_frame\(\s*['"](?P<twin>""" + _UUID_PATTERN + r""")['"]"""
+    r"""(?P<rest>[^)]*)\)""",
+    re.MULTILINE,
+)
+
+_SENSOR_KWARG_RE = re.compile(
+    r"""sensor\s*=\s*['"](?P<sensor>[a-zA-Z_][a-zA-Z0-9_]*|\*)['"]"""
+)
+
+
 def _scan_model_ids(filepath: Path) -> list[str]:
     """Return deduplicated model IDs referenced by ``cw.models.load(...)`` in *filepath*."""
     try:
@@ -82,6 +104,30 @@ def _scan_model_ids(filepath: Path) -> list[str]:
             seen.add(model_id)
             result.append(model_id)
     return result
+
+
+def _scan_frame_hooks(filepath: Path) -> list[tuple[str, str | None]]:
+    """Return ``(twin_uuid, sensor_or_None)`` pairs for every static
+    ``@cw.on_frame(...)`` decorator in *filepath*.
+
+    A ``None`` sensor means the decorator didn't pin a sensor and the SDK
+    will subscribe with a wildcard that matches any camera on the twin.
+    """
+    try:
+        source = filepath.read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    hooks: list[tuple[str, str | None]] = []
+    for match in _CW_ON_FRAME_RE.finditer(source):
+        twin_uuid = match.group("twin")
+        rest = match.group("rest") or ""
+        sensor_match = _SENSOR_KWARG_RE.search(rest)
+        sensor = sensor_match.group("sensor") if sensor_match else None
+        if sensor == "*":
+            sensor = None
+        hooks.append((twin_uuid, sensor))
+    return hooks
 
 
 def _find_worker_container(*, include_stopped: bool = False) -> str | None:
@@ -1030,6 +1076,328 @@ _LEVEL_GLYPHS = {
 }
 
 
+def _observe_zenoh_keys(
+    *,
+    container_name: str | None,
+    duration: float = 2.0,
+) -> tuple[bool, set[str], str]:
+    """Open a short-lived Zenoh session and collect publish keys under
+    ``cw/**``.  Returns ``(ok, keys, reason)``.
+
+    ``ok`` is False when Zenoh isn't available or the session can't be
+    opened — in that case ``reason`` explains why, and ``keys`` is empty.
+    """
+    try:
+        import zenoh  # type: ignore[import-not-found]
+    except ImportError:
+        return (
+            False,
+            set(),
+            "zenoh not installed (pip install eclipse-zenoh)",
+        )
+
+    from ..monitor import ZENOH_LISTEN_PORT, get_container_ip  # local import
+
+    observed: set[str] = set()
+    lock = threading.Lock()
+
+    from cyberwave.data.zenoh_backend import extract_sample_key_expr
+
+    def _on_sample(sample: Any) -> None:
+        key = extract_sample_key_expr(sample)
+        if key:
+            with lock:
+                observed.add(key)
+
+    connect: list[str] | None = None
+    if container_name:
+        import platform as _platform
+
+        if _platform.system() == "Darwin":
+            connect = [f"tcp/127.0.0.1:{ZENOH_LISTEN_PORT}"]
+        else:
+            ip = get_container_ip(container_name)
+            connect = (
+                [f"tcp/{ip}:{ZENOH_LISTEN_PORT}"]
+                if ip
+                else [f"tcp/127.0.0.1:{ZENOH_LISTEN_PORT}"]
+            )
+
+    session = None
+    sub = None
+    try:
+        cfg = zenoh.Config()
+        if connect:
+            cfg.insert_json5("connect/endpoints", json.dumps(connect))
+        cfg.insert_json5("transport/shared_memory/enabled", "false")
+        cfg.insert_json5("scouting/multicast/enabled", "false")
+        session = zenoh.open(cfg)
+        sub = session.declare_subscriber("cw/**", _on_sample)
+        time.sleep(duration)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user
+        return (False, set(), f"zenoh session error: {exc}")
+    finally:
+        if sub is not None:
+            try:
+                sub.undeclare()
+            except Exception:
+                pass
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    with lock:
+        return (True, set(observed), "")
+
+
+def _keyexpr_intersects(expected: str, observed: str) -> bool:
+    """Return True when an observed key falls under an expected subscription
+    key expression.  Handles ``**`` (zero-or-more segments) and ``*``
+    (exactly one segment) in *expected*.  ``**`` is consumed greedily so
+    ``frames/**`` matches both ``frames`` and ``frames/a/b/c``.
+    """
+    if expected == observed:
+        return True
+    exp_parts = expected.split("/")
+    obs_parts = observed.split("/")
+    i = j = 0
+    while i < len(exp_parts):
+        e = exp_parts[i]
+        if e == "**":
+            return True  # matches zero or more remaining segments
+        if j >= len(obs_parts):
+            return False
+        if e == "*" or e == obs_parts[j]:
+            i += 1
+            j += 1
+            continue
+        return False
+    return j == len(obs_parts)
+
+
+_CW_TWIN_KEY_RE = re.compile(r"^cw/(?P<twin>[^/]+)/data/")
+
+
+def _twin_uuids_from_keys(observed: set[str]) -> set[str]:
+    """Extract the twin-UUID segment from ``cw/<twin>/data/...`` keys."""
+    out: set[str] = set()
+    for key in observed:
+        m = _CW_TWIN_KEY_RE.match(key)
+        if m:
+            out.add(m.group("twin"))
+    return out
+
+
+def _collect_driver_twin_binding_checks(
+    observed_twins: set[str],
+    driver_envs: dict[str, dict[str, str]],
+) -> list[_Check]:
+    """Validate the ``one driver ⇄ one twin`` deployment invariant against
+    observed bus traffic.
+
+    Pure function — takes already-gathered inputs so it's trivial to test.
+    Produces at most one ``driver-twin-binding`` check (``warn`` when the
+    invariant is violated, ``ok`` when everything lines up).
+    """
+    if not observed_twins and not driver_envs:
+        return []
+
+    bound_by_twin: dict[str, list[str]] = {}
+    for name, env in driver_envs.items():
+        twin = env.get("CYBERWAVE_TWIN_UUID", "").strip()
+        if twin:
+            bound_by_twin.setdefault(twin, []).append(name)
+
+    # Nothing to enforce the invariant against: we either have no driver
+    # containers bound (docker missing, drivers not started, etc.) or no
+    # observed traffic.  Reporting "ok" here would falsely claim we
+    # validated the invariant.
+    if not bound_by_twin:
+        return [
+            _Check(
+                "driver-twin-binding",
+                "info",
+                "Skipped one-driver ⇄ one-twin check",
+                hint=(
+                    "No driver containers with CYBERWAVE_TWIN_UUID were "
+                    "visible to docker on this host."
+                ),
+            )
+        ]
+
+    problems: list[str] = []
+
+    duplicates = {t: names for t, names in bound_by_twin.items() if len(names) > 1}
+    for twin, names in duplicates.items():
+        problems.append(
+            f"twin {twin} is served by {len(names)} drivers: {', '.join(names)}"
+        )
+
+    expected = set(bound_by_twin)
+    # Any observed twin with no bound driver means either a rogue publisher
+    # (driver using a wrong CYBERWAVE_TWIN_UUID) or a single container
+    # publishing under multiple twins — both violate the 1-to-1 invariant.
+    rogue = observed_twins - expected
+    if rogue:
+        problems.append(
+            f"observed publishes under twin(s) with no bound driver: "
+            f"{', '.join(sorted(rogue))}"
+        )
+
+    if problems:
+        return [
+            _Check(
+                "driver-twin-binding",
+                "warn",
+                "one-driver ⇄ one-twin invariant violated",
+                hint=(
+                    "Cyberwave deployments assume each driver container "
+                    "serves exactly one twin. Observed violations:\n  "
+                    + "\n  ".join(problems)
+                ),
+            )
+        ]
+
+    return [
+        _Check(
+            "driver-twin-binding",
+            "ok",
+            f"{len(bound_by_twin)} driver(s) each bound to a distinct twin",
+        )
+    ]
+
+
+def _collect_keyexpr_probe_checks(
+    workers_dir: Path,
+    *,
+    duration: float = 2.0,
+) -> list[_Check]:
+    """Scan installed workers for ``@cw.on_frame`` hooks, observe the bus,
+    and warn when the subscribe key can't match anything currently being
+    published.
+
+    This turns the "drivers publish ``frames/color_camera`` but the hook
+    subscribes to ``frames/default``" drift class into a single warning.
+    """
+    checks: list[_Check] = []
+
+    if not workers_dir.is_dir():
+        return checks
+
+    hooks_by_file: dict[Path, list[tuple[str, str | None]]] = {}
+    for f in sorted(workers_dir.glob("*.py")):
+        hooks = _scan_frame_hooks(f)
+        if hooks:
+            hooks_by_file[f] = hooks
+
+    if not hooks_by_file:
+        checks.append(
+            _Check(
+                "keyexpr-probe",
+                "info",
+                "No @cw.on_frame hooks found in installed workers",
+            )
+        )
+        return checks
+
+    container = _find_worker_container() or (
+        _running_driver_containers()[0]
+        if _running_driver_containers()
+        else None
+    )
+    ok, observed, reason = _observe_zenoh_keys(
+        container_name=container, duration=duration
+    )
+    if not ok:
+        checks.append(
+            _Check(
+                "keyexpr-probe",
+                "info",
+                "Skipped Zenoh key-expression probe",
+                hint=reason,
+            )
+        )
+        return checks
+
+    if not observed:
+        checks.append(
+            _Check(
+                "keyexpr-probe",
+                "warn",
+                f"No keys observed under cw/** in {duration:.1f}s",
+                hint=(
+                    "No driver is publishing on this Zenoh session. "
+                    "Start a driver or check ZENOH_CONNECT."
+                ),
+            )
+        )
+        return checks
+
+    driver_envs: dict[str, dict[str, str]] = {
+        name: _inspect_container_env(name)
+        for name in _running_driver_containers()
+    }
+    driver_envs = {k: v for k, v in driver_envs.items() if v}
+    checks.extend(
+        _collect_driver_twin_binding_checks(
+            _twin_uuids_from_keys(observed), driver_envs
+        )
+    )
+
+    mismatches: list[str] = []
+    for path, hooks in hooks_by_file.items():
+        for twin_uuid, sensor in hooks:
+            if sensor is None or sensor == "*":
+                expected = f"cw/{twin_uuid}/data/frames/**"
+            else:
+                expected = f"cw/{twin_uuid}/data/frames/{sensor}"
+
+            twin_frames = sorted(
+                k for k in observed
+                if k.startswith(f"cw/{twin_uuid}/data/frames/")
+            )
+            if any(_keyexpr_intersects(expected, k) for k in twin_frames):
+                continue
+            if twin_frames:
+                mismatches.append(
+                    f"{path.name}: hook expects {expected!r} "
+                    f"but driver publishes {', '.join(twin_frames)}"
+                )
+            else:
+                mismatches.append(
+                    f"{path.name}: hook expects {expected!r} "
+                    f"but no driver is publishing frames for twin {twin_uuid}"
+                )
+
+    if mismatches:
+        checks.append(
+            _Check(
+                "keyexpr-probe",
+                "warn",
+                f"{len(mismatches)} hook(s) won't match observed publish keys",
+                hint=(
+                    "The hook's subscribe key doesn't intersect any key "
+                    "observed on the bus. Most common causes: a sensor= "
+                    "name that disagrees with the driver's camera_name, "
+                    "a stale 'default' placeholder, or a wrong twin UUID.\n  "
+                    + "\n  ".join(mismatches)
+                ),
+            )
+        )
+    else:
+        checks.append(
+            _Check(
+                "keyexpr-probe",
+                "ok",
+                f"All {sum(len(h) for h in hooks_by_file.values())} frame "
+                f"hook(s) match observed driver keys",
+            )
+        )
+    return checks
+
+
 def _print_preflight_checks(checks: list[_Check], *, verbose: bool) -> None:
     """Render pre-flight/doctor results to the console."""
     for c in checks:
@@ -1047,7 +1415,24 @@ def _print_preflight_checks(checks: list[_Check], *, verbose: bool) -> None:
     is_flag=True,
     help="Show hints for passing checks too",
 )
-def worker_doctor(verbose: bool) -> None:
+@click.option(
+    "--probe/--no-probe",
+    default=True,
+    help=(
+        "Open a short Zenoh session and verify each @cw.on_frame hook's "
+        "subscribe key intersects a key observed on the bus. Catches the "
+        "'driver publishes frames/color_camera but hook subscribes to "
+        "frames/default' drift class."
+    ),
+)
+@click.option(
+    "--probe-duration",
+    type=float,
+    default=2.0,
+    show_default=True,
+    help="Seconds to observe the Zenoh bus when --probe is enabled.",
+)
+def worker_doctor(verbose: bool, probe: bool, probe_duration: float) -> None:
     """Diagnose why a worker may not receive frames.
 
     Runs a set of fast, local checks against the edge host and reports the
@@ -1059,12 +1444,17 @@ def worker_doctor(verbose: bool) -> None:
     Examples:
         cyberwave worker doctor
         cyberwave worker doctor --verbose
+        cyberwave worker doctor --no-probe
     """
     workers_dir = _get_workers_dir()
     console.print("\n[bold]Cyberwave worker doctor[/bold]\n")
     console.print(f"[dim]Workers directory: {workers_dir}[/dim]\n")
 
     checks = _collect_preflight_checks(workers_dir)
+    if probe:
+        checks.extend(
+            _collect_keyexpr_probe_checks(workers_dir, duration=probe_duration)
+        )
     _print_preflight_checks(checks, verbose=verbose)
 
     errors = sum(1 for c in checks if c.level == "error")

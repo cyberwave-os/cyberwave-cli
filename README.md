@@ -205,8 +205,9 @@ Streams logs from the edge worker container (requires Docker).
 ### `cyberwave worker doctor`
 
 ```bash
-cyberwave worker doctor              # run a set of local sanity checks
+cyberwave worker doctor              # run local sanity checks + 2s bus probe
 cyberwave worker doctor --verbose    # also show hints for passing checks
+cyberwave worker doctor --no-probe   # skip the Zenoh bus probe
 ```
 
 Diagnoses the common silent failure modes where a worker container looks
@@ -216,7 +217,18 @@ healthy but hooks report `frames: 0`. Checks include:
 - worker files in `{CONFIG_DIR}/workers/` are world-readable (UID 1001 needs to read them);
 - at least one `cyberwave-driver-*` container is running on this host;
 - `CYBERWAVE_ENVIRONMENT` and `ZENOH_CONNECT` agree between the host and any
-  running driver containers.
+  running driver containers;
+- **key-expression intersection probe**: opens a short Zenoh session (2 s by
+  default), collects keys observed under `cw/**`, and warns when an
+  `@cw.on_frame` hook's subscribe key doesn't match anything being
+  published. Catches the classic "hook pins `sensor='default'` but the
+  driver publishes `frames/color_camera` because the twin asset declares
+  the sensor as `color_camera`" drift.
+- **one-driver ⇄ one-twin invariant**: while the probe is running, the
+  twin UUIDs seen on the bus are compared against `CYBERWAVE_TWIN_UUID`
+  on each running driver container. Warns if two drivers are bound to
+  the same twin, or if keys are being published under a twin that no
+  driver on this host is bound to.
 
 `cyberwave worker start` now invokes the same checks as a pre-flight; pass
 `--skip-preflight` to bypass them.

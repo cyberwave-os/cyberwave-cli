@@ -362,9 +362,21 @@ def _accelerator() -> dict[str, Any]:
 
 
 def _zenoh_version() -> str | None:
+    """Return the installed ``eclipse-zenoh`` version, or ``None`` if absent.
+
+    ``eclipse-zenoh`` >= 1.x dropped the module-level ``zenoh.__version__``
+    attribute (its ``__getattr__`` raises ``AttributeError`` for unknown
+    names), so we ask ``importlib.metadata`` for the distribution version
+    directly.  This avoids the historical "unknown" fallback when zenoh is
+    actually installed, and cleanly reports ``None`` when it is not — which
+    is the signal callers want when deciding whether the host Python is
+    even benchmarking the same stack that the edge containers run.
+    """
+    from importlib.metadata import PackageNotFoundError, version
     try:
-        import zenoh  # type: ignore
-        return getattr(zenoh, "__version__", None) or "unknown"
+        return version("eclipse-zenoh")
+    except PackageNotFoundError:
+        return None
     except Exception:
         return None
 

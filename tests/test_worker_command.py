@@ -327,7 +327,7 @@ def test_doctor_exits_nonzero_on_blocking_issue() -> None:
             patch.object(wm, "_find_edge_core_binary", return_value=None),
             patch.object(wm.shutil, "which", return_value=None),
         ):
-            result = runner.invoke(wm.worker, ["doctor"])
+            result = runner.invoke(wm.worker, ["doctor", "--no-probe"])
         assert result.exit_code == 1, result.output
         assert "edge-core" in result.output
 
@@ -348,5 +348,254 @@ def test_doctor_exits_zero_when_only_warnings() -> None:
                 patch.object(wm, "_find_edge_core_binary", return_value="/usr/bin/cwec")
             )
             _apply_docker_patches(stack, wm, drivers=[])
-            result = runner.invoke(wm.worker, ["doctor"])
+            result = runner.invoke(wm.worker, ["doctor", "--no-probe"])
         assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
+# keyexpr-intersection probe
+# ---------------------------------------------------------------------------
+
+
+def test_scan_frame_hooks_extracts_twin_and_sensor() -> None:
+    """``_scan_frame_hooks`` must recover both explicit and wildcard hooks."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / "wf_demo.py"
+        f.write_text(
+            "import cyberwave as cw\n"
+            "\n"
+            "@cw.on_frame('487d1591-e3bf-47e4-bf1c-30c0d74f8d7e', "
+            "sensor='color_camera')\n"
+            "def a(frame): pass\n"
+            "\n"
+            "@cw.on_frame('00000000-0000-0000-0000-000000000001')\n"
+            "def b(frame): pass\n"
+            "\n"
+            "@cw.on_frame('00000000-0000-0000-0000-000000000002', sensor='*')\n"
+            "def c(frame): pass\n"
+        )
+        hooks = wm._scan_frame_hooks(f)
+    assert hooks == [
+        ("487d1591-e3bf-47e4-bf1c-30c0d74f8d7e", "color_camera"),
+        ("00000000-0000-0000-0000-000000000001", None),
+        ("00000000-0000-0000-0000-000000000002", None),
+    ]
+
+
+def test_keyexpr_intersects_handles_wildcards() -> None:
+    wm = _module()
+    assert wm._keyexpr_intersects(
+        "cw/abc/data/frames/**", "cw/abc/data/frames/color_camera"
+    )
+    assert not wm._keyexpr_intersects(
+        "cw/abc/data/frames/default", "cw/abc/data/frames/color_camera"
+    )
+    assert wm._keyexpr_intersects(
+        "cw/abc/data/frames/color_camera", "cw/abc/data/frames/color_camera"
+    )
+    assert wm._keyexpr_intersects(
+        "cw/abc/data/frames/*", "cw/abc/data/frames/front"
+    )
+    # ``**`` matches zero segments too — ``frames/**`` matches bare ``frames``.
+    assert wm._keyexpr_intersects("cw/abc/data/frames/**", "cw/abc/data/frames")
+    # Expected longer than observed and not a wildcard → no match.
+    assert not wm._keyexpr_intersects(
+        "cw/abc/data/frames/front", "cw/abc/data/frames"
+    )
+    # ``*`` matches exactly one segment.
+    assert not wm._keyexpr_intersects("cw/abc/data/frames/*", "cw/abc/data/frames")
+
+
+def test_probe_flags_stale_default_sensor() -> None:
+    """The classic drift: hook pins ``sensor='default'`` but the driver
+    publishes under ``frames/color_camera``.  Probe must warn."""
+    wm = _module()
+    twin = "487d1591-e3bf-47e4-bf1c-30c0d74f8d7e"
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        (wd / "wf_stale.py").write_text(
+            f"import cyberwave as cw\n"
+            f"@cw.on_frame('{twin}', sensor='default')\n"
+            f"def h(frame): pass\n"
+        )
+        observed = {f"cw/{twin}/data/frames/color_camera"}
+        with (
+            patch.object(
+                wm,
+                "_observe_zenoh_keys",
+                return_value=(True, observed, ""),
+            ),
+            patch.object(wm, "_find_worker_container", return_value=None),
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+        ):
+            checks = wm._collect_keyexpr_probe_checks(wd, duration=0.0)
+    named = {c.name: c for c in checks}
+    assert "keyexpr-probe" in named
+    c = named["keyexpr-probe"]
+    assert c.level == "warn", c.message
+    hint = c.hint or ""
+    assert "frames/default" in hint
+    assert "frames/color_camera" in hint
+
+
+def test_probe_ok_when_wildcard_matches_any_camera() -> None:
+    """An ``@cw.on_frame(twin)`` with no sensor must match driver-published
+    ``frames/<real_sensor>`` keys."""
+    wm = _module()
+    twin = "00000000-0000-0000-0000-000000000001"
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        (wd / "wf_wild.py").write_text(
+            f"import cyberwave as cw\n"
+            f"@cw.on_frame('{twin}')\n"
+            f"def h(frame): pass\n"
+        )
+        observed = {f"cw/{twin}/data/frames/front"}
+        with (
+            patch.object(
+                wm,
+                "_observe_zenoh_keys",
+                return_value=(True, observed, ""),
+            ),
+            patch.object(wm, "_find_worker_container", return_value=None),
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+        ):
+            checks = wm._collect_keyexpr_probe_checks(wd, duration=0.0)
+    named = {c.name: c for c in checks}
+    assert named["keyexpr-probe"].level == "ok", named["keyexpr-probe"].message
+
+
+def test_probe_is_info_when_zenoh_unavailable() -> None:
+    """When Zenoh can't be loaded the probe is skipped, not a failure."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        (wd / "wf_x.py").write_text(
+            "import cyberwave as cw\n"
+            "@cw.on_frame('00000000-0000-0000-0000-000000000001')\n"
+            "def h(frame): pass\n"
+        )
+        with (
+            patch.object(
+                wm,
+                "_observe_zenoh_keys",
+                return_value=(False, set(), "zenoh not installed"),
+            ),
+            patch.object(wm, "_find_worker_container", return_value=None),
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+        ):
+            checks = wm._collect_keyexpr_probe_checks(wd, duration=0.0)
+    named = {c.name: c for c in checks}
+    assert named["keyexpr-probe"].level == "info"
+
+
+def test_probe_no_hooks_returns_info() -> None:
+    """Probe short-circuits with info when no hooks are installed."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        (wd / "plain.py").write_text("print('no hooks here')\n")
+        checks = wm._collect_keyexpr_probe_checks(wd, duration=0.0)
+    named = {c.name: c for c in checks}
+    assert named["keyexpr-probe"].level == "info"
+
+
+# ---------------------------------------------------------------------------
+# one-driver ⇄ one-twin invariant
+# ---------------------------------------------------------------------------
+
+
+def test_twin_uuids_from_keys_strips_segment() -> None:
+    """Only keys matching ``cw/<twin>/data/...`` contribute a twin UUID.
+    Monitor/internal keys (no ``/data/`` segment) are excluded."""
+    wm = _module()
+    assert wm._twin_uuids_from_keys(
+        {
+            "cw/aaa/data/frames/color_camera",
+            "cw/bbb/data/frames/color_camera",
+            "cw/_monitor/worker_stats",
+        }
+    ) == {"aaa", "bbb"}
+
+
+def test_binding_ok_when_each_driver_owns_one_twin() -> None:
+    """Two drivers, two twins, each container serves only its twin."""
+    wm = _module()
+    checks = wm._collect_driver_twin_binding_checks(
+        observed_twins={"aaa", "bbb"},
+        driver_envs={
+            "cyberwave-driver-1": {"CYBERWAVE_TWIN_UUID": "aaa"},
+            "cyberwave-driver-2": {"CYBERWAVE_TWIN_UUID": "bbb"},
+        },
+    )
+    assert len(checks) == 1
+    assert checks[0].level == "ok"
+    assert "2 driver(s)" in checks[0].message
+
+
+def test_binding_flags_two_drivers_bound_to_same_twin() -> None:
+    """Two containers claim the same twin — violates 1-to-1."""
+    wm = _module()
+    checks = wm._collect_driver_twin_binding_checks(
+        observed_twins={"aaa"},
+        driver_envs={
+            "cyberwave-driver-1": {"CYBERWAVE_TWIN_UUID": "aaa"},
+            "cyberwave-driver-2": {"CYBERWAVE_TWIN_UUID": "aaa"},
+        },
+    )
+    assert len(checks) == 1
+    assert checks[0].level == "warn"
+    hint = checks[0].hint or ""
+    assert "cyberwave-driver-1" in hint
+    assert "cyberwave-driver-2" in hint
+    assert "served by 2 drivers" in hint
+
+
+def test_binding_flags_rogue_publisher() -> None:
+    """Keys observed under a twin nobody is bound to."""
+    wm = _module()
+    checks = wm._collect_driver_twin_binding_checks(
+        observed_twins={"aaa", "rogue-twin"},
+        driver_envs={
+            "cyberwave-driver-1": {"CYBERWAVE_TWIN_UUID": "aaa"},
+        },
+    )
+    assert len(checks) == 1
+    assert checks[0].level == "warn"
+    assert "rogue-twin" in (checks[0].hint or "")
+
+
+def test_binding_empty_inputs_returns_nothing() -> None:
+    """No containers and no observations → no check."""
+    wm = _module()
+    assert wm._collect_driver_twin_binding_checks(set(), {}) == []
+
+
+def test_binding_info_when_traffic_but_no_docker_bindings() -> None:
+    """Traffic seen on the bus but no driver container envs to cross-check
+    against — doctor must report ``info`` rather than confidently ``ok``."""
+    wm = _module()
+    checks = wm._collect_driver_twin_binding_checks(
+        observed_twins={"aaa"},
+        driver_envs={},
+    )
+    assert len(checks) == 1
+    assert checks[0].level == "info"
+    assert "Skipped" in checks[0].message
+
+
+def test_binding_info_when_driver_env_has_no_twin_uuid() -> None:
+    """Driver container exists but CYBERWAVE_TWIN_UUID isn't set — we can't
+    enforce the invariant, so emit ``info`` not ``ok``."""
+    wm = _module()
+    checks = wm._collect_driver_twin_binding_checks(
+        observed_twins={"aaa"},
+        driver_envs={"cyberwave-driver-1": {"OTHER": "val"}},
+    )
+    assert len(checks) == 1
+    assert checks[0].level == "info"
