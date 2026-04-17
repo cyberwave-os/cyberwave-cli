@@ -53,6 +53,9 @@ _init_macos_console(console)
 # ---- constants ---------------------------------------------------------------
 
 PACKAGE_NAME = "cyberwave-edge-core"
+BUILDKITE_ORG_SLUG = "cyberwave"
+INTERNAL_DEB_REGISTRY_SLUG = "cyberwave-internal-deb"
+INTERNAL_DEB_READ_TOKEN_ENV = "CYBERWAVE_INTERNAL_DEB_READ_TOKEN"
 EDGE_CORE_PACKAGE_CHANNELS = {
     "stable": PACKAGE_NAME,
     "dev": "cyberwave-edge-core-dev",
@@ -97,6 +100,7 @@ class ServiceSpec:
     unit_name: str
     unit_path: Path
     package_channels: dict[str, str]
+    public_deb_registry_slug: str
     deb_repo_url: str
     gpg_key_url: str
     keyring_path: Path
@@ -116,6 +120,7 @@ EDGE_CORE_SPEC = ServiceSpec(
     unit_name=SYSTEMD_UNIT_NAME,
     unit_path=SYSTEMD_UNIT_PATH,
     package_channels=EDGE_CORE_PACKAGE_CHANNELS,
+    public_deb_registry_slug="cyberwave-edge-core",
     deb_repo_url=BUILDKITE_DEB_REPO_URL,
     gpg_key_url=BUILDKITE_GPG_KEY_URL,
     keyring_path=BUILDKITE_KEYRING_PATH,
@@ -164,6 +169,7 @@ CLOUD_NODE_SPEC = ServiceSpec(
         "dev": "cyberwave-cloud-node-dev",
         "staging": "cyberwave-cloud-node-staging",
     },
+    public_deb_registry_slug="cyberwave-cloud-node",
     deb_repo_url="https://packages.buildkite.com/cyberwave/cyberwave-cloud-node/any/",
     gpg_key_url="https://packages.buildkite.com/cyberwave/cyberwave-cloud-node/gpgkey",
     keyring_path=Path("/etc/apt/keyrings/cyberwave_cyberwave-cloud-node-archive-keyring.gpg"),
@@ -968,6 +974,75 @@ def _resolve_service_package_name(
     return spec.package_channels.get(channel.lower(), spec.package_name)
 
 
+def _buildkite_deb_registry_urls(registry_slug: str) -> tuple[str, str]:
+    """Return the apt repo and GPG key URLs for a Buildkite Debian registry."""
+    return (
+        f"https://packages.buildkite.com/{BUILDKITE_ORG_SLUG}/{registry_slug}/any/",
+        f"https://packages.buildkite.com/{BUILDKITE_ORG_SLUG}/{registry_slug}/gpgkey",
+    )
+
+
+def _buildkite_deb_registry_paths(registry_slug: str) -> tuple[Path, Path]:
+    """Return the keyring and sources-list paths for a Buildkite Debian registry."""
+    return (
+        Path(f"/etc/apt/keyrings/cyberwave_{registry_slug}-archive-keyring.gpg"),
+        Path(f"/etc/apt/sources.list.d/buildkite-cyberwave-{registry_slug}.list"),
+    )
+
+
+def _buildkite_deb_registry_auth_conf_path(registry_slug: str) -> Path:
+    """Return the apt auth.conf.d path for a Buildkite Debian registry."""
+    return Path(f"/etc/apt/auth.conf.d/cyberwave_{registry_slug}.conf")
+
+
+def _resolve_deb_registry_slug(spec: ServiceSpec, channel: str = "stable") -> str:
+    """Return the Buildkite Debian registry slug for the selected channel."""
+    normalized_channel = _normalize_service_channel(channel)
+    if normalized_channel == "stable":
+        return spec.public_deb_registry_slug
+    return INTERNAL_DEB_REGISTRY_SLUG
+
+
+def _resolve_deb_registry_urls(spec: ServiceSpec, channel: str = "stable") -> tuple[str, str]:
+    """Return the apt repo and GPG key URLs for the selected service channel."""
+    return _buildkite_deb_registry_urls(_resolve_deb_registry_slug(spec, channel))
+
+
+def _resolve_deb_registry_paths(spec: ServiceSpec, channel: str = "stable") -> tuple[Path, Path]:
+    """Return the keyring and sources-list paths for the selected service channel."""
+    return _buildkite_deb_registry_paths(_resolve_deb_registry_slug(spec, channel))
+
+
+def _resolve_deb_registry_auth_conf_path(spec: ServiceSpec, channel: str = "stable") -> Path:
+    """Return the apt auth.conf.d path for the selected service channel."""
+    return _buildkite_deb_registry_auth_conf_path(_resolve_deb_registry_slug(spec, channel))
+
+
+def _resolve_deb_registry_read_token(channel: str = "stable") -> str | None:
+    """Return the private registry read token required for prerelease channels."""
+    normalized_channel = _normalize_service_channel(channel)
+    if normalized_channel == "stable":
+        return None
+    env_token = os.environ.get(INTERNAL_DEB_READ_TOKEN_ENV)
+    if env_token:
+        return env_token
+    creds = load_credentials()
+    saved_token = getattr(creds, "internal_deb_read_token", None) if creds else None
+    if isinstance(saved_token, str) and saved_token.strip():
+        return saved_token.strip()
+    return None
+
+
+def _resolve_deb_registry_gpg_key_fetch_url(spec: ServiceSpec, channel: str = "stable") -> str:
+    """Return the GPG key URL, embedding auth for private prerelease registries."""
+    registry_slug = _resolve_deb_registry_slug(spec, channel)
+    _, public_gpg_key_url = _buildkite_deb_registry_urls(registry_slug)
+    token = _resolve_deb_registry_read_token(channel)
+    if not token:
+        return public_gpg_key_url
+    return f"https://buildkite:{token}@packages.buildkite.com/{BUILDKITE_ORG_SLUG}/{registry_slug}/gpgkey"
+
+
 def _resolve_edge_core_package_name(channel: str | None) -> str:
     """Resolve the Debian package name for the requested edge-core channel."""
     normalized_channel = (channel or "stable").lower()
@@ -1007,6 +1082,7 @@ def _apt_get_install(
     *,
     package_name: str | None = None,
     package_version: str | None = None,
+    channel: str = "stable",
 ) -> bool:
     """Install a service package via apt-get.
 
@@ -1016,13 +1092,40 @@ def _apt_get_install(
     Returns True on success.
     """
     resolved_name = package_name or spec.package_name
-    sources_list = spec.sources_list_path
+    deb_repo_url, gpg_key_url = _resolve_deb_registry_urls(spec, channel)
+    keyring_path, sources_list = _resolve_deb_registry_paths(spec, channel)
+    auth_conf_path = _resolve_deb_registry_auth_conf_path(spec, channel)
+    registry_slug = _resolve_deb_registry_slug(spec, channel)
+    registry_read_token = _resolve_deb_registry_read_token(channel)
+
+    if channel != "stable" and not registry_read_token:
+        console.print(
+            f"[red]{INTERNAL_DEB_READ_TOKEN_ENV} is required for {channel} package installs.[/red]"
+        )
+        return False
+
+    if registry_read_token:
+        try:
+            auth_conf_path.parent.mkdir(parents=True, exist_ok=True)
+            auth_conf_path.write_text(
+                "machine "
+                f"https://packages.buildkite.com/{BUILDKITE_ORG_SLUG}/{registry_slug}/ "
+                f"login buildkite password {registry_read_token}\n",
+                encoding="utf-8",
+            )
+            _run(["chmod", "600", str(auth_conf_path)])
+        except PermissionError:
+            console.print(
+                "[red]Permission denied writing apt auth config.[/red]\n"
+                f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
+            )
+            return False
 
     # Install the GPG signing key if missing
-    if not spec.keyring_path.exists():
+    if not keyring_path.exists():
         console.print("[cyan]Installing Cyberwave package signing key...[/cyan]")
         try:
-            spec.keyring_path.parent.mkdir(parents=True, exist_ok=True)
+            keyring_path.parent.mkdir(parents=True, exist_ok=True)
 
             child_env = clean_subprocess_env()
             ld_library_path = child_env.get("LD_LIBRARY_PATH", "(unset)")
@@ -1030,19 +1133,19 @@ def _apt_get_install(
 
             # Download the armored GPG key
             curl = subprocess.run(
-                ["curl", "-fsSL", spec.gpg_key_url],
+                ["curl", "-fsSL", _resolve_deb_registry_gpg_key_fetch_url(spec, channel)],
                 capture_output=True,
                 check=True,
                 env=child_env,
             )
             if not curl.stdout:
                 console.print("[red]Downloaded GPG key is empty.[/red]")
-                console.print(f"[dim]URL: {spec.gpg_key_url}[/dim]")
+                console.print(f"[dim]URL: {_resolve_deb_registry_gpg_key_fetch_url(spec, channel)}[/dim]")
                 return False
 
             # Dearmor into the keyring file
             gpg = subprocess.run(
-                ["gpg", "--batch", "--yes", "--dearmor", "-o", str(spec.keyring_path)],
+                ["gpg", "--batch", "--yes", "--dearmor", "-o", str(keyring_path)],
                 input=curl.stdout,
                 capture_output=True,
                 env=child_env,
@@ -1061,7 +1164,7 @@ def _apt_get_install(
             console.print(f"[red]Failed to download GPG key (exit {exc.returncode}).[/red]")
             if stderr_msg:
                 console.print(f"[dim]{stderr_msg}[/dim]")
-            console.print(f"[dim]URL: {spec.gpg_key_url}[/dim]")
+            console.print(f"[dim]URL: {_resolve_deb_registry_gpg_key_fetch_url(spec, channel)}[/dim]")
             return False
         except FileNotFoundError as exc:
             console.print(f"[red]Required command not found: {exc.filename}[/red]")
@@ -1079,10 +1182,10 @@ def _apt_get_install(
     # Add the repository if missing
     if not sources_list.exists():
         console.print("[cyan]Adding Cyberwave package repository...[/cyan]")
-        signed_by = f"signed-by={spec.keyring_path}"
+        signed_by = f"signed-by={keyring_path}"
         source_lines = (
-            f"deb [{signed_by}] {spec.deb_repo_url} any main\n"
-            f"deb-src [{signed_by}] {spec.deb_repo_url} any main\n"
+            f"deb [{signed_by}] {deb_repo_url} any main\n"
+            f"deb-src [{signed_by}] {deb_repo_url} any main\n"
         )
         try:
             sources_list.write_text(source_lines)
@@ -1135,6 +1238,7 @@ def _apt_get_install(
 
 # Re-exported from pip_registry for backward compat.
 from .pip_registry import (  # noqa: E402
+    INTERNAL_PYTHON_REGISTRY_SLUG,
     Version,
     _buildkite_python_registry_index_url,
     _buildkite_python_registry_slug,
@@ -1142,9 +1246,12 @@ from .pip_registry import (  # noqa: E402
     _fetch_available_simple_index_versions,
     _normalize_service_channel,
     _pip_version_matches_channel,
+    _resolve_buildkite_python_registry_slug,
     _select_pip_version_for_channel,
     _validate_pip_channel_version,
 )
+
+INTERNAL_PYTHON_READ_TOKEN_ENV = "CYBERWAVE_INTERNAL_PYTHON_READ_TOKEN"
 
 
 def _describe_pip_install_target(
@@ -1175,9 +1282,13 @@ def _pip_install(
     """
     normalized_channel = _normalize_service_channel(channel)
     pip_command = [sys.executable, "-m", "pip", "install"]
-    buildkite_index_url = _buildkite_python_registry_index_url(
-        _buildkite_python_registry_slug(spec.package_name)
-    )
+    buildkite_index_url: str | None = None
+    registry_read_token = os.environ.get(INTERNAL_PYTHON_READ_TOKEN_ENV)
+    if not registry_read_token:
+        creds = load_credentials()
+        saved_token = getattr(creds, "internal_python_read_token", None) if creds else None
+        if isinstance(saved_token, str) and saved_token.strip():
+            registry_read_token = saved_token.strip()
 
     if normalized_channel == "stable" and not package_version:
         pip_target = spec.package_name
@@ -1191,6 +1302,17 @@ def _pip_install(
                 )
                 pip_target = f"{spec.package_name}=={validated_version}"
             else:
+                if normalized_channel != "stable" and not registry_read_token:
+                    console.print(
+                        f"[red]{INTERNAL_PYTHON_READ_TOKEN_ENV} is required for {normalized_channel} "
+                        "Python package installs.[/red]"
+                    )
+                    return False
+                if normalized_channel != "stable":
+                    buildkite_index_url = _buildkite_python_registry_index_url(
+                        _resolve_buildkite_python_registry_slug(spec.package_name, normalized_channel),
+                        registry_read_token,
+                    )
                 available_versions = _fetch_available_simple_index_versions(
                     buildkite_index_url,
                     spec.package_name,
@@ -1210,6 +1332,18 @@ def _pip_install(
             return False
 
         if normalized_channel != "stable":
+            if buildkite_index_url is None:
+                if not registry_read_token:
+                    console.print(
+                        f"[red]{INTERNAL_PYTHON_READ_TOKEN_ENV} is required for {normalized_channel} "
+                        "Python package installs.[/red]"
+                    )
+                    return False
+                buildkite_index_url = _buildkite_python_registry_index_url(
+                    _resolve_buildkite_python_registry_slug(spec.package_name, normalized_channel),
+                    registry_read_token,
+                )
+            assert buildkite_index_url is not None
             pip_command.extend(
                 [
                     "--pre",
@@ -1244,7 +1378,12 @@ def install_service_package(
     """
     if _is_linux() and shutil.which("apt-get"):
         package_name = _resolve_service_package_name(channel, spec)
-        return _apt_get_install(spec, package_name=package_name, package_version=version)
+        return _apt_get_install(
+            spec,
+            package_name=package_name,
+            package_version=version,
+            channel=channel,
+        )
     return _pip_install(spec, package_version=version, channel=channel)
 
 

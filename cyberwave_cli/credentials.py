@@ -48,6 +48,8 @@ class Credentials:
     cyberwave_base_url: Optional[str] = None
     cyberwave_mqtt_host: Optional[str] = None
     cyberwave_mqtt_port: Optional[str] = None
+    internal_deb_read_token: Optional[str] = None
+    internal_python_read_token: Optional[str] = None
 
     def runtime_envs(self) -> dict[str, str]:
         """Return persisted runtime env vars for edge/core processes."""
@@ -80,6 +82,13 @@ class Credentials:
         envs = self.runtime_envs()
         if envs:
             payload["envs"] = envs
+        package_registry_tokens: dict[str, str] = {}
+        if self.internal_deb_read_token:
+            package_registry_tokens["internal_deb_read_token"] = self.internal_deb_read_token
+        if self.internal_python_read_token:
+            package_registry_tokens["internal_python_read_token"] = self.internal_python_read_token
+        if package_registry_tokens:
+            payload["package_registry_tokens"] = package_registry_tokens
         return payload
 
     @classmethod
@@ -87,12 +96,25 @@ class Credentials:
         """Create credentials from dictionary."""
         raw_envs = data.get("envs")
         envs: dict[str, Any] = raw_envs if isinstance(raw_envs, dict) else {}
+        raw_package_registry_tokens = data.get("package_registry_tokens")
+        package_registry_tokens: dict[str, Any] = (
+            raw_package_registry_tokens if isinstance(raw_package_registry_tokens, dict) else {}
+        )
 
         def _env_value(key: str) -> Optional[str]:
             value = envs.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
             # Backward compatibility with old flat credentials schema.
+            flat_value = data.get(key)
+            if isinstance(flat_value, str) and flat_value.strip():
+                return flat_value.strip()
+            return None
+
+        def _package_registry_token(key: str) -> Optional[str]:
+            value = package_registry_tokens.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
             flat_value = data.get(key)
             if isinstance(flat_value, str) and flat_value.strip():
                 return flat_value.strip()
@@ -109,6 +131,8 @@ class Credentials:
             cyberwave_base_url=_env_value("CYBERWAVE_BASE_URL"),
             cyberwave_mqtt_host=_env_value("CYBERWAVE_MQTT_HOST"),
             cyberwave_mqtt_port=_env_value("CYBERWAVE_MQTT_PORT"),
+            internal_deb_read_token=_package_registry_token("internal_deb_read_token"),
+            internal_python_read_token=_package_registry_token("internal_python_read_token"),
         )
 
 

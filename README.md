@@ -763,8 +763,15 @@ Set API credentials directly without the interactive login flow. Useful when you
 ```bash
 cyberwave configure --token YOUR_TOKEN
 cyberwave configure --token YOUR_TOKEN --base-url http://localhost:8000
+cyberwave configure --internal-deb-read-token YOUR_BUILDKITE_DEB_TOKEN
+cyberwave configure --internal-python-read-token YOUR_BUILDKITE_PYTHON_TOKEN
 cyberwave configure --show
 ```
+
+Private Buildkite read tokens are stored alongside the API credentials in `credentials.json`.
+When prerelease (`dev`/`staging`) installs need access to `cyberwave-internal-deb` or
+`cyberwave-internal-python`, the CLI prefers explicit environment variables first and then
+falls back to those saved tokens.
 
 ## Configuration
 
@@ -779,7 +786,7 @@ Run `cyberwave config-dir` to see which directory is active.
 
 **Files inside the config directory:**
 
-- `credentials.json` — API token and workspace info (permissions `600`)
+- `credentials.json` — API token, workspace info, runtime env overrides, and optional private Buildkite registry read tokens (permissions `600`)
 - `environment.json` — selected workspace, environment, and twin bindings
 - `fingerprint.json` — unique edge device identifier
 
