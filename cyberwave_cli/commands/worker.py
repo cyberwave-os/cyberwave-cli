@@ -320,7 +320,8 @@ def add_worker(source: str, name: str | None, force: bool) -> None:
     console.print(f"[green]✓[/green] Worker installed: [bold]{dest_name}[/bold]")
     console.print(f"  Path: {dest}")
     console.print(
-        "\n[dim]Edge-core will detect the change and restart the worker container automatically.[/dim]"
+        "\n[dim]Edge-core will detect the change and restart "
+        "the worker container automatically.[/dim]"
     )
     console.print("[dim]Run 'cyberwave worker status' to check the container state.[/dim]")
 
@@ -370,7 +371,8 @@ def remove_worker(name: str, yes: bool) -> None:
 
     console.print(f"[green]✓[/green] Removed: [bold]{filename}[/bold]")
     console.print(
-        "\n[dim]Edge-core will detect the change and restart the worker container automatically.[/dim]"
+        "\n[dim]Edge-core will detect the change and restart "
+        "the worker container automatically.[/dim]"
     )
     console.print("[dim]Run 'cyberwave worker status' to check the container state.[/dim]")
 
@@ -483,7 +485,10 @@ def worker_status(container: str | None) -> None:
                 "docker",
                 "inspect",
                 "--format",
-                "{{.State.Status}} | {{.State.StartedAt}} | {{.State.FinishedAt}} | {{.State.ExitCode}}",
+                (
+                    "{{.State.Status}} | {{.State.StartedAt}} | "
+                    "{{.State.FinishedAt}} | {{.State.ExitCode}}"
+                ),
                 container_name,
             ],
             capture_output=True,
@@ -572,8 +577,8 @@ def worker_monitor(update: float, container: str | None) -> None:
         if stopped:
             console.print(f"[red]✗[/red] Worker container '{stopped}' exists but is not running.")
             console.print(
-                f"[dim]Check exit reason with: cyberwave worker logs\n"
-                f"Restart with: cyberwave worker restart[/dim]"
+                "[dim]Check exit reason with: cyberwave worker logs\n"
+                "Restart with: cyberwave worker restart[/dim]"
             )
         else:
             console.print("[red]✗[/red] Worker container not found.")
