@@ -21,8 +21,10 @@ Example usage:
 """
 
 import datetime
+import json
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -41,6 +43,7 @@ console = Console()
 WORKERS_DIR = CONFIG_DIR / "workers"
 
 WORKER_CONTAINER_PREFIX = "cyberwave-worker-"
+DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
 
 # Prefix used for workflow-generated worker files.
 GENERATED_WORKER_PREFIX = "wf_"
@@ -292,6 +295,24 @@ def add_worker(source: str, name: str | None, force: bool) -> None:
     except OSError as exc:
         console.print(f"[red]✗[/red] Failed to copy worker: {exc}")
         raise click.Abort() from exc
+
+    # shutil.copy2 preserves the source's mode. When `worker add` is invoked
+    # as root (e.g. via sudo or an edge-core-managed hook) the destination
+    # ends up root-owned; a private source mode like 0600 is also preserved.
+    # The worker container runs as a non-root user (UID 1001 in
+    # cyberwaveos/edge-ml-worker), so restrictive modes produce silent
+    # PermissionError at container start and 0 hooks loaded. Force world-
+    # readable to avoid the footgun. A filesystem that can't honor chmod
+    # (some FUSE mounts, macOS bind-mounts) shouldn't nuke a successful
+    # copy — warn and continue.
+    try:
+        dest.chmod(0o644)
+    except OSError as exc:
+        console.print(
+            f"[yellow]⚠[/yellow] Copied, but could not chmod 0644: {exc}. "
+            "Verify the worker file is readable by the worker container "
+            f"(UID 1001): chmod 0644 {dest}"
+        )
 
     console.print(f"[green]✓[/green] Worker installed: [bold]{dest_name}[/bold]")
     console.print(f"  Path: {dest}")
@@ -620,7 +641,12 @@ def worker_monitor(update: float, container: str | None) -> None:
 
 
 @worker.command("start")
-def worker_start() -> None:
+@click.option(
+    "--skip-preflight",
+    is_flag=True,
+    help="Skip the pre-flight sanity checks and start unconditionally",
+)
+def worker_start(skip_preflight: bool) -> None:
     """Start the worker container.
 
     Requires cyberwave-edge-core to be installed. Ensures model weights
@@ -629,6 +655,7 @@ def worker_start() -> None:
     \b
     Examples:
         cyberwave worker start
+        cyberwave worker start --skip-preflight
     """
     workers_dir = _get_workers_dir()
     has_workers = any(workers_dir.glob("*.py"))
@@ -640,6 +667,21 @@ def worker_start() -> None:
             "Or place .py worker files in the directory above.[/dim]"
         )
         return
+
+    # Run a quick pre-flight so common misconfigurations (unreadable worker
+    # files, no matching driver on the same host, missing Zenoh env vars) are
+    # surfaced before the container crashes with a PermissionError traceback
+    # or loads 0 hooks.
+    if not skip_preflight:
+        preflight = _collect_preflight_checks(workers_dir)
+        _print_preflight_checks(preflight, verbose=False)
+        if any(c.level == "error" for c in preflight):
+            console.print(
+                "\n[red]✗[/red] Pre-flight failed. Run "
+                "[bold]cyberwave worker doctor[/bold] for details, or re-run "
+                "with [bold]--skip-preflight[/bold] if you know what you're doing."
+            )
+            raise click.Abort()
 
     _delegate_to_edge_core("worker", "start")
 
@@ -677,3 +719,361 @@ def worker_health() -> None:
         cyberwave worker health
     """
     _delegate_to_edge_core("worker", "health")
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight / doctor checks
+# ---------------------------------------------------------------------------
+
+
+class _Check:
+    """Lightweight result object for a single pre-flight check."""
+
+    __slots__ = ("name", "level", "message", "hint")
+
+    def __init__(
+        self,
+        name: str,
+        level: str,
+        message: str,
+        hint: str | None = None,
+    ) -> None:
+        # level is one of: "ok", "warn", "error", "info"
+        self.name = name
+        self.level = level
+        self.message = message
+        self.hint = hint
+
+
+def _running_containers_with_prefix(prefix: str) -> list[str]:
+    """Return the names of running containers whose name starts with *prefix*."""
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "--filter",
+                f"name=^{prefix}",
+                "--format",
+                "{{.Names}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return []
+        return [n.strip() for n in result.stdout.splitlines() if n.strip()]
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+
+
+def _running_driver_containers() -> list[str]:
+    """Return the names of running camera/robot driver containers, or []."""
+    return _running_containers_with_prefix(DRIVER_CONTAINER_PREFIX)
+
+
+def _running_worker_containers() -> list[str]:
+    """Return the names of running ML worker containers, or []."""
+    return _running_containers_with_prefix(WORKER_CONTAINER_PREFIX)
+
+
+def _inspect_container_env(container_name: str) -> dict[str, str]:
+    """Return the ``KEY=VAL`` env map for a running container, or ``{}``."""
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "--format", "{{json .Config.Env}}", container_name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return {}
+        raw = json.loads(result.stdout)
+        if not isinstance(raw, list):
+            return {}
+        env: dict[str, str] = {}
+        for entry in raw:
+            if not isinstance(entry, str) or "=" not in entry:
+                continue
+            key, _, value = entry.partition("=")
+            env[key] = value
+        return env
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+_ENV_KEYS_TO_COMPARE = ("CYBERWAVE_ENVIRONMENT", "ZENOH_CONNECT")
+
+
+def _collect_preflight_checks(workers_dir: Path) -> list[_Check]:
+    """Collect pre-flight signals that a worker is likely to run successfully.
+
+    Each check is cheap (no network) and safe to run repeatedly. Severity
+    reflects whether the issue *definitely* breaks the worker:
+
+    * ``error`` — the worker cannot start or cannot load its hooks:
+      ``edge-core`` missing, ``docker`` missing, worker files not
+      world-readable.
+    * ``warn`` — the worker may come up but has a known footgun class:
+      no co-located driver yet, env drift between driver containers or
+      between driver and worker containers, drivers with no twin binding.
+    """
+    checks: list[_Check] = []
+
+    # 1. edge-core presence — delegation will fail without it.
+    binary = _find_edge_core_binary()
+    if binary:
+        checks.append(_Check("edge-core", "ok", f"cyberwave-edge-core found at {binary}"))
+    else:
+        checks.append(
+            _Check(
+                "edge-core",
+                "error",
+                "cyberwave-edge-core not installed",
+                hint="Install it with: cyberwave edge install",
+            )
+        )
+
+    # 2. workers dir and file permissions — the main silent-failure class.
+    if not workers_dir.is_dir():
+        checks.append(
+            _Check(
+                "workers-dir",
+                "error",
+                f"Workers directory not found: {workers_dir}",
+                hint="Add a worker with: cyberwave worker add <file.py>",
+            )
+        )
+    else:
+        files = sorted(workers_dir.glob("*.py"))
+        if not files:
+            checks.append(
+                _Check(
+                    "worker-files",
+                    "warn",
+                    "No .py worker files installed",
+                    hint="Install one with: cyberwave worker add <file.py>",
+                )
+            )
+        else:
+            unreadable: list[str] = []
+            for f in files:
+                mode = f.stat().st_mode
+                # The worker container runs as UID 1001 and must be able
+                # to read every file; require at least "other-readable".
+                if not (mode & stat.S_IROTH):
+                    unreadable.append(f.name)
+            if unreadable:
+                checks.append(
+                    _Check(
+                        "worker-perms",
+                        "error",
+                        f"Worker files not world-readable: {', '.join(unreadable)}",
+                        hint=(
+                            "The worker container runs as a non-root user "
+                            "(UID 1001) and cannot read mode 0600 files. "
+                            f"Fix with: chmod 0644 {workers_dir}/*.py  "
+                            "(or re-run `cyberwave worker add`, which now "
+                            "chmod's 0644)."
+                        ),
+                    )
+                )
+            else:
+                checks.append(
+                    _Check(
+                        "worker-perms",
+                        "ok",
+                        f"{len(files)} worker file(s), all readable",
+                    )
+                )
+
+    # 3. docker availability — every subsequent check needs it, and so does
+    # the delegated `edge-core worker start`.
+    if not shutil.which("docker"):
+        checks.append(
+            _Check(
+                "docker",
+                "error",
+                "docker not on PATH",
+                hint=(
+                    "edge-core manages workers and drivers via Docker. "
+                    "Install Docker Engine and add your user to the "
+                    "`docker` group."
+                ),
+            )
+        )
+        return checks
+
+    # 4. co-located drivers: this is a warning, not an error. A worker can
+    # legitimately come up before drivers (edge-core reconciles), or bind
+    # to a remote Zenoh router with no local driver at all.
+    drivers = _running_driver_containers()
+    if not drivers:
+        checks.append(
+            _Check(
+                "driver-container",
+                "warn",
+                "No cyberwave-driver-* container running on this host",
+                hint=(
+                    "Workers only receive frames from drivers reachable on "
+                    "the same Zenoh session. If you expect a driver here, "
+                    "start it with `cyberwave drivers start`; otherwise "
+                    "ensure ZENOH_CONNECT points at the remote router."
+                ),
+            )
+        )
+    else:
+        checks.append(
+            _Check(
+                "driver-container",
+                "ok",
+                f"{len(drivers)} driver container(s) running: {', '.join(drivers)}",
+            )
+        )
+
+    # 5. env consistency across drivers and (if running) the worker.
+    # We compare what containers actually have, not the CLI host's shell,
+    # because the worker container is launched by edge-core with its own
+    # env and the shell that ran this command is mostly irrelevant.
+    driver_envs: dict[str, dict[str, str]] = {
+        name: _inspect_container_env(name) for name in drivers
+    }
+    driver_envs = {k: v for k, v in driver_envs.items() if v}
+
+    workers = _running_worker_containers()
+    worker_envs: dict[str, dict[str, str]] = {
+        name: _inspect_container_env(name) for name in workers
+    }
+    worker_envs = {k: v for k, v in worker_envs.items() if v}
+
+    mismatches: list[str] = []
+
+    # driver ↔ driver: multiple drivers on the same host must agree, or
+    # they're publishing on disjoint Zenoh sessions / environments.
+    if len(driver_envs) > 1:
+        names = list(driver_envs)
+        base = driver_envs[names[0]]
+        for other_name in names[1:]:
+            other = driver_envs[other_name]
+            for key in _ENV_KEYS_TO_COMPARE:
+                a, b = base.get(key, ""), other.get(key, "")
+                if a and b and a != b:
+                    mismatches.append(
+                        f"driver disagreement: {names[0]}:{key}={a!r} vs "
+                        f"{other_name}:{key}={b!r}"
+                    )
+
+    # driver ↔ worker: at least one driver must share env with the worker.
+    for w_name, w_env in worker_envs.items():
+        for d_name, d_env in driver_envs.items():
+            for key in _ENV_KEYS_TO_COMPARE:
+                a, b = w_env.get(key, ""), d_env.get(key, "")
+                if a and b and a != b:
+                    mismatches.append(
+                        f"worker/driver disagreement: {w_name}:{key}={a!r} "
+                        f"vs {d_name}:{key}={b!r}"
+                    )
+
+    if mismatches:
+        # Deduplicate while preserving order.
+        seen: set[str] = set()
+        unique = [m for m in mismatches if not (m in seen or seen.add(m))]
+        checks.append(
+            _Check(
+                "env-consistency",
+                "warn",
+                "Container env drift detected",
+                hint=(
+                    "Mismatched env produces healthy-looking containers "
+                    "that publish on disjoint Zenoh sessions. Review:\n  "
+                    + "\n  ".join(unique)
+                ),
+            )
+        )
+    elif driver_envs or worker_envs:
+        checks.append(
+            _Check(
+                "env-consistency",
+                "ok",
+                "Container env agrees on CYBERWAVE_ENVIRONMENT / ZENOH_CONNECT",
+            )
+        )
+
+    # 6. twin binding: drivers with no twin env publish on undefined keys.
+    missing_twin: list[str] = [
+        name
+        for name, env in driver_envs.items()
+        if not env.get("CYBERWAVE_TWIN_JSON_FILE") and not env.get("CYBERWAVE_TWIN_UUID")
+    ]
+    if missing_twin:
+        checks.append(
+            _Check(
+                "twin-binding",
+                "warn",
+                "Driver containers with no twin binding: " + ", ".join(missing_twin),
+                hint=(
+                    "Drivers started without CYBERWAVE_TWIN_JSON_FILE or "
+                    "CYBERWAVE_TWIN_UUID publish to undefined keys."
+                ),
+            )
+        )
+
+    return checks
+
+
+_LEVEL_GLYPHS = {
+    "ok": "[green]✓[/green]",
+    "warn": "[yellow]⚠[/yellow]",
+    "error": "[red]✗[/red]",
+    "info": "[dim]·[/dim]",
+}
+
+
+def _print_preflight_checks(checks: list[_Check], *, verbose: bool) -> None:
+    """Render pre-flight/doctor results to the console."""
+    for c in checks:
+        glyph = _LEVEL_GLYPHS.get(c.level, "·")
+        console.print(f"  {glyph} [bold]{c.name}[/bold]  {c.message}")
+        if c.hint and (verbose or c.level in {"warn", "error"}):
+            for line in c.hint.splitlines():
+                console.print(f"      [dim]{line}[/dim]")
+
+
+@worker.command("doctor")
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    help="Show hints for passing checks too",
+)
+def worker_doctor(verbose: bool) -> None:
+    """Diagnose why a worker may not receive frames.
+
+    Runs a set of fast, local checks against the edge host and reports the
+    most common silent failure modes: missing edge-core, worker files the
+    container user can't read, absent co-located drivers, and environment
+    variable drift between driver and worker containers.
+
+    \b
+    Examples:
+        cyberwave worker doctor
+        cyberwave worker doctor --verbose
+    """
+    workers_dir = _get_workers_dir()
+    console.print("\n[bold]Cyberwave worker doctor[/bold]\n")
+    console.print(f"[dim]Workers directory: {workers_dir}[/dim]\n")
+
+    checks = _collect_preflight_checks(workers_dir)
+    _print_preflight_checks(checks, verbose=verbose)
+
+    errors = sum(1 for c in checks if c.level == "error")
+    warnings = sum(1 for c in checks if c.level == "warn")
+    console.print()
+    if errors:
+        console.print(f"[red]{errors} blocking issue(s)[/red], {warnings} warning(s)")
+        sys.exit(1)
+    if warnings:
+        console.print(f"[yellow]{warnings} warning(s)[/yellow] — worker may still run")
+        return
+    console.print("[green]All pre-flight checks passed.[/green]")

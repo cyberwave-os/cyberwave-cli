@@ -202,6 +202,25 @@ cyberwave worker logs --no-follow # print and exit
 
 Streams logs from the edge worker container (requires Docker).
 
+### `cyberwave worker doctor`
+
+```bash
+cyberwave worker doctor              # run a set of local sanity checks
+cyberwave worker doctor --verbose    # also show hints for passing checks
+```
+
+Diagnoses the common silent failure modes where a worker container looks
+healthy but hooks report `frames: 0`. Checks include:
+
+- `cyberwave-edge-core` is installed;
+- worker files in `{CONFIG_DIR}/workers/` are world-readable (UID 1001 needs to read them);
+- at least one `cyberwave-driver-*` container is running on this host;
+- `CYBERWAVE_ENVIRONMENT` and `ZENOH_CONNECT` agree between the host and any
+  running driver containers.
+
+`cyberwave worker start` now invokes the same checks as a pre-flight; pass
+`--skip-preflight` to bypass them.
+
 ### `cyberwave worker monitor`
 
 ```bash
