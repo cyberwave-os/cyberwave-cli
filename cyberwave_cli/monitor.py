@@ -364,10 +364,16 @@ class RateTracker:
         self._prev_recv_bytes: dict[str, int] = {}
         self._prev_ts: float = 0.0
         self._seeded = False
+        self._last_results: list[ZenohChannelStats] = []
 
-    def update(self, transport: dict[str, Any]) -> list[ZenohChannelStats]:
+    def update(
+        self,
+        transport: dict[str, Any],
+        snapshot_ts: float | None = None,
+    ) -> list[ZenohChannelStats]:
         """Return per-channel stats from the latest *transport* snapshot."""
-        now = time.time()
+        use_snapshot_clock = snapshot_ts is not None
+        now = float(snapshot_ts) if use_snapshot_clock else time.time()
 
         publish = transport.get("publish", {})
         recv = transport.get("recv", {})
@@ -381,7 +387,12 @@ class RateTracker:
             self._prev_recv_bytes = dict(recv_bytes)
             self._prev_ts = now
             self._seeded = True
-            return self._zeros(publish, recv)
+            self._last_results = self._zeros(publish, recv)
+            return self._last_results
+
+        # Stale snapshot: return cached rates to avoid aliasing.
+        if use_snapshot_clock and now == self._prev_ts:
+            return self._last_results
 
         elapsed = now - self._prev_ts
         if elapsed <= 0:
@@ -415,6 +426,7 @@ class RateTracker:
         self._prev_publish_bytes = dict(publish_bytes)
         self._prev_recv_bytes = dict(recv_bytes)
         self._prev_ts = now
+        self._last_results = results
         return results
 
     @staticmethod

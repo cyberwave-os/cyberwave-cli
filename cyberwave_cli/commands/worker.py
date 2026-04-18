@@ -618,6 +618,8 @@ def worker_monitor(update: float, container: str | None) -> None:
                 transport = zenoh_data.get("transport", {})
                 hooks_data = zenoh_data.get("hooks", {})
                 models_data = zenoh_data.get("models", [])
+                # Anchor rates on the worker clock to avoid wall-clock aliasing.
+                snapshot_ts = zenoh_data.get("ts")
 
                 snap = WorkerSnapshot(
                     container_name=container_name,
@@ -626,7 +628,7 @@ def worker_monitor(update: float, container: str | None) -> None:
                     docker=docker,
                     gpu=gpu,
                     thermal_power=thermal_reader.latest() if thermal_ok else ThermalPowerStats(),
-                    zenoh_channels=rate_tracker.update(transport),
+                    zenoh_channels=rate_tracker.update(transport, snapshot_ts=snapshot_ts),
                     hooks=parse_hook_stats(hooks_data),
                     models=parse_model_stats(models_data),
                 )
