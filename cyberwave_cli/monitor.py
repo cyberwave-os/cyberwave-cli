@@ -443,9 +443,30 @@ class RateTracker:
 
 
 def _display_channel(ch: str) -> str:
-    """Strip the Zenoh key prefix for display."""
-    parts = ch.split("/", 2)
-    return parts[2] if len(parts) >= 3 else ch
+    """Render a compact, twin-disambiguated form of a Zenoh key.
+
+    Canonical keys follow ``<prefix>/<twin_uuid>/data/<channel>[/<sensor>]``.
+    The ``<prefix>`` (``cw``) is always noise, but the twin UUID must stay in
+    the display: multi-twin workers subscribe to the same channel on
+    different twins (e.g. ``.../frames/color_camera`` on twin A and twin B),
+    and collapsing both to ``data/frames/color_camera`` makes the Zenoh
+    Throughput table look like duplicate rows of one camera.
+
+    We keep the first 8 hex chars of the twin UUID as a short prefix so the
+    two rows stay visually distinct while the display stays compact::
+
+        cw/<uuid>/data/frames/color_camera → <uuid8>/data/frames/color_camera
+
+    Short keys (no ``cw/<twin>/`` prefix) are returned unchanged so callers
+    that already hand us display-form strings keep working.
+    """
+    parts = ch.split("/", 3)
+    if len(parts) < 4:
+        return ch
+    twin_uuid = parts[1]
+    twin_short = twin_uuid[:8] if twin_uuid else twin_uuid
+    rest = f"{parts[2]}/{parts[3]}"
+    return f"{twin_short}/{rest}" if twin_short else rest
 
 
 def parse_hook_stats(hooks_data: dict[str, Any]) -> list[HookStats]:

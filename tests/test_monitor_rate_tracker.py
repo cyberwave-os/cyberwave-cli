@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from cyberwave_cli.monitor import RateTracker
+from cyberwave_cli.monitor import RateTracker, _display_channel
 
 
 def _transport(channel: str, count: int, byte_count: int = 0) -> dict:
@@ -127,3 +127,42 @@ class TestMultipleChannels:
         results = {r.channel: r.msgs_per_sec for r in tracker.update(t1, snapshot_ts=1.0)}
         assert results["frames"] == pytest.approx(30.0)
         assert results["detections"] == pytest.approx(5.0)
+
+
+class TestDisplayChannel:
+    """``_display_channel`` must keep multi-twin rows visually distinct.
+
+    Pins the fix for the monitor collapsing two distinct per-twin
+    subscriptions (``cw/<twin_A>/data/frames/color_camera`` and
+    ``cw/<twin_B>/data/frames/color_camera``) to the same display row,
+    which made multi-twin workers look like only one camera was publishing.
+    """
+
+    def test_full_canonical_key_keeps_short_twin_prefix(self):
+        """``cw/<uuid>/data/frames/<sensor>`` → ``<uuid8>/data/frames/<sensor>``."""
+        key = "cw/c91fde0e-1234-5678-9abc-def012345678/data/frames/color_camera"
+        assert _display_channel(key) == "c91fde0e/data/frames/color_camera"
+
+    def test_two_twins_same_channel_render_distinct(self):
+        """Two twins publishing under the same sensor name must not collapse.
+
+        This is the exact user-visible bug: both generated hooks pin to
+        ``color_camera`` (the shared asset sensor name) so both subscriptions
+        only differ by their twin UUID.  The monitor used to strip the UUID
+        entirely, making the two rows look like duplicates.
+        """
+        twin_a = "cw/aaaaaaaa-1111-2222-3333-444444444444/data/frames/color_camera"
+        twin_b = "cw/bbbbbbbb-1111-2222-3333-444444444444/data/frames/color_camera"
+        assert _display_channel(twin_a) != _display_channel(twin_b)
+        assert _display_channel(twin_a) == "aaaaaaaa/data/frames/color_camera"
+        assert _display_channel(twin_b) == "bbbbbbbb/data/frames/color_camera"
+
+    def test_sensor_less_channel_preserved(self):
+        """Channels without a sensor segment (``imu``, ``joint_states``) keep rendering."""
+        key = "cw/c91fde0e-1234-5678-9abc-def012345678/data/joint_states"
+        assert _display_channel(key) == "c91fde0e/data/joint_states"
+
+    def test_already_short_key_returned_unchanged(self):
+        """Short keys (already in display form) pass through untouched."""
+        assert _display_channel("frames/color_camera") == "frames/color_camera"
+        assert _display_channel("worker_stats") == "worker_stats"
