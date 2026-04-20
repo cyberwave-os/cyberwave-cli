@@ -1,6 +1,6 @@
-import importlib
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
+
+from tests._core_module_loader import load_core_module as _load_core_module
 
 
 class _FakeProjectsManager:
@@ -45,28 +45,6 @@ class _FakeTwinsManager:
         if twin_uuid in self._fail_on_update:
             raise RuntimeError("simulated update failure")
         self.updated.append((str(twin_uuid), metadata))
-
-
-def _load_core_module(monkeypatch):
-    """Import cyberwave_cli.core with lightweight cyberwave stubs."""
-    cyberwave_module = ModuleType("cyberwave")
-
-    config_module = ModuleType("cyberwave.config")
-    config_module.DEFAULT_BASE_URL = "https://api.example.test"
-
-    fingerprint_module = ModuleType("cyberwave.fingerprint")
-    fingerprint_module.generate_fingerprint = lambda: "fingerprint-test"
-
-    cyberwave_module.config = config_module
-    cyberwave_module.fingerprint = fingerprint_module
-
-    monkeypatch.setitem(sys.modules, "cyberwave", cyberwave_module)
-    monkeypatch.setitem(sys.modules, "cyberwave.config", config_module)
-    monkeypatch.setitem(sys.modules, "cyberwave.fingerprint", fingerprint_module)
-
-    sys.modules.pop("cyberwave_cli.config", None)
-    sys.modules.pop("cyberwave_cli.core", None)
-    return importlib.import_module("cyberwave_cli.core")
 
 
 def test_workspace_environments_includes_standalone_and_project_scoped(monkeypatch):
@@ -155,7 +133,13 @@ def test_workspace_environments_deduplicates_between_project_and_global_lists(mo
     assert [env.uuid for env in result] == ["env-dup", "env-standalone"]
 
 
-def test_detach_edge_fingerprint_from_other_twins_removes_only_stale_non_selected(monkeypatch):
+def test_detach_edge_fingerprint_sends_explicit_null_to_delete_key(monkeypatch):
+    """Regression: backend treats missing keys as "unchanged" and only
+    explicit ``None`` values as deletions, so the detach call must send
+    ``{"edge_fingerprint": None}`` rather than a stripped copy of the
+    existing metadata. Otherwise stale fingerprints from previous installs
+    survive forever and pin unwanted driver containers to this edge.
+    """
     core = _load_core_module(monkeypatch)
 
     environment_uuid = "env-1"
@@ -184,7 +168,10 @@ def test_detach_edge_fingerprint_from_other_twins_removes_only_stale_non_selecte
     assert detached == 1
     assert failed == 0
     assert twins.list_calls == [environment_uuid]
-    assert twins.updated == [("twin-stale", {"label": "old-binding"})]
+    # The payload must send an explicit null so the backend deletes the key.
+    # Sending the remaining metadata without ``edge_fingerprint`` would merge
+    # on top of the stored copy, leaving the stale fingerprint intact.
+    assert twins.updated == [("twin-stale", {"edge_fingerprint": None})]
 
 
 def test_detach_edge_fingerprint_from_other_twins_counts_update_failures(monkeypatch):
@@ -209,6 +196,35 @@ def test_detach_edge_fingerprint_from_other_twins_counts_update_failures(monkeyp
 
     assert detached == 0
     assert failed == 1
+
+
+def test_attach_edge_fingerprint_sends_only_the_key(monkeypatch):
+    """Attach must send only the single key it wants to write; the backend's
+    merge semantics preserve the rest of the metadata. Sending a full dict
+    copied off an SDK wrapper risks overwriting with an empty ``{}`` when
+    the wrapper doesn't expose ``.metadata`` (as ``LocomoteCameraTwin`` did
+    not), silently wiping ``drivers``, ``attach_to``, etc.
+    """
+    core = _load_core_module(monkeypatch)
+
+    twins = _FakeTwinsManager(
+        twins=[],
+        fail_on_update={"twin-broken"},
+    )
+    client = SimpleNamespace(twins=twins)
+
+    updated, failed = core._attach_edge_fingerprint_to_twins(
+        client,
+        twin_uuids=["twin-a", "twin-broken", "twin-c"],
+        edge_fingerprint="fp-123",
+    )
+
+    assert updated == 2
+    assert failed == 1
+    assert twins.updated == [
+        ("twin-a", {"edge_fingerprint": "fp-123"}),
+        ("twin-c", {"edge_fingerprint": "fp-123"}),
+    ]
 
 
 class _FakeWorkspacesManager:

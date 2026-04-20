@@ -809,24 +809,24 @@ def _attach_edge_fingerprint_to_twins(
 ) -> tuple[int, int]:
     """Update selected twins metadata with edge_fingerprint.
 
+    The backend's ``twins.update`` merges ``metadata`` on top of the stored
+    copy, so we only need to send the single key we want to write.
+
     Returns:
         (updated_count, failed_count)
     """
     updated = 0
     failed = 0
-
     for twin_uuid in twin_uuids:
         try:
-            twin = client.twins.get(twin_uuid)
-            metadata = getattr(twin, "metadata", {}) or {}
-            if not isinstance(metadata, dict):
-                metadata = {}
-            metadata["edge_fingerprint"] = edge_fingerprint
-            client.twins.update(twin_uuid, metadata=metadata)
+            client.twins.update(twin_uuid, metadata={"edge_fingerprint": edge_fingerprint})
             updated += 1
-        except Exception:
+        except Exception as exc:
+            console.print(
+                f"[yellow]Failed to attach fingerprint to twin "
+                f"{twin_uuid[:8]}…: {exc}[/yellow]"
+            )
             failed += 1
-
     return updated, failed
 
 
@@ -838,6 +838,13 @@ def _detach_edge_fingerprint_from_other_twins(
 ) -> tuple[int, int]:
     """Remove stale edge_fingerprint from twins not selected for this edge.
 
+    The backend treats explicit ``None`` values in ``metadata`` as deletions
+    while merging everything else, so we must send ``{"edge_fingerprint":
+    None}`` to actually clear the key — simply omitting it would keep the
+    stored value intact (which is exactly the bug that caused stale
+    fingerprints from previous installs to pin unwanted drivers to this
+    edge).
+
     Returns:
         (detached_count, failed_count)
     """
@@ -847,7 +854,10 @@ def _detach_edge_fingerprint_from_other_twins(
 
     try:
         twins = client.twins.list(environment_id=environment_uuid)
-    except Exception:
+    except Exception as exc:
+        console.print(
+            f"[yellow]Could not list twins to clear stale fingerprints: {exc}[/yellow]"
+        )
         return detached, 1
 
     for twin in twins:
@@ -862,12 +872,14 @@ def _detach_edge_fingerprint_from_other_twins(
         if metadata.get("edge_fingerprint") != edge_fingerprint:
             continue
 
-        updated_metadata = dict(metadata)
-        updated_metadata.pop("edge_fingerprint", None)
         try:
-            client.twins.update(twin_uuid, metadata=updated_metadata)
+            client.twins.update(twin_uuid, metadata={"edge_fingerprint": None})
             detached += 1
-        except Exception:
+        except Exception as exc:
+            console.print(
+                f"[yellow]Failed to detach fingerprint from twin "
+                f"{twin_uuid[:8]}…: {exc}[/yellow]"
+            )
             failed += 1
 
     return detached, failed
