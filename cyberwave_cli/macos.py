@@ -542,6 +542,12 @@ def setup_usbip_server(*, force: bool = False) -> bool:
 
 CAMERA_STREAM_LAUNCHD_LABEL = "com.cyberwave.camera-stream"
 CAMERA_STREAM_PORT = 8091
+# Prefix used for per-camera launchd labels when more than one physical
+# camera is mapped on the host (e.g. ``com.cyberwave.camera-stream.1``).
+CAMERA_STREAM_LAUNCHD_LABEL_PREFIX = f"{CAMERA_STREAM_LAUNCHD_LABEL}."
+# Name of the JSON file that records per-twin stream URLs so edge-core can
+# bind each driver container to the correct MJPEG endpoint.
+CAMERA_STREAMS_FILENAME = "camera_streams.json"
 
 _CAMERA_STREAM_WRAPPER_TEMPLATE = textwrap.dedent("""\
     #!/bin/bash
@@ -594,16 +600,44 @@ _CAMERA_STREAM_PLIST_TEMPLATE = textwrap.dedent("""\
 """)
 
 
-def _camera_stream_wrapper_path() -> Path:
-    return _user_home() / ".cyberwave" / "camera_stream.sh"
+def _camera_stream_wrapper_path(slot: Optional[int] = None) -> Path:
+    """Path to the ffmpeg wrapper script. ``slot`` differentiates per-camera services."""
+    if slot is None or slot == 0:
+        return _user_home() / ".cyberwave" / "camera_stream.sh"
+    return _user_home() / ".cyberwave" / f"camera_stream.{slot}.sh"
 
 
-def _camera_stream_plist_path() -> Path:
-    return _user_home() / "Library" / "LaunchAgents" / f"{CAMERA_STREAM_LAUNCHD_LABEL}.plist"
+def _camera_stream_plist_path(slot: Optional[int] = None) -> Path:
+    """Path to the launchd plist. ``slot`` differentiates per-camera services."""
+    label = _camera_stream_launchd_label(slot)
+    return _user_home() / "Library" / "LaunchAgents" / f"{label}.plist"
 
 
-def _camera_stream_log_path() -> Path:
-    return _user_home() / ".cyberwave" / "camera_stream.log"
+def _camera_stream_log_path(slot: Optional[int] = None) -> Path:
+    if slot is None or slot == 0:
+        return _user_home() / ".cyberwave" / "camera_stream.log"
+    return _user_home() / ".cyberwave" / f"camera_stream.{slot}.log"
+
+
+def _camera_stream_launchd_label(slot: Optional[int] = None) -> str:
+    if slot is None or slot == 0:
+        return CAMERA_STREAM_LAUNCHD_LABEL
+    return f"{CAMERA_STREAM_LAUNCHD_LABEL_PREFIX}{slot}"
+
+
+def _camera_stream_port(slot: Optional[int] = None) -> int:
+    """Port number for the ffmpeg MJPEG server of *slot*.
+
+    Slot 0 keeps the legacy port (8091) for back-compat; additional slots
+    are assigned consecutive ports above it.
+    """
+    if slot is None or slot == 0:
+        return CAMERA_STREAM_PORT
+    return CAMERA_STREAM_PORT + int(slot)
+
+
+def _camera_streams_config_path() -> Path:
+    return _user_home() / ".cyberwave" / CAMERA_STREAMS_FILENAME
 
 
 def _has_ffmpeg() -> bool:
@@ -650,12 +684,39 @@ def is_camera_stream_running() -> bool:
     return _is_port_listening(CAMERA_STREAM_PORT)
 
 
-def _teardown_camera_stream_server() -> None:
-    """Stop the camera stream server and remove all related artifacts."""
-    console = _get_console()
-    console.print("[cyan]Tearing down existing camera stream server...[/cyan]")
+def _discover_camera_stream_slots() -> list[int]:
+    """Return every launchd slot with an existing plist under ``~/Library/LaunchAgents``."""
+    agents_dir = _user_home() / "Library" / "LaunchAgents"
+    if not agents_dir.is_dir():
+        return [0]
+    slots: set[int] = {0}
+    for entry in agents_dir.iterdir():
+        name = entry.name
+        if not name.startswith(CAMERA_STREAM_LAUNCHD_LABEL_PREFIX):
+            continue
+        if not name.endswith(".plist"):
+            continue
+        suffix = name[len(CAMERA_STREAM_LAUNCHD_LABEL_PREFIX) : -len(".plist")]
+        try:
+            slots.add(int(suffix))
+        except ValueError:
+            continue
+    return sorted(slots)
 
-    _bootout_launchd_service(CAMERA_STREAM_LAUNCHD_LABEL)
+
+def _teardown_camera_stream_server() -> None:
+    """Stop every camera stream service and remove all related artifacts.
+
+    Tears down both the legacy single-camera service (slot 0) and any
+    per-camera services (slot ≥ 1) that were created for multi-twin
+    mappings so a subsequent install starts from a clean slate.
+    """
+    console = _get_console()
+    console.print("[cyan]Tearing down existing camera stream server(s)...[/cyan]")
+
+    slots = _discover_camera_stream_slots()
+    for slot in slots:
+        _bootout_launchd_service(_camera_stream_launchd_label(slot))
 
     # Kill any lingering ffmpeg camera-stream processes that survived bootout.
     for _ in range(5):
@@ -671,11 +732,17 @@ def _teardown_camera_stream_server() -> None:
         )
         time.sleep(0.5)
 
-    for path in [
-        _camera_stream_plist_path(),
-        _camera_stream_wrapper_path(),
-        _camera_stream_log_path(),
-    ]:
+    paths_to_remove: list[Path] = []
+    for slot in slots:
+        paths_to_remove.extend(
+            [
+                _camera_stream_plist_path(slot),
+                _camera_stream_wrapper_path(slot),
+                _camera_stream_log_path(slot),
+            ]
+        )
+    paths_to_remove.append(_camera_streams_config_path())
+    for path in paths_to_remove:
         try:
             path.unlink(missing_ok=True)
         except OSError:
@@ -684,10 +751,155 @@ def _teardown_camera_stream_server() -> None:
     console.print("[green]Camera stream server teardown complete.[/green]")
 
 
+def _bring_up_camera_stream_slot(
+    *, slot: int, device_name: str
+) -> tuple[bool, bool]:
+    """Materialize and start the ffmpeg launchd service for a single camera.
+
+    Creates the per-slot wrapper + plist, reloads launchd, and waits for the
+    MJPEG port to open.
+
+    Returns ``(loaded, port_open)``:
+      * ``loaded`` — the plist was successfully registered with launchd. When
+        False, nothing else will bring this slot up and the caller should
+        treat the slot as failed.
+      * ``port_open`` — the MJPEG port was listening within the wait window.
+        May be False when ``loaded`` is True (e.g. ffmpeg is still warming
+        up, the camera is in use, or launchd will retry via ``KeepAlive``).
+        Callers typically persist the mapping anyway so the service can
+        recover transparently.
+    """
+    console = _get_console()
+
+    wrapper_path = _camera_stream_wrapper_path(slot)
+    plist_path = _camera_stream_plist_path(slot)
+    log_path = _camera_stream_log_path(slot)
+    label = _camera_stream_launchd_label(slot)
+    port = _camera_stream_port(slot)
+
+    wrapper_contents = _CAMERA_STREAM_WRAPPER_TEMPLATE.format(port=port)
+    try:
+        _write_file_as_real_user(wrapper_path, wrapper_contents, mode=0o755)
+    except OSError as exc:
+        console.print(f"[red]Failed to create camera stream script: {exc}[/red]")
+        return False, False
+
+    plist_contents = _CAMERA_STREAM_PLIST_TEMPLATE.format(
+        label=label,
+        wrapper_path=str(wrapper_path),
+        log_path=str(log_path),
+        device_name=_xml_escape(device_name),
+    )
+    try:
+        _write_file_as_real_user(plist_path, plist_contents)
+    except OSError as exc:
+        console.print(f"[red]Failed to write camera stream plist: {exc}[/red]")
+        return False, False
+
+    console.print(f"[green]Created:[/green] {plist_path}")
+
+    _, real_uid, _ = _resolve_real_user()
+    gui_domain = f"gui/{real_uid}" if real_uid is not None else None
+
+    _bootout_launchd_service(label)
+
+    if gui_domain:
+        try:
+            _run(_launchctl_as_user(["bootstrap", gui_domain, str(plist_path)]))
+        except subprocess.CalledProcessError:
+            console.print(
+                "[yellow]launchctl bootstrap failed, falling back to load...[/yellow]"
+            )
+            try:
+                _run(_launchctl_as_user(["load", str(plist_path)]))
+            except subprocess.CalledProcessError as exc:
+                console.print(
+                    f"[red]Failed to load camera stream service "
+                    f"(exit {exc.returncode}).[/red]"
+                )
+                return False, False
+    else:
+        try:
+            _run(_launchctl_as_user(["load", str(plist_path)]))
+        except subprocess.CalledProcessError as exc:
+            console.print(
+                f"[red]Failed to load camera stream service "
+                f"(exit {exc.returncode}).[/red]"
+            )
+            return False, False
+
+    max_wait_secs = 10
+    for _ in range(max_wait_secs * 2):
+        if _is_port_listening(port):
+            console.print(
+                f"[green]Camera stream server running on port {port} ({label}).[/green]"
+            )
+            return True, True
+        time.sleep(0.5)
+
+    console.print(
+        f"[yellow]Camera stream service {label} loaded but port {port} is not "
+        f"listening after {max_wait_secs}s. Check logs at {log_path}[/yellow]"
+    )
+    # launchd will keep retrying (``KeepAlive``); surface this to callers so
+    # they can include the slot in a summary warning without tearing it down.
+    return True, False
+
+
+def _prompt_single_camera(
+    cameras: list[tuple[int, str]], *, prompt_label: str, default_idx: int
+) -> Optional[tuple[int, str]]:
+    """Render a menu, read stdin, and return the chosen ``(index, name)`` or ``None``."""
+    console = _get_console()
+    console.print("[cyan]Available cameras:[/cyan]")
+    valid_indices = {i for i, _ in cameras}
+    for idx, name in cameras:
+        console.print(f"  [bold]{idx}[/bold]) {name}")
+    raw = input(f"{prompt_label} [{default_idx}]: ").strip()
+    if raw == "":
+        chosen_idx = default_idx
+    else:
+        try:
+            chosen_idx = int(raw)
+        except ValueError:
+            console.print("[red]Invalid selection.[/red]")
+            return None
+    if chosen_idx not in valid_indices:
+        console.print(f"[red]Camera index {chosen_idx} is not available.[/red]")
+        return None
+    name = next((n for i, n in cameras if i == chosen_idx), str(chosen_idx))
+    return chosen_idx, name
+
+
+def _persist_camera_streams_config(
+    *,
+    devices: list[tuple[int, str]],
+    twin_to_stream_url: dict[str, str],
+) -> None:
+    """Write ``camera_streams.json`` so edge-core can resolve per-twin URLs."""
+    import json
+
+    console = _get_console()
+    path = _camera_streams_config_path()
+    data = {
+        "devices": [{"index": idx, "name": name} for idx, name in devices],
+        "twin_to_stream_url": twin_to_stream_url,
+    }
+    try:
+        _write_file_as_real_user(path, json.dumps(data, indent=2))
+        console.print(f"[dim]Saved twin→camera map to {path}[/dim]")
+    except OSError as exc:
+        console.print(
+            f"[yellow]Could not persist {path}: {exc}[/yellow]\n"
+            f"[dim]Per-twin camera mapping may not survive reboots.[/dim]"
+        )
+
+
 def setup_camera_stream_server(
     *,
     force: bool = False,
     device_index: Optional[int] = None,
+    camera_twins: Optional[list[tuple[str, str]]] = None,
 ) -> bool:
     """Install the optional MJPEG camera stream server on macOS.
 
@@ -699,6 +911,14 @@ def setup_camera_stream_server(
     *device_index* selects the AVFoundation camera; when ``None``, the
     user is prompted interactively (or ``0`` is used when only one camera
     is available).
+
+    When *camera_twins* lists two or more camera-bearing twins **and** the
+    host exposes at least two AVFoundation devices, the user is walked
+    through a per-twin mapping and one ffmpeg launchd service is started
+    per distinct physical camera (on sequential ports starting at
+    :data:`CAMERA_STREAM_PORT`).  The mapping is persisted to
+    ``~/.cyberwave/camera_streams.json`` so edge-core can bind each driver
+    container to the correct MJPEG endpoint.
 
     Returns True on success.  Returns True immediately on non-macOS.
     """
@@ -726,13 +946,23 @@ def setup_camera_stream_server(
         "containers can consume.\n"
     )
 
-    # --- camera device selection ---
+    camera_twins = camera_twins or []
+    cameras = _list_avfoundation_devices() if device_index is None else []
+    multi_mapping = (
+        device_index is None
+        and len(camera_twins) >= 2
+        and len(cameras) >= 2
+    )
+
+    if multi_mapping:
+        return _setup_camera_stream_server_multi(cameras, camera_twins)
+
+    # --- legacy single-camera flow ---
     # AVFoundation numeric indices are unstable (they shift when devices
     # connect/disconnect), so we resolve and store the *device name* which
     # ffmpeg also accepts via ``-i``.
     device_name: Optional[str] = None
     if device_index is None:
-        cameras = _list_avfoundation_devices()
         if not cameras:
             console.print(
                 "[yellow]Could not detect AVFoundation cameras; defaulting to device 0.[/yellow]"
@@ -742,97 +972,21 @@ def setup_camera_stream_server(
             device_name = cameras[0][1]
             console.print(f"[cyan]Detected camera:[/cyan] {device_name}")
         else:
-            console.print("[cyan]Available cameras:[/cyan]")
-            for idx, name in cameras:
-                console.print(f"  [bold]{idx}[/bold]) {name}")
-            valid_indices = {i for i, _ in cameras}
-            raw = input(f"Enter camera number [{cameras[0][0]}]: ").strip()
-            if raw == "":
-                chosen_idx = cameras[0][0]
-            else:
-                try:
-                    chosen_idx = int(raw)
-                except ValueError:
-                    console.print("[red]Invalid selection.[/red]")
-                    return False
-            if chosen_idx not in valid_indices:
-                console.print(
-                    f"[red]Camera index {chosen_idx} is not available.[/red]"
-                )
-                return False
-            device_name = next(
-                (n for i, n in cameras if i == chosen_idx), str(chosen_idx)
+            chosen = _prompt_single_camera(
+                cameras,
+                prompt_label="Enter camera number",
+                default_idx=cameras[0][0],
             )
+            if chosen is None:
+                return False
+            _, device_name = chosen
             console.print(f"[green]Selected:[/green] {device_name}")
     else:
         device_name = str(device_index)
 
-    wrapper_path = _camera_stream_wrapper_path()
-    plist_path = _camera_stream_plist_path()
-    log_path = _camera_stream_log_path()
-
-    wrapper_contents = _CAMERA_STREAM_WRAPPER_TEMPLATE.format(port=CAMERA_STREAM_PORT)
-    try:
-        _write_file_as_real_user(wrapper_path, wrapper_contents, mode=0o755)
-    except OSError as exc:
-        console.print(f"[red]Failed to create camera stream script: {exc}[/red]")
+    loaded, _port_open = _bring_up_camera_stream_slot(slot=0, device_name=device_name)
+    if not loaded:
         return False
-
-    plist_contents = _CAMERA_STREAM_PLIST_TEMPLATE.format(
-        label=CAMERA_STREAM_LAUNCHD_LABEL,
-        wrapper_path=str(wrapper_path),
-        log_path=str(log_path),
-        device_name=_xml_escape(device_name),
-    )
-
-    try:
-        _write_file_as_real_user(plist_path, plist_contents)
-    except OSError as exc:
-        console.print(f"[red]Failed to write camera stream plist: {exc}[/red]")
-        return False
-
-    console.print(f"[green]Created:[/green] {plist_path}")
-
-    _, real_uid, _ = _resolve_real_user()
-    gui_domain = f"gui/{real_uid}" if real_uid is not None else None
-
-    _bootout_launchd_service(CAMERA_STREAM_LAUNCHD_LABEL)
-
-    if gui_domain:
-        try:
-            _run(_launchctl_as_user(["bootstrap", gui_domain, str(plist_path)]))
-        except subprocess.CalledProcessError:
-            console.print("[yellow]launchctl bootstrap failed, falling back to load...[/yellow]")
-            try:
-                _run(_launchctl_as_user(["load", str(plist_path)]))
-            except subprocess.CalledProcessError as exc:
-                console.print(
-                    f"[red]Failed to load camera stream service (exit {exc.returncode}).[/red]"
-                )
-                return False
-    else:
-        try:
-            _run(_launchctl_as_user(["load", str(plist_path)]))
-        except subprocess.CalledProcessError as exc:
-            console.print(
-                f"[red]Failed to load camera stream service (exit {exc.returncode}).[/red]"
-            )
-            return False
-
-    max_wait_secs = 10
-    for _ in range(max_wait_secs * 2):
-        if is_camera_stream_running():
-            console.print(
-                f"[green]Camera stream server running on port {CAMERA_STREAM_PORT} "
-                f"({CAMERA_STREAM_LAUNCHD_LABEL}).[/green]"
-            )
-            break
-        time.sleep(0.5)
-    else:
-        console.print(
-            f"[yellow]Camera stream service loaded but port {CAMERA_STREAM_PORT} is not "
-            f"listening after {max_wait_secs}s. Check logs at {log_path}[/yellow]"
-        )
 
     stream_url = f"http://host.docker.internal:{CAMERA_STREAM_PORT}"
     try:
@@ -849,7 +1003,240 @@ def setup_camera_stream_server(
             f"[dim]Set manually: export CYBERWAVE_MACOS_CAMERA_STREAM_URL={stream_url}[/dim]"
         )
 
+    # When we already know which twins want this single stream, record a 1-1
+    # mapping so edge-core uses the same code path as the multi-camera case.
+    if camera_twins:
+        twin_map = {
+            str(twin_uuid): stream_url for twin_uuid, _ in camera_twins
+        }
+        _persist_camera_streams_config(
+            devices=cameras or [(0, device_name or "0")],
+            twin_to_stream_url=twin_map,
+        )
+
     return True
+
+
+def _setup_camera_stream_server_multi(
+    cameras: list[tuple[int, str]],
+    camera_twins: list[tuple[str, str]],
+) -> bool:
+    """Per-twin mapping path: one ffmpeg service per distinct physical camera.
+
+    The prompt loop persists partial progress: if the user aborts with Ctrl-C
+    or enters an invalid value, the twins that were already mapped are kept
+    and the remaining ones fall back to whatever edge-core's legacy resolution
+    picks.  After bringing up each distinct camera's ffmpeg service, the
+    function surfaces a per-slot summary so silent port-binding failures
+    don't hide behind a green "install complete" message.
+    """
+    console = _get_console()
+
+    console.print(
+        f"\n[bold]Detected {len(cameras)} camera(s) and "
+        f"{len(camera_twins)} camera twin(s).[/bold]"
+    )
+    console.print(
+        "[dim]Map each twin to the physical camera it is wired to. "
+        "A camera may be shared across twins.[/dim]\n"
+    )
+
+    # twin_uuid -> (camera_index, camera_name)
+    twin_assignments: dict[str, tuple[int, str]] = {}
+    # camera_index -> (camera_name, slot)
+    camera_to_slot: dict[int, tuple[str, int]] = {}
+
+    valid_indices = {i for i, _ in cameras}
+    default_idx = cameras[0][0]
+
+    twin_name_by_uuid = dict(camera_twins)
+
+    aborted = False
+    for twin_uuid, twin_name in camera_twins:
+        console.print(f"[bold]Twin:[/bold] {twin_name} [dim]({twin_uuid[:8]}...)[/dim]")
+        for idx, name in cameras:
+            assigned_names = [
+                twin_name_by_uuid.get(other_uuid, other_uuid)
+                for other_uuid, (other_idx, _) in twin_assignments.items()
+                if other_idx == idx
+            ]
+            suffix = (
+                f"  [dim](already assigned to: {', '.join(assigned_names)})[/dim]"
+                if assigned_names
+                else ""
+            )
+            console.print(f"  [bold]{idx}[/bold]) {name}{suffix}")
+        try:
+            raw = input(f"Camera for {twin_name} [{default_idx}]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print(
+                "\n[yellow]Aborted — keeping mappings made so far; "
+                "remaining twins will fall back to the default stream.[/yellow]"
+            )
+            aborted = True
+            break
+        if raw == "":
+            chosen_idx = default_idx
+        else:
+            try:
+                chosen_idx = int(raw)
+            except ValueError:
+                console.print(
+                    "[yellow]Invalid selection — keeping mappings made so far; "
+                    "remaining twins will fall back to the default stream.[/yellow]"
+                )
+                aborted = True
+                break
+        if chosen_idx not in valid_indices:
+            console.print(
+                f"[yellow]Camera index {chosen_idx} is not available — "
+                f"keeping mappings made so far; remaining twins will fall back "
+                f"to the default stream.[/yellow]"
+            )
+            aborted = True
+            break
+        chosen_name = next((n for i, n in cameras if i == chosen_idx), str(chosen_idx))
+        twin_assignments[twin_uuid] = (chosen_idx, chosen_name)
+        if chosen_idx not in camera_to_slot:
+            camera_to_slot[chosen_idx] = (chosen_name, len(camera_to_slot))
+            # Shift default toward an unmapped camera to speed up the flow.
+            remaining = [i for i in valid_indices if i not in camera_to_slot]
+            if remaining:
+                default_idx = remaining[0]
+        console.print(f"[green]Selected:[/green] {chosen_name}\n")
+
+    if not twin_assignments:
+        console.print("[yellow]No twins mapped — skipping camera stream setup.[/yellow]")
+        return False
+
+    # Bring up one ffmpeg service per distinct camera and track per-slot state.
+    #   slot -> (camera_name, port_open)
+    slot_status: dict[int, tuple[str, bool]] = {}
+    for camera_idx, (camera_name, slot) in camera_to_slot.items():
+        loaded, port_open = _bring_up_camera_stream_slot(
+            slot=slot, device_name=camera_name
+        )
+        if not loaded:
+            console.print(
+                f"[red]Failed to register ffmpeg service for {camera_name} "
+                f"(slot {slot}) — skipping.[/red]"
+            )
+            continue
+        slot_status[slot] = (camera_name, port_open)
+
+    # Build twin_uuid -> stream URL map for every successfully *registered*
+    # slot.  Port-open failures are persisted too so launchd's KeepAlive can
+    # recover the service later; they're surfaced via the summary below.
+    twin_to_stream_url: dict[str, str] = {}
+    for twin_uuid, (camera_idx, _) in twin_assignments.items():
+        slot = camera_to_slot[camera_idx][1]
+        if slot not in slot_status:
+            continue
+        port = _camera_stream_port(slot)
+        twin_to_stream_url[str(twin_uuid)] = f"http://host.docker.internal:{port}"
+
+    _persist_camera_streams_config(
+        devices=cameras,
+        twin_to_stream_url=twin_to_stream_url,
+    )
+
+    # Set the legacy env var to the first mapped twin's URL for back-compat
+    # with older edge-core builds that only know about the single stream URL.
+    if twin_to_stream_url:
+        first_mapped_uuid = next(
+            (str(uuid) for uuid, _ in camera_twins if str(uuid) in twin_to_stream_url),
+            None,
+        )
+        if first_mapped_uuid is not None:
+            try:
+                from .credentials import upsert_runtime_env
+
+                primary_url = twin_to_stream_url[first_mapped_uuid]
+                upsert_runtime_env("CYBERWAVE_MACOS_CAMERA_STREAM_URL", primary_url)
+                console.print(
+                    f"[green]Saved[/green] CYBERWAVE_MACOS_CAMERA_STREAM_URL={primary_url} "
+                    "to credentials.json (first mapped twin's stream)"
+                )
+            except Exception as exc:
+                console.print(
+                    f"[yellow]Could not persist primary camera stream URL: {exc}[/yellow]"
+                )
+
+    _print_multi_camera_summary(
+        camera_twins=camera_twins,
+        twin_assignments=twin_assignments,
+        camera_to_slot=camera_to_slot,
+        slot_status=slot_status,
+        aborted=aborted,
+    )
+
+    # Success means at least one twin has a live mapping.  If every slot
+    # failed to register, signal failure to the caller.
+    return bool(twin_to_stream_url)
+
+
+def _print_multi_camera_summary(
+    *,
+    camera_twins: list[tuple[str, str]],
+    twin_assignments: dict[str, tuple[int, str]],
+    camera_to_slot: dict[int, tuple[str, int]],
+    slot_status: dict[int, tuple[str, bool]],
+    aborted: bool,
+) -> None:
+    """Render the final per-twin / per-slot result table.
+
+    Makes it obvious which twins were mapped, which were skipped, and which
+    physical cameras have a running MJPEG server vs. a pending one.
+    """
+    console = _get_console()
+    console.print("\n[bold]Camera stream setup summary[/bold]")
+
+    unmapped_names: list[str] = []
+    for twin_uuid, twin_name in camera_twins:
+        assignment = twin_assignments.get(twin_uuid)
+        if assignment is None:
+            unmapped_names.append(twin_name)
+            continue
+        _, camera_name = assignment
+        slot = camera_to_slot[assignment[0]][1]
+        status = slot_status.get(slot)
+        if status is None:
+            console.print(
+                f"  [red]✗[/red] {twin_name} → {camera_name} "
+                f"[red](service failed to register)[/red]"
+            )
+        elif status[1]:
+            console.print(
+                f"  [green]✓[/green] {twin_name} → {camera_name} "
+                f"[dim](slot {slot}, port {_camera_stream_port(slot)})[/dim]"
+            )
+        else:
+            console.print(
+                f"  [yellow]○[/yellow] {twin_name} → {camera_name} "
+                f"[yellow](slot {slot}, port {_camera_stream_port(slot)} not "
+                f"yet listening — launchd will retry)[/yellow]"
+            )
+
+    if unmapped_names:
+        console.print(
+            "  [dim]Unmapped twins will use the default stream: "
+            + ", ".join(unmapped_names)
+            + "[/dim]"
+        )
+
+    pending = [s for s, (_, ok) in slot_status.items() if not ok]
+    if pending:
+        console.print(
+            f"[yellow]Note:[/yellow] {len(pending)} stream(s) did not become "
+            f"reachable during setup.  If a twin keeps failing, re-run "
+            f"[bold]cyberwave edge install --reconfigure-camera[/bold] after "
+            f"checking the ffmpeg logs under ~/.cyberwave/."
+        )
+    if aborted:
+        console.print(
+            "[dim]Mapping was stopped before every twin was walked; "
+            "run the reconfigure flow above to finish it.[/dim]"
+        )
 
 
 # ---- Edge-core launchd service -----------------------------------------------

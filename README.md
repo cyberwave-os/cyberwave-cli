@@ -432,7 +432,9 @@ Manage the edge node service lifecycle, configuration, and monitoring.
 
 Installs the `cyberwave-edge-core` package (via apt-get on Debian/Ubuntu) and creates a systemd service so it starts on boot. Guides you through workspace, environment, and twin selection.
 
-On **macOS**, the installer also sets up an MJPEG camera stream bridge (using `ffmpeg` and AVFoundation) and prompts you to select which camera to use. The selected camera is stored by **device name** (not index) so it persists across USB reconnections and reboots.
+On **macOS**, the installer also sets up an MJPEG camera stream bridge (using `ffmpeg` and AVFoundation) and prompts you to select which camera to use. The selected camera is stored by **device name** (not index) so it persists across USB reconnections and reboots. With multiple camera-bearing twins and multiple AVFoundation devices, the installer walks you through a per-twin mapping and launches one `ffmpeg` MJPEG service per distinct camera (sequential ports starting at `8091`). Assignments are persisted in `~/.cyberwave/camera_streams.json` under `twin_to_stream_url` and honored by edge-core when it wires each driver container.
+
+On **Linux** with multiple camera-bearing twins, the installer walks you through a per-twin mapping so each twin is bound to a specific `/dev/video*` device. The mapping is persisted in `~/.cyberwave/cameras.json` under `twin_to_device` and honored by edge-core when it launches each driver container. A single-camera host automatically shares the device across every selected camera twin.
 
 On non-apt platforms, `--channel dev|staging` installs prerelease Python builds from the Buildkite Python registry; stable installs continue to use the public PyPI release.
 

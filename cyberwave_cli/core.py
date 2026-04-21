@@ -1798,67 +1798,240 @@ def start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
 _CAMERA_SENSOR_TYPES = {"camera", "rgb", "depth_camera"}
 
 
-def _any_twin_has_camera_sensor() -> bool:
-    """Check downloaded twin JSON files for camera-type sensors."""
-    for path in CONFIG_DIR.glob("*.json"):
+def _load_selected_twin_uuids() -> set[str] | None:
+    """Return the twin UUIDs the user selected in ``environment.json``.
+
+    Returns ``None`` when the file is missing or does not list any twins,
+    signalling callers to fall back to "every cached twin".
+    """
+    if not ENVIRONMENT_FILE.exists():
+        return None
+    try:
+        data = json.loads(ENVIRONMENT_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    twin_uuids = data.get("twin_uuids")
+    if not isinstance(twin_uuids, list):
+        return None
+    selected = {str(u) for u in twin_uuids if u}
+    return selected or None
+
+
+def _list_camera_twins() -> list[tuple[str, str]]:
+    """Return ``(twin_uuid, twin_name)`` for each *selected* twin with a camera sensor.
+
+    Reads the ``{twin_uuid}.json`` files written by
+    :func:`_download_twin_json_files`, filters to assets that declare at
+    least one camera-type sensor, and then restricts the result to the
+    twins listed in ``environment.json`` when that file is present.  This
+    ensures the per-twin camera mapping only walks through the twins the
+    user actually chose in the connected-twin picker, ignoring stale
+    caches from previous installs.
+    """
+    selected_uuids = _load_selected_twin_uuids()
+    results: list[tuple[str, str]] = []
+    for path in sorted(CONFIG_DIR.glob("*.json")):
         if path.name in ("credentials.json", "environment.json", "cameras.json", "fingerprint.json"):
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            asset = data.get("asset") or {}
-            schema = asset.get("universal_schema") or {}
-            for sensor in schema.get("sensors", []):
-                if sensor.get("type") in _CAMERA_SENSOR_TYPES:
-                    return True
         except Exception:
             continue
-    return False
+        asset = data.get("asset") or {}
+        schema = asset.get("universal_schema") or {}
+        sensors = schema.get("sensors") or []
+        if not any(sensor.get("type") in _CAMERA_SENSOR_TYPES for sensor in sensors):
+            continue
+        twin_uuid = str(data.get("uuid") or path.stem)
+        twin_name = str(data.get("name") or twin_uuid)
+        if not twin_uuid:
+            continue
+        if selected_uuids is not None and twin_uuid not in selected_uuids:
+            continue
+        results.append((twin_uuid, twin_name))
+    return results
+
+
+def _any_twin_has_camera_sensor() -> bool:
+    """Check downloaded twin JSON files for camera-type sensors."""
+    return bool(_list_camera_twins())
+
+
+def _render_camera_menu(
+    cameras: list[Any],
+    *,
+    assignments: dict[int, str] | None = None,
+) -> dict[int, Any]:
+    """Print a numbered camera menu and return the map of valid indices.
+
+    When ``assignments`` is provided, each already-mapped camera is annotated
+    with the twin name it is currently assigned to.
+    """
+    from .device_utils import camera_likelihood_score
+
+    assignments = assignments or {}
+    valid_indices: dict[int, Any] = {}
+    for i, cam in enumerate(cameras):
+        idx = cam.index if cam.index is not None else i
+        valid_indices[idx] = cam
+        score = camera_likelihood_score(cam)
+        assigned_to = assignments.get(idx)
+        suffix = f"  [yellow](assigned to {assigned_to})[/yellow]" if assigned_to else ""
+        if score >= 40:
+            label = (
+                f"  [bold cyan]{idx}[/bold cyan])  {cam.card}  "
+                f"[dim]{cam.primary_path}[/dim]{suffix}"
+            )
+        else:
+            label = (
+                f"  [dim]{idx})  {cam.card}  {cam.primary_path}  "
+                f"(probably not a camera)[/dim]{suffix}"
+            )
+        console.print(label)
+    return valid_indices
+
+
+def _prompt_camera_index(
+    cameras: list[Any],
+    valid_indices: dict[int, Any],
+    *,
+    prompt: str,
+    default_index: int,
+) -> int | None:
+    """Prompt for a single camera index. Returns ``None`` on invalid input."""
+    raw = Prompt.ask(prompt, default=str(default_index))
+    try:
+        chosen = int(raw)
+    except ValueError:
+        console.print("[yellow]Invalid selection — skipping camera config.[/yellow]")
+        return None
+    if chosen not in valid_indices:
+        console.print(f"[yellow]Camera {chosen} not available — skipping.[/yellow]")
+        return None
+    return chosen
 
 
 def _detect_and_select_cameras() -> None:
-    """Discover cameras and prompt the user to select one.
+    """Discover cameras and prompt the user to map them to camera-bearing twins.
+
+    When a single camera twin is connected, the user is prompted once (matching
+    the historical single-select behaviour).  When multiple camera twins are
+    connected alongside multiple physical cameras, the user is walked through a
+    per-twin mapping so each twin ends up bound to a specific ``/dev/video*``
+    device.
 
     Best-effort: failures are logged but never block installation.
     """
-    from .device_utils import CameraDevice, camera_likelihood_score, discover_usb_cameras, write_cameras_json
+    from .device_utils import discover_usb_cameras, write_cameras_json
 
     cameras = discover_usb_cameras()
     if not cameras:
         console.print("[dim]No cameras detected. You can add one later: cyberwave edge cameras[/dim]")
         return
 
-    selected: int | None = None
+    camera_twins = _list_camera_twins()
+    default_idx = cameras[0].index if cameras[0].index is not None else 0
+
+    # Single physical camera: auto-assign to every camera twin.
     if len(cameras) == 1:
         cam = cameras[0]
         selected = cam.index if cam.index is not None else 0
+        twin_to_device = {twin_uuid: selected for twin_uuid, _ in camera_twins}
         console.print(f"\n[cyan]Detected camera:[/cyan] {cam.card} ({cam.primary_path})")
-    else:
-        console.print(f"\n[bold]Detected {len(cameras)} camera(s):[/bold]\n")
-        valid_indices: dict[int, CameraDevice] = {}
-        for i, cam in enumerate(cameras):
-            idx = cam.index if cam.index is not None else i
-            valid_indices[idx] = cam
-            score = camera_likelihood_score(cam)
-            if score >= 40:
-                label = f"  [bold cyan]{idx}[/bold cyan])  {cam.card}  [dim]{cam.primary_path}[/dim]"
-            else:
-                label = f"  [dim]{idx})  {cam.card}  {cam.primary_path}  (probably not a camera)[/dim]"
-            console.print(label)
+        if len(camera_twins) > 1:
+            console.print(
+                f"[dim]All {len(camera_twins)} camera twin(s) will share this device.[/dim]"
+            )
+        write_cameras_json(
+            cameras,
+            CONFIG_DIR,
+            selected_index=selected,
+            twin_to_device=twin_to_device or None,
+        )
+        console.print(f"[dim]Saved to {CONFIG_DIR / 'cameras.json'}[/dim]\n")
+        return
 
-        default_idx = cameras[0].index if cameras[0].index is not None else 0
+    # Single camera twin (or none known) with multiple cameras: keep the legacy
+    # single-select flow so existing scripted installs remain unchanged.
+    if len(camera_twins) <= 1:
+        console.print(f"\n[bold]Detected {len(cameras)} camera(s):[/bold]\n")
+        valid_indices = _render_camera_menu(cameras)
         console.print()
-        raw = Prompt.ask("Select camera", default=str(default_idx))
-        try:
-            selected = int(raw)
-        except ValueError:
-            console.print("[yellow]Invalid selection — skipping camera config.[/yellow]")
-            return
-        if selected not in valid_indices:
-            console.print(f"[yellow]Camera {selected} not available — skipping.[/yellow]")
+        selected = _prompt_camera_index(
+            cameras,
+            valid_indices,
+            prompt="Select camera",
+            default_index=default_idx,
+        )
+        if selected is None:
             return
         console.print(f"[green]Selected:[/green] {valid_indices[selected].card}")
+        twin_to_device = (
+            {camera_twins[0][0]: selected} if camera_twins else {}
+        )
+        write_cameras_json(
+            cameras,
+            CONFIG_DIR,
+            selected_index=selected,
+            twin_to_device=twin_to_device or None,
+        )
+        console.print(f"[dim]Saved to {CONFIG_DIR / 'cameras.json'}[/dim]\n")
+        return
 
-    write_cameras_json(cameras, CONFIG_DIR, selected_index=selected)
+    # Multiple camera twins AND multiple cameras: map each twin to a camera.
+    console.print(
+        f"\n[bold]Detected {len(cameras)} camera(s) and "
+        f"{len(camera_twins)} camera twin(s).[/bold]"
+    )
+    console.print(
+        "[dim]Map each twin to the physical camera it is wired to. "
+        "A device can be assigned to more than one twin if it is shared.[/dim]\n"
+    )
+
+    twin_to_device: dict[str, int] = {}
+    assignments_label: dict[int, str] = {}
+    first_selected: int | None = None
+    remaining_default = default_idx
+
+    for twin_uuid, twin_name in camera_twins:
+        console.print(f"[bold]Twin:[/bold] {twin_name} [dim]({twin_uuid[:8]}...)[/dim]")
+        valid_indices = _render_camera_menu(cameras, assignments=assignments_label)
+        console.print()
+        selected = _prompt_camera_index(
+            cameras,
+            valid_indices,
+            prompt=f"Camera for {twin_name}",
+            default_index=remaining_default,
+        )
+        if selected is None:
+            console.print(
+                "[yellow]Skipping remaining twin mappings; edge will fall back "
+                "to /dev/video0 for unmapped twins.[/yellow]"
+            )
+            break
+        twin_to_device[twin_uuid] = selected
+        assignments_label[selected] = twin_name
+        if first_selected is None:
+            first_selected = selected
+        # Prefer an unassigned device as the next default, but keep the current
+        # choice if every device has been touched.
+        remaining = [
+            idx for idx in valid_indices if idx not in assignments_label
+        ]
+        if remaining:
+            remaining_default = remaining[0]
+        console.print(f"[green]Selected:[/green] {valid_indices[selected].card}\n")
+
+    if not twin_to_device:
+        console.print("[yellow]No cameras mapped — skipping camera config.[/yellow]")
+        return
+
+    write_cameras_json(
+        cameras,
+        CONFIG_DIR,
+        selected_index=first_selected,
+        twin_to_device=twin_to_device,
+    )
     console.print(f"[dim]Saved to {CONFIG_DIR / 'cameras.json'}[/dim]\n")
 
 
@@ -2004,7 +2177,10 @@ def setup_service(
     # Only prompt when at least one selected twin has a camera sensor.
     if spec.requires_docker and _any_twin_has_camera_sensor():
         if is_macos():
-            if not setup_camera_stream_server(force=force_reinstall):
+            if not setup_camera_stream_server(
+                force=force_reinstall,
+                camera_twins=_list_camera_twins(),
+            ):
                 console.print(
                     "[yellow]Camera stream setup failed. MJPEG fallback will "
                     "not be available.[/yellow]\n"

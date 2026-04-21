@@ -176,7 +176,7 @@ def test_setup_edge_core_force_reinstall_passes_force_to_helpers(monkeypatch):
 
     assert core.setup_edge_core(skip_confirm=True, force_reinstall=True) is True
     assert usbip_kwargs == [{"force": True}]
-    assert camera_kwargs == [{"force": True}]
+    assert camera_kwargs == [{"force": True, "camera_twins": []}]
 
 
 def test_setup_edge_core_default_does_not_force(monkeypatch):
@@ -214,7 +214,7 @@ def test_setup_edge_core_default_does_not_force(monkeypatch):
 
     assert core.setup_edge_core(skip_confirm=True) is True
     assert usbip_kwargs == [{"force": False}]
-    assert camera_kwargs == [{"force": False}]
+    assert camera_kwargs == [{"force": False, "camera_twins": []}]
 
 
 def test_setup_edge_core_macos_rejects_sudo(monkeypatch):

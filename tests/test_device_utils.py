@@ -233,3 +233,54 @@ def test_discover_sorts_real_cameras_first(mock_v4l2):
     devices = discover_usb_cameras()
     assert len(devices) == 2
     assert devices[0].card == "HD Pro Webcam C920"
+
+
+# ---------------------------------------------------------------------------
+# write_cameras_json — twin-to-device mapping
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+
+from cyberwave_cli.device_utils import write_cameras_json  # noqa: E402
+
+
+def test_write_cameras_json_without_mapping(tmp_path):
+    cams = [
+        CameraDevice(card="Cam A", bus_info="usb-1", paths=["/dev/video0"]),
+        CameraDevice(card="Cam B", bus_info="usb-2", paths=["/dev/video2"]),
+    ]
+    out = write_cameras_json(cams, tmp_path, selected_index=2)
+    data = json.loads(out.read_text())
+    assert data["selected_device"] == 2
+    assert "twin_to_device" not in data
+    assert len(data["devices"]) == 2
+
+
+def test_write_cameras_json_persists_twin_mapping(tmp_path):
+    cams = [
+        CameraDevice(card="Cam A", bus_info="usb-1", paths=["/dev/video0"]),
+        CameraDevice(card="Cam B", bus_info="usb-2", paths=["/dev/video2"]),
+    ]
+    mapping = {"twin-a": 0, "twin-b": 2}
+    out = write_cameras_json(
+        cams,
+        tmp_path,
+        selected_index=0,
+        twin_to_device=mapping,
+    )
+    data = json.loads(out.read_text())
+    assert data["selected_device"] == 0
+    assert data["twin_to_device"] == {"twin-a": 0, "twin-b": 2}
+
+
+def test_write_cameras_json_coerces_mapping_values(tmp_path):
+    """Non-int values in the mapping are coerced to plain ints for JSON stability."""
+    cams = [CameraDevice(card="Cam A", bus_info="usb-1", paths=["/dev/video0"])]
+    out = write_cameras_json(
+        cams,
+        tmp_path,
+        selected_index=0,
+        twin_to_device={"twin-a": "0"},  # type: ignore[dict-item]
+    )
+    data = json.loads(out.read_text())
+    assert data["twin_to_device"] == {"twin-a": 0}

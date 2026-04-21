@@ -399,6 +399,7 @@ def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, wit
         from ...macos import is_macos
 
         if is_macos():
+            from ...core import _list_camera_twins
             from ...macos import (
                 setup_camera_stream_server,
                 start_edge_core_service,
@@ -406,7 +407,10 @@ def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, wit
             )
 
             try:
-                if not setup_camera_stream_server(force=True):
+                if not setup_camera_stream_server(
+                    force=True,
+                    camera_twins=_list_camera_twins(),
+                ):
                     raise SystemExit(1)
                 console.print("[cyan]Restarting edge-core so the driver reconnects...[/cyan]")
                 stop_edge_core_service()
