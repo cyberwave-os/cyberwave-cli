@@ -720,6 +720,11 @@ def _select_or_create_environment(client: Any, workspace_uuid: str, *, skip_conf
         return environments[idx]
 
 
+def _twin_has_asset(twin: Any) -> bool:
+    """Return ``True`` when the twin has an asset attached on the backend."""
+    return bool(getattr(twin, "asset_uuid", None) or getattr(twin, "asset_id", None))
+
+
 def _select_connected_twins(client: Any, environment_uuid: str, *, skip_confirm: bool) -> list[str]:
     """List twins in environment and ask user which ones are connected."""
     twins = client.twins.list(environment_id=environment_uuid)
@@ -731,20 +736,51 @@ def _select_connected_twins(client: Any, environment_uuid: str, *, skip_confirm:
         # Keep non-interactive flow deterministic by selecting the first twin.
         return [str(getattr(twins[0], "uuid", ""))] if getattr(twins[0], "uuid", None) else []
 
-    labels = [
-        f"{getattr(twin, 'name', 'Unnamed')} ({str(getattr(twin, 'uuid', ''))[:8]}...)"
-        for twin in twins
-    ]
+    labels: list[str] = []
+    for twin in twins:
+        name = getattr(twin, "name", "Unnamed")
+        uuid_short = str(getattr(twin, "uuid", ""))[:8]
+        if _twin_has_asset(twin):
+            labels.append(f"{name} ({uuid_short}...)")
+        else:
+            # Broken twins are visibly flagged so the user doesn't silently pick
+            # a twin that the edge-core will later fail to spawn a driver for.
+            labels.append(
+                f"{name} ({uuid_short}...)  \u26a0  NO ASSET ATTACHED — fix on dashboard"
+            )
+
     base_title = "Which twins are physically connected to your edge?"
     prompt_title = base_title
     while True:
         idxs = _select_multiple_with_arrows(prompt_title, labels)
         selected_uuids: list[str] = []
+        selected_without_asset: list[tuple[str, str]] = []
         for idx in idxs:
-            twin_uuid = str(getattr(twins[idx], "uuid", ""))
-            if twin_uuid:
-                selected_uuids.append(twin_uuid)
+            twin = twins[idx]
+            twin_uuid = str(getattr(twin, "uuid", ""))
+            if not twin_uuid:
+                continue
+            selected_uuids.append(twin_uuid)
+            if not _twin_has_asset(twin):
+                selected_without_asset.append(
+                    (getattr(twin, "name", "Unnamed"), twin_uuid)
+                )
+
         if selected_uuids:
+            if selected_without_asset:
+                console.print()
+                console.print(
+                    "[bold red]\u2717 The following selected twin(s) have no "
+                    "asset attached on the backend:[/bold red]"
+                )
+                for name, twin_uuid in selected_without_asset:
+                    console.print(f"  [red]\u2022 {name} ({twin_uuid[:8]}...)[/red]")
+                console.print(
+                    "[red]The edge-core cannot spawn a driver for these twins. "
+                    "Open each twin on the dashboard, attach an asset, then re-run "
+                    "`cyberwave edge install`.[/red]"
+                )
+                console.print()
             return selected_uuids
 
         prompt_title = (
@@ -786,8 +822,26 @@ def _download_twin_json_files(client: Any, twin_uuids: list[str]) -> int:
                 try:
                     asset = client.assets.get(str(asset_uuid))
                     asset_data = asset.to_dict() if hasattr(asset, "to_dict") else {}
-                except Exception:
-                    pass
+                except Exception as asset_exc:
+                    console.print(
+                        f"[yellow]Failed to fetch asset {str(asset_uuid)[:8]}… "
+                        f"for twin {twin_uuid[:8]}…: {asset_exc}[/yellow]"
+                    )
+            else:
+                # No asset on the twin means edge-core will silently skip
+                # spawning a driver for it. Surface the failure loudly now so
+                # the user can fix it before hitting the cryptic "No twins
+                # with driver images matched this edge" message later.
+                twin_name = getattr(twin, "name", "?")
+                console.print(
+                    f"[bold red]\u2717 Twin '{twin_name}' ({twin_uuid[:8]}...) "
+                    f"has no asset attached on the backend.[/bold red]"
+                )
+                console.print(
+                    "  [red]The edge-core cannot spawn a driver for this twin. "
+                    "Open it on the dashboard, attach an asset, then re-run "
+                    "`cyberwave edge install`.[/red]"
+                )
 
             twin_data["asset"] = asset_data
             twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
