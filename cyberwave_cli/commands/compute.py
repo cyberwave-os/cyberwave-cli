@@ -17,6 +17,7 @@ Example usage:
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -303,10 +304,16 @@ def uninstall_cloud_node(yes: bool) -> None:
     installed_pkg = _resolve_installed_service_package_name(spec)
     remove_pkg = yes or Confirm.ask(f"Also uninstall {installed_pkg} package?", default=False)
     if remove_pkg:
-        try:
-            _run(["apt-get", "remove", "-y", installed_pkg], check=False)
-        except FileNotFoundError:
-            console.print("[yellow]apt-get not found — remove manually with pip.[/yellow]")
+        if shutil.which("apt-get"):
+            try:
+                _run(["apt-get", "remove", "-y", installed_pkg], check=False)
+            except FileNotFoundError:
+                console.print("[yellow]apt-get not found — remove manually with pip.[/yellow]")
+        else:
+            try:
+                _run([sys.executable, "-m", "pip", "uninstall", "-y", installed_pkg], check=False)
+            except OSError:
+                console.print("[yellow]pip uninstall failed — remove manually.[/yellow]")
 
     console.print("[green]Cloud node service removed.[/green]")
     console.print("[dim]Node credentials in ~/.cyberwave/ were preserved.[/dim]")

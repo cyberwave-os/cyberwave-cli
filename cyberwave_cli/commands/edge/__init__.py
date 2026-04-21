@@ -381,8 +381,8 @@ def edge():
 def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, without_workers):
     """Install cyberwave-edge-core and register it as a boot service.
 
-    Downloads the cyberwave-edge-core package (via apt-get on Debian/Ubuntu)
-    and creates a systemd service so it starts automatically on boot.
+    Downloads the cyberwave-edge-core package (via apt-get on Debian/Ubuntu,
+    pip elsewhere) and creates a systemd service so it starts automatically on boot.
     By default the ML worker Docker image is also pulled.
 
     \b
@@ -630,11 +630,19 @@ def uninstall_edge(yes):
                     )
                 except OSError:
                     console.print("[yellow]pip uninstall failed — remove manually.[/yellow]")
-            else:
+            elif shutil.which("apt-get"):
                 try:
                     _run(["apt-get", "remove", "-y", installed_package_name], check=False)
                 except FileNotFoundError:
                     console.print("[yellow]apt-get not found — remove manually with pip.[/yellow]")
+            else:
+                try:
+                    _run(
+                        [sys.executable, "-m", "pip", "uninstall", "-y", installed_package_name],
+                        check=False,
+                    )
+                except OSError:
+                    console.print("[yellow]pip uninstall failed — remove manually.[/yellow]")
 
     deleted_count, failed_count = _delete_registered_edges_for_fingerprint(
         fingerprint=edge_fingerprint,
@@ -1070,7 +1078,12 @@ def list_cameras(as_json: bool, save: bool):
         if system == "Linux":
             console.print("[yellow]No cameras detected.[/yellow]")
             if not shutil.which("v4l2-ctl"):
-                console.print("[dim]Install v4l-utils: sudo apt-get install v4l-utils[/dim]")
+                if shutil.which("apt-get"):
+                    console.print("[dim]Install v4l-utils: sudo apt-get install v4l-utils[/dim]")
+                elif shutil.which("pacman"):
+                    console.print("[dim]Install v4l-utils: sudo pacman -S v4l-utils[/dim]")
+                else:
+                    console.print("[dim]Install v4l-utils using your package manager.[/dim]")
         elif system == "Darwin":
             console.print("[yellow]No cameras detected.[/yellow]")
             if not shutil.which("ffmpeg"):

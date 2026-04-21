@@ -2111,11 +2111,21 @@ def setup_service(
 
     if not skip_confirm:
         if linux_service_setup:
-            selected_pkg = _resolve_service_package_name(channel, spec)
-            selected_target = f"{selected_pkg}={version}" if version else selected_pkg
+            has_apt = bool(shutil.which("apt-get"))
+            if has_apt:
+                selected_pkg = _resolve_service_package_name(channel, spec)
+                selected_target = f"{selected_pkg}={version}" if version else selected_pkg
+                install_method = f"Install [bold]{selected_target}[/bold] via apt-get"
+            else:
+                pip_target = _describe_pip_install_target(
+                    spec,
+                    channel=channel,
+                    package_version=version,
+                )
+                install_method = f"Install [bold]{pip_target}[/bold] via pip"
             console.print(
                 f"\nThis will:\n"
-                f"  1. Install [bold]{selected_target}[/bold] via apt-get\n"
+                f"  1. {install_method}\n"
                 f"  2. Create a systemd service ([bold]{spec.unit_name}[/bold])\n"
                 f"  3. Enable it to start on boot\n"
             )
