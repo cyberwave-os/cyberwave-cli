@@ -6,6 +6,8 @@ on the edge machine. Currently supports Linux via v4l2-ctl.
 Future: Add support for macOS (AVFoundation), Windows (DirectShow), etc.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import re

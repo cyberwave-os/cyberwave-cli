@@ -1,5 +1,7 @@
 """CLI commands for Cyberwave."""
 
+from __future__ import annotations
+
 from .camera import camera
 from .compute import compute
 from .completion import completion

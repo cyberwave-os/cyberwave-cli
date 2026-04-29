@@ -1,5 +1,7 @@
 """Workflow management commands for the Cyberwave CLI."""
 
+from __future__ import annotations
+
 import json
 from typing import NoReturn
 from urllib.parse import urlparse

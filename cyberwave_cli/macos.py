@@ -12,6 +12,8 @@ CLI commands (start/stop/restart/status/logs) work identically to
 the systemd-based experience on Linux.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import platform

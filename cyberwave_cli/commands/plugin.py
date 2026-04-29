@@ -15,6 +15,8 @@ Example usage:
     cyberwave plugin info yolo
 """
 
+from __future__ import annotations
+
 import json
 import subprocess
 import sys

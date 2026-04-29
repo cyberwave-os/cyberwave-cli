@@ -20,6 +20,8 @@ Example usage:
     cyberwave worker monitor                # Live resource/throughput dashboard
 """
 
+from __future__ import annotations
+
 import ast
 import datetime
 import json

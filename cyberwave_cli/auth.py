@@ -4,6 +4,8 @@ This module handles authentication with the Cyberwave API.
 The login endpoint is not part of the SDK, so we implement it here directly.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Optional
 

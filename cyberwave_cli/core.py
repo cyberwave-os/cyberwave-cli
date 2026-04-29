@@ -6,6 +6,8 @@ This module provides the logic for:
   3. Enabling and starting the service
 """
 
+from __future__ import annotations
+
 import json
 import os
 import platform

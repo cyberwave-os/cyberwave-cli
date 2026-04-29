@@ -1,5 +1,7 @@
 """Camera edge setup command for the Cyberwave CLI."""
 
+from __future__ import annotations
+
 import shutil
 import subprocess
 import uuid

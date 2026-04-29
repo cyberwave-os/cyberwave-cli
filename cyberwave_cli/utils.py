@@ -7,6 +7,8 @@ This module provides common functionality used across multiple CLI commands:
 - Common CLI patterns
 """
 
+from __future__ import annotations
+
 import re
 from urllib.parse import urlparse
 

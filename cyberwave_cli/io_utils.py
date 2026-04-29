@@ -1,5 +1,7 @@
 """Low-level I/O helpers shared across the CLI package."""
 
+from __future__ import annotations
+
 import json
 import os
 import tempfile

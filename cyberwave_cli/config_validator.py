@@ -5,6 +5,8 @@ Validates edge configurations against the JSON schema defined in the asset's
 edge_runtimes metadata. Provides helpful error messages and suggestions.
 """
 
+from __future__ import annotations
+
 from typing import Any
 
 from rich.console import Console

@@ -1,5 +1,7 @@
 """Configure command for the Cyberwave CLI."""
 
+from __future__ import annotations
+
 import click
 from rich.console import Console
 from rich.prompt import Prompt

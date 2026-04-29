@@ -22,6 +22,8 @@ Example usage:
     cyberwave edge pull --environment-uuid UUID
 """
 
+from __future__ import annotations
+
 import json
 import os
 import shutil

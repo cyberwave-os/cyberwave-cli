@@ -12,6 +12,8 @@ CLI commands are for local/offline configuration:
     cyberwave model show       # Show current config
 """
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
