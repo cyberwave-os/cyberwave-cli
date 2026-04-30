@@ -31,8 +31,6 @@ pip install cyberwave-cli
 curl -fsSL https://cyberwave.com/install.sh | bash
 ```
 
-The same Buildkite apt registry also carries **`cyberwave-cli-dev`** and **`cyberwave-cli-staging`** for CI builds from `dev` / `staging`. Use those package names explicitly when you want those channels; default `cyberwave-cli` is tagged releases. The packages conflict because they ship the same `/usr/bin/cyberwave`.
-
 ### From Source
 
 ```bash
@@ -436,14 +434,10 @@ On **macOS**, the installer also sets up an MJPEG camera stream bridge (using `f
 
 On **Linux** with multiple camera-bearing twins, the installer walks you through a per-twin mapping so each twin is bound to a specific `/dev/video*` device. The mapping is persisted in `~/.cyberwave/cameras.json` under `twin_to_device` and honored by edge-core when it launches each driver container. A single-camera host automatically shares the device across every selected camera twin.
 
-On non-apt platforms, `--channel dev|staging` installs prerelease Python builds from the Buildkite Python registry; stable installs continue to use the public PyPI release.
-
 ```bash
 sudo cyberwave edge install
 sudo cyberwave edge install -y   # skip prompts
 sudo cyberwave edge install --reconfigure-camera   # re-select camera without full reinstall
-sudo cyberwave edge install --channel dev
-sudo cyberwave edge install --channel staging --version 0.0.42.595
 ```
 
 **Options:**
@@ -670,14 +664,11 @@ Manage the cloud node service — a GPU-powered companion that runs ML workloads
 
 ```bash
 sudo cyberwave compute install
-sudo cyberwave compute install --channel dev
 cyberwave compute start --slug my-gpu-node --profile gpu-a100
 cyberwave compute status
 cyberwave compute logs -f
 cyberwave compute stop
 ```
-
-On non-apt platforms, `cyberwave compute install --channel dev|staging` installs prerelease Python builds from the Buildkite Python registry; stable installs continue to use the public PyPI release.
 
 ## `cyberwave model`
 
@@ -777,15 +768,8 @@ Set API credentials directly without the interactive login flow. Useful when you
 ```bash
 cyberwave configure --token YOUR_TOKEN
 cyberwave configure --token YOUR_TOKEN --base-url http://localhost:8000
-cyberwave configure --internal-deb-read-token YOUR_BUILDKITE_DEB_TOKEN
-cyberwave configure --internal-python-read-token YOUR_BUILDKITE_PYTHON_TOKEN
 cyberwave configure --show
 ```
-
-Private Buildkite read tokens are stored alongside the API credentials in `credentials.json`.
-When prerelease (`dev`/`staging`) installs need access to `cyberwave-internal-deb` or
-`cyberwave-internal-python`, the CLI prefers explicit environment variables first and then
-falls back to those saved tokens.
 
 ## Configuration
 
@@ -800,7 +784,7 @@ Run `cyberwave config-dir` to see which directory is active.
 
 **Files inside the config directory:**
 
-- `credentials.json` — API token, workspace info, runtime env overrides, and optional private Buildkite registry read tokens (permissions `600`)
+- `credentials.json` — API token, workspace info, and runtime env overrides (permissions `600`)
 - `environment.json` — selected workspace, environment, and twin bindings
 - `fingerprint.json` — unique edge device identifier
 
