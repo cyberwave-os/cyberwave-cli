@@ -208,12 +208,10 @@ _LABEL_FOR_KIND: dict[str, str] = {
 def _print_workflow_metadata(w) -> None:
     """Print the workflow header block used by ``sync`` preflight.
 
-    The ``kind`` field is no longer load-bearing on the backend (the
-    edge compiler dispatches per-subgraph based on graph shape), but
-    we still surface it here because the schema still returns it and
-    users are familiar with the badge in the editor. ``run_on_edge``
-    and ``environment`` are the fields that actually drive what edge
-    sync will ship; they get prominent rows.
+    ``run_on_edge`` and ``environment`` are the fields that actually
+    drive what edge sync will ship; they get prominent rows. The edge
+    compiler dispatches per-subgraph based on graph shape — there is
+    no user-visible workflow "kind" anymore.
     """
     console.print(f"\n[bold cyan]{w.name}[/bold cyan]")
     console.print(f"  uuid:             {w.uuid}")
@@ -228,9 +226,6 @@ def _print_workflow_metadata(w) -> None:
         )
     else:
         console.print("  environment:      [dim]none[/dim]")
-    kind = getattr(w, "kind", None)
-    if kind:
-        console.print(f"  kind (derived):   [dim]{kind}[/dim]")
 
 
 def _diagnose_missing_workflow(w, twin_uuid: str) -> str:
@@ -241,18 +236,14 @@ def _diagnose_missing_workflow(w, twin_uuid: str) -> str:
     get from the backend, without waiting for an MQTT round-trip that
     succeeds silently.
 
-    With graph-shape compiler dispatch (no more
-    ``Workflow.kind``-keyed routing), the previous
-    "kind=mission without twin_control" branch is no longer the failure
-    mode it once was: the unified compiler renders any workflow with a
-    ``twin_control`` node through the navigation path and any workflow
-    with a ``camera_frame`` trigger through the perception path,
-    regardless of kind, and combines both when the same workflow has
-    both shapes. The only graph-shape failure left is "no subgraph the
-    compiler can render at all" — which the backend's
-    :func:`diagnose_compilation_dispatch` reports through the
-    ``/compile`` endpoint, and which we mirror here through
-    ``warnings`` returned by the compile call.
+    The unified compiler renders any workflow with a ``twin_control``
+    node through the navigation path and any workflow with a
+    ``camera_frame`` trigger through the perception path, and combines
+    both when the same workflow has both shapes. The only graph-shape
+    failure left is "no subgraph the compiler can render at all" —
+    which the backend's :func:`diagnose_compilation_dispatch` reports
+    through the ``/compile`` endpoint, and which we mirror here
+    through ``warnings`` returned by the compile call.
     """
     if not getattr(w, "is_active", False):
         return (
