@@ -24,6 +24,7 @@ Example usage:
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import shutil
@@ -1221,15 +1222,88 @@ def show_logs(follow, lines):
 
 
 @edge.command("sync-workflows")
-@click.option("--twin-uuid", required=True, help="Twin UUID to sync workflows for")
+@click.option("--twin-uuid", help="Twin UUID to trigger workflow sync for via MQTT")
 def sync_workflows(twin_uuid):
     """
-    Trigger workflow sync on the edge node.
+    Sync workflow workers on the edge node.
 
-    This command sends an MQTT message to the edge node to re-sync
-    model bindings from active workflows in the backend.
+    Without --twin-uuid, syncs locally for all twin UUIDs configured in
+    environment.json. With --twin-uuid, keeps the remote trigger behavior and
+    sends an MQTT command to the edge node for that twin.
     """
-    from ...utils import get_sdk_client, print_error
+    from ...utils import get_sdk_client, print_error, print_success
+
+    if not twin_uuid:
+        try:
+            from ...config import ensure_edge_core_importable
+
+            ensure_edge_core_importable()
+            startup = importlib.import_module("cyberwave_edge_core.startup")
+        except Exception as e:
+            print_error(
+                f"Edge core is not available: {e}",
+                "Install cyberwave-edge-core on this edge device and try again.",
+            )
+            return
+
+        token = startup.load_token()
+        if not token:
+            print_error("Not authenticated.", "Run 'cyberwave login' first.")
+            return
+
+        twin_uuids = startup.load_selected_twin_uuids()
+        if not twin_uuids:
+            print_error(
+                "No local twin UUIDs configured.",
+                "Run 'cyberwave edge install' to populate environment.json.",
+            )
+            return
+
+        base_url = (
+            startup.get_runtime_env_var("CYBERWAVE_BASE_URL", startup.DEFAULT_API_URL)
+            or startup.DEFAULT_API_URL
+        )
+        console.print(
+            f"[cyan]Syncing workflow workers locally for {len(twin_uuids)} twin(s)...[/cyan]"
+        )
+        summary = startup._sync_workers_for_twins(
+            token=token,
+            twin_uuids=twin_uuids,
+            base_url=base_url,
+        )
+
+        total_written = sum(r.get("written", 0) for r in summary.values())
+        total_removed = sum(r.get("removed", 0) for r in summary.values())
+        total_unchanged = sum(r.get("unchanged", 0) for r in summary.values())
+        total_errors = sum(r.get("errors", 0) for r in summary.values())
+
+        for twin in twin_uuids:
+            stats = summary.get(twin, {})
+            console.print(
+                f"  [bold]{twin}[/bold] "
+                f"written={stats.get('written', 0)} "
+                f"removed={stats.get('removed', 0)} "
+                f"unchanged={stats.get('unchanged', 0)} "
+                f"errors={stats.get('errors', 0)}"
+            )
+
+        if total_errors:
+            print_error(
+                "Workflow sync completed with errors.",
+                (
+                    f"written={total_written}, removed={total_removed}, "
+                    f"unchanged={total_unchanged}, errors={total_errors}"
+                ),
+            )
+        else:
+            print_success(
+                (
+                    "Workflow sync complete "
+                    f"(written={total_written}, removed={total_removed}, "
+                    f"unchanged={total_unchanged})."
+                )
+            )
+        return
 
     client = get_sdk_client()
     if not client:
@@ -1241,7 +1315,6 @@ def sync_workflows(twin_uuid):
     try:
         # Publish command via MQTT
         client.mqtt.publish_command_message(twin_uuid, {"command": "sync_workflows"})
-        from ...utils import print_success
 
         print_success("Command sent. Check edge logs for results.")
         console.print(

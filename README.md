@@ -303,16 +303,18 @@ touches files that do not start with `wf_`.
 
 Manage workflows for automation — list, create, show, activate, sync to edge, and delete.
 
-| Subcommand   | Description                                    |
-| ------------ | ---------------------------------------------- |
-| `list`       | List workflows (table or `--json`)             |
-| `templates`  | List available workflow templates               |
-| `create`     | Create a workflow (`--name` or `--template`)   |
-| `show`       | Show workflow details, nodes, and target twins |
-| `sync`       | Sync a workflow to its edge node(s) via MQTT   |
-| `activate`   | Activate a workflow                            |
-| `deactivate` | Deactivate a workflow                          |
-| `delete`     | Delete a workflow (`--yes` to skip confirm)    |
+| Subcommand        | Description                                                     |
+| ----------------- | --------------------------------------------------------------- |
+| `list`            | List workflows (table or `--json`)                              |
+| `templates`       | List available workflow templates                               |
+| `create`          | Create a workflow (`--name` or `--template`)                    |
+| `show`            | Show workflow details, nodes, and target twins                  |
+| `sync`            | Sync a workflow to its edge node(s) via MQTT                    |
+| `compile`         | Compile a workflow on the backend and report the emitted artifact |
+| `compile-source`  | Download the generated `wf_*.py` worker source                  |
+| `activate`        | Activate a workflow                                             |
+| `deactivate`      | Deactivate a workflow                                           |
+| `delete`          | Delete a workflow (`--yes` to skip confirm)                     |
 
 All subcommands accept `--base-url` / `-u` to override the API URL (e.g. `http://192.168.10.101:8000`). When a UUID argument is omitted, an interactive arrow-key selector is shown.
 
@@ -336,11 +338,22 @@ cyberwave workflow sync e7f1856c --base-url http://192.168.10.101:8000
 cyberwave workflow activate
 cyberwave workflow deactivate
 
+# Inspect what the edge compiler emitted for a workflow (and why)
+cyberwave workflow compile e7f1856c
+cyberwave workflow compile e7f1856c --json     # raw API response (compiled_payload, worker_source, ...)
+
+# Download the generated worker source
+cyberwave workflow compile-source e7f1856c             # to stdout
+cyberwave workflow compile-source e7f1856c -o ./wf.py  # to a file
+cyberwave workflow compile-source e7f1856c -o /tmp/    # appends wf_<uuid>.py
+
 # Delete
 cyberwave workflow delete --yes
 ```
 
-The `sync` command reads the workflow's `camera_frame` trigger nodes to find target twin(s), then sends `sync_workflows` MQTT commands to each twin's edge node.
+The `sync` command reads the workflow's nodes to find target twin(s), then sends `sync_workflows` MQTT commands to each twin's edge node.
+
+`compile` wraps `/api/v1/workflows/{uuid}/compile` and reports the artifact shape the unified edge compiler emitted (`perception` for camera-frame graphs, `navigation` for graphs with a Move Twin node), the auto-derived target twin, model requirements, and any compiler warnings — including the diagnostic from the backend's `diagnose_compilation_dispatch` helper when the workflow's graph shape isn't compilable. Reach for it when `cyberwave workflow sync` reports the cloud isn't shipping a workflow to your edge. `compile-source` is the companion download for the generated `wf_*.py`.
 
 ## Shell Autocompletion
 

@@ -9,13 +9,14 @@ This module provides common functionality used across multiple CLI commands:
 
 from __future__ import annotations
 
+import os
 import re
+from typing import Any, Callable, Optional, TypeVar
 from urllib.parse import urlparse
 
 import click
 from rich.console import Console
 from rich.table import Table
-from typing import Any, Callable, Optional, TypeVar
 
 from .config import get_api_url
 from .credentials import Credentials, load_credentials
@@ -23,6 +24,25 @@ from .credentials import Credentials, load_credentials
 console = Console()
 
 T = TypeVar("T")
+
+
+def resolve_api_url(
+    api_url: Optional[str] = None,
+    creds: Optional[Credentials] = None,
+) -> str:
+    """Resolve the backend API URL for CLI calls.
+
+    Precedence is explicit command option, process environment, stored
+    credentials, then the SDK default returned by ``get_api_url``.
+    """
+    if api_url:
+        return api_url
+    env_url = os.getenv("CYBERWAVE_BASE_URL")
+    if env_url:
+        return env_url
+    if creds and creds.cyberwave_base_url:
+        return creds.cyberwave_base_url
+    return get_api_url()
 
 
 def _is_local_or_private(hostname: str) -> bool:
@@ -95,7 +115,7 @@ def get_sdk_client(api_url: Optional[str] = None):
     try:
         from cyberwave import Cyberwave
 
-        base_url = api_url or get_api_url()
+        base_url = resolve_api_url(api_url, creds)
         mqtt_kwargs = _resolve_mqtt_kwargs(creds, base_url)
         return Cyberwave(base_url=base_url, token=creds.token, **mqtt_kwargs)
     except ImportError:
