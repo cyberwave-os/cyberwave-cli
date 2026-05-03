@@ -57,6 +57,138 @@ def _is_local_or_private(hostname: str) -> bool:
         return False
 
 
+def _infer_env_from_mqtt_host(mqtt_host: Optional[str]) -> Optional[str]:
+    """Reverse-derive the environment name from the MQTT broker host.
+
+    Mirrors :func:`cyberwave_cli.credentials._infer_env_from_base_url` but
+    works in the opposite direction: given an MQTT broker host, return the
+    environment family it belongs to so we can validate the resolved
+    ``topic_prefix`` against it.
+
+    ====================================  ==============
+    host                                  environment
+    ====================================  ==============
+    ``mqtt.cyberwave.com``                ``production``
+    ``dev.mqtt.cyberwave.com``            ``dev``
+    ``staging.mqtt.cyberwave.com``        ``staging``
+    ``localhost`` / RFC-1918 private IPs  ``local``
+    ====================================  ==============
+
+    Returns ``None`` when the host doesn't match any known pattern (custom
+    brokers, on-prem deployments, …) so the consistency guard stays silent
+    instead of yelling about every unknown host.
+    """
+    if not mqtt_host:
+        return None
+    host = mqtt_host.strip().lower()
+    if not host:
+        return None
+    if host == "mqtt.cyberwave.com":
+        return "production"
+    if host.endswith(".mqtt.cyberwave.com"):
+        return host.removesuffix(".mqtt.cyberwave.com")
+    if _is_local_or_private(host):
+        return "local"
+    return None
+
+
+def _normalize_topic_prefix(env_name: Optional[str]) -> Optional[str]:
+    """Map an environment name to the SDK's ``topic_prefix`` value.
+
+    Matches the rule in :class:`cyberwave.config.CyberwaveConfig`:
+    ``production`` is normalized to an empty prefix; everything else is
+    forwarded as-is.  ``None`` / blank means "let the SDK figure it out".
+    """
+    if env_name is None:
+        return None
+    name = env_name.strip().lower()
+    if not name:
+        return None
+    if name == "production":
+        return ""
+    return name
+
+
+def _derive_topic_prefix(
+    creds: Optional[Credentials],
+    mqtt_host: Optional[str],
+) -> Optional[str]:
+    """Derive the MQTT topic prefix the SDK should use.
+
+    Resolution order mirrors :class:`cyberwave.config.CyberwaveConfig`:
+
+    1. Explicit ``CYBERWAVE_MQTT_TOPIC_PREFIX`` env var — caller has
+       opted out of auto-derivation.
+    2. ``creds.cyberwave_environment`` from ``credentials.json`` — the
+       same field ``cyberwave-edge-core`` consumes via
+       ``load_credentials_envs()``, so the CLI lands on the same topic
+       family edge-core listens on.
+    3. Fallback: infer from the MQTT host (``dev.mqtt.cyberwave.com``
+       implies ``dev``).  Catches the case where credentials were saved
+       before ``cyberwave_environment`` was persisted but the broker
+       host still tells us which environment we're talking to.
+
+    Returns ``None`` when no prefix could be derived; callers should not
+    forward the kwarg in that case (the SDK falls back to its own logic).
+    """
+    explicit = os.getenv("CYBERWAVE_MQTT_TOPIC_PREFIX")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+
+    env_name: Optional[str] = None
+    if creds and creds.cyberwave_environment:
+        env_name = creds.cyberwave_environment
+    if not env_name:
+        env_name = _infer_env_from_mqtt_host(mqtt_host)
+
+    return _normalize_topic_prefix(env_name)
+
+
+def _validate_mqtt_topic_prefix_consistency(
+    topic_prefix: Optional[str],
+    mqtt_host: Optional[str],
+) -> None:
+    """Fail fast when the resolved prefix can't possibly match the broker.
+
+    ``mqtt.publish_command_message`` is fire-and-forget at the protocol
+    level: the broker happily ACKs publishes to topics nobody subscribed
+    to.  When the CLI publishes to ``cyberwave/twin/.../command`` while
+    edge-core is subscribed to ``devcyberwave/twin/.../command`` (or
+    vice-versa) the message is silently dropped and the user sees a
+    misleading "✓ Sent sync" line in their terminal.
+
+    This guard cross-checks the prefix we resolved against what we would
+    infer from the MQTT host and raises :class:`click.ClickException` if
+    they disagree.  Unknown hosts (custom brokers, IP literals outside
+    RFC-1918, …) are skipped — we only complain about combinations that
+    are unambiguously wrong.
+    """
+    inferred_env = _infer_env_from_mqtt_host(mqtt_host)
+    if inferred_env is None:
+        return
+
+    expected_prefix = _normalize_topic_prefix(inferred_env) or ""
+    actual_prefix = topic_prefix or ""
+
+    if actual_prefix == expected_prefix:
+        return
+
+    expected_label = expected_prefix or "<empty> (production)"
+    actual_label = actual_prefix or "<empty> (production)"
+    raise click.ClickException(
+        "MQTT topic prefix doesn't match the broker host.\n\n"
+        f"  broker host:       {mqtt_host}\n"
+        f"  inferred env:      {inferred_env}\n"
+        f"  expected prefix:   {expected_label!r}\n"
+        f"  resolved prefix:   {actual_label!r}\n\n"
+        "Published commands would land on a topic family no edge-core "
+        "subscribes to and be silently dropped.\n"
+        "Re-run `cyberwave login` (or set CYBERWAVE_ENVIRONMENT in your "
+        "shell) so credentials match the broker, or override with "
+        "CYBERWAVE_MQTT_TOPIC_PREFIX=<value> if you really mean it."
+    )
+
+
 def _resolve_mqtt_kwargs(
     creds: Optional[Credentials],
     base_url: str,
@@ -72,6 +204,13 @@ def _resolve_mqtt_kwargs(
     (``cyberwave_mqtt_host``) is forwarded so the SDK connects to the right
     broker without requiring the ``CYBERWAVE_MQTT_HOST`` env var.
 
+    The MQTT ``topic_prefix`` is resolved from credentials too — without
+    it the CLI would publish to an un-prefixed topic (``cyberwave/...``)
+    while edge-core subscribed under e.g. ``devcyberwave/...``, causing
+    every command to be silently dropped.  The resolved prefix is then
+    cross-checked against the broker host so an obvious env/host mismatch
+    surfaces as a hard error instead of a misleading success line.
+
     Returns a dict suitable for passing as ``**kwargs`` to ``Cyberwave()``.
     """
     mqtt_host: Optional[str] = None
@@ -86,11 +225,16 @@ def _resolve_mqtt_kwargs(
     elif creds and creds.cyberwave_mqtt_host:
         mqtt_host = creds.cyberwave_mqtt_host
 
+    topic_prefix = _derive_topic_prefix(creds, mqtt_host)
+    _validate_mqtt_topic_prefix_consistency(topic_prefix, mqtt_host)
+
     kwargs: dict[str, Any] = {}
     if mqtt_host:
         kwargs["mqtt_host"] = mqtt_host
     if mqtt_port is not None:
         kwargs["mqtt_port"] = mqtt_port
+    if topic_prefix is not None:
+        kwargs["topic_prefix"] = topic_prefix
     return kwargs
 
 

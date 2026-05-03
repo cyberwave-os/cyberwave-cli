@@ -806,9 +806,34 @@ Other environment variables:
 - `CYBERWAVE_BASE_URL`: Override the API URL (default: `https://api.cyberwave.com`)
 - `CYBERWAVE_ENVIRONMENT`: Environment name (for example `dev`, defaults to `production`)
 - `CYBERWAVE_MQTT_HOST`: MQTT broker host (for example `dev.mqtt.cyberwave.com` for dev; defaults to `mqtt.cyberwave.com`)
+- `CYBERWAVE_MQTT_TOPIC_PREFIX`: Override the MQTT topic prefix (rarely needed; the CLI derives it from `CYBERWAVE_ENVIRONMENT`/credentials)
 
 When credentials are written, the CLI also persists these `CYBERWAVE_*` values into
 `credentials.json` so `cyberwave-edge-core` can reuse them in service mode.
+
+### MQTT topic prefix safety check
+
+Commands that publish over MQTT (for example `cyberwave workflow sync`) need to
+hit the same topic prefix `cyberwave-edge-core` is subscribed to — `dev` for
+the dev broker, `staging` for staging, empty for production. The CLI derives
+that prefix automatically from `CYBERWAVE_ENVIRONMENT`/credentials and
+cross-checks it against the broker host.
+
+If you log in against `https://api-dev.cyberwave.com` but your saved
+`CYBERWAVE_ENVIRONMENT` says `production`, the CLI will refuse to publish:
+
+```
+Error: MQTT topic prefix doesn't match the broker host.
+
+  broker host:       dev.mqtt.cyberwave.com
+  inferred env:      dev
+  expected prefix:   'dev'
+  resolved prefix:   '' (production)
+```
+
+Fix it by re-running `cyberwave login` (or `cyberwave configure`) so the
+saved environment matches the broker, or set `CYBERWAVE_ENVIRONMENT=dev` in
+your shell. As a last-resort override use `CYBERWAVE_MQTT_TOPIC_PREFIX`.
 
 ## Building for Distribution
 
