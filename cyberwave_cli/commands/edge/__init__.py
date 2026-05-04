@@ -676,7 +676,13 @@ def uninstall_edge(yes):
 @click.option("--env-file", type=click.Path(), default=None, help="Path to .env file")
 @click.option("--foreground", "-f", is_flag=True, help="Run in foreground (don't daemonize)")
 def start_edge(env_file, foreground):
-    """Start the edge node service."""
+    """Start the edge node service.
+
+    When the service is already running, ``systemctl start`` is a no-op
+    and edge-core's boot-time driver startup is *not* re-executed.  Use
+    ``cyberwave edge restart`` to force a full reload of twin/asset
+    metadata and re-spawn driver containers.
+    """
     from ...core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, load_launchagent_service, start_service
 
     spec = EDGE_CORE_SPEC

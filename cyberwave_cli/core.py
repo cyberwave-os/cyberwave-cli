@@ -1833,13 +1833,34 @@ def stop_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
 def start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
     """Start the service without re-enabling it (user-initiated start).
 
-    Returns True on success.
+    When the service is already active, this is a no-op from systemd's
+    perspective: ``systemctl start`` does not re-execute the unit's
+    ``ExecStart`` (so edge-core's boot-time driver startup does *not*
+    run again).  Surfacing this explicitly avoids the misleading
+    ``✓ Started`` UX when an operator is actually trying to apply
+    config changes — they should use ``cyberwave edge restart`` for
+    that.
+
+    Returns True on success or when the service was already active.
     """
     if not _has_systemd():
         return False
     if not spec.unit_path.exists():
         console.print(f"[red]Service unit not found — run '{spec.sudo_command_hint}' first.[/red]")
         return False
+    if is_service_active(spec):
+        # Derive ``cyberwave <namespace> restart`` from the install hint
+        # (e.g. ``cyberwave edge install`` -> ``cyberwave edge restart``)
+        # so the message stays correct for both edge-core and cloud-node.
+        restart_hint = spec.install_command_hint.rsplit(" ", 1)[0] + " restart"
+        console.print(
+            f"[yellow]{spec.unit_name} is already running — `systemctl start` is a no-op.[/yellow]"
+        )
+        console.print(
+            "[dim]To apply config changes (re-run boot-time driver startup, "
+            f"reload twins, etc.) use: {restart_hint}[/dim]"
+        )
+        return True
     result = _sudo_systemctl("start", spec.unit_name, check=False)
     if result.returncode == 0:
         console.print(f"[green]✓ Started {spec.unit_name}[/green]")
@@ -2301,14 +2322,37 @@ def _resolve_worker_image() -> str:
     return f"{base}:latest"
 
 
+def _docker_image_present(docker_bin: str, image: str) -> bool:
+    """Return True if *image* is already present in the local Docker daemon."""
+    try:
+        proc = subprocess.run(
+            [docker_bin, "image", "inspect", image],
+            capture_output=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return proc.returncode == 0
+
+
 def _pull_worker_image() -> bool:
     """Pull the ML worker Docker image (best-effort).
 
-    Tries the environment-specific tag first (e.g. ``:dev``).  If that fails
-    and the tag is not ``:latest``, retries with ``:latest`` as a fallback.
+    Behavior mirrors ``WorkerManager._ensure_image_pulled`` in
+    ``cyberwave-edge-core``:
+
+    * If the resolved image is already present locally, skip the pull
+      entirely.  This is the contract for the ``:local`` tag and for
+      ``CYBERWAVE_WORKER_IMAGE`` overrides (e.g. ``:local-gpu``) — those
+      tags only exist locally and a registry pull is guaranteed to fail.
+    * Otherwise issue ``docker pull`` to refresh mutable tags
+      (``:dev``, ``:staging``, …).  If that fails and the tag is not
+      ``:latest``, retry with ``:latest`` as a last-ditch fallback for
+      first-time installs.
 
     Returns True always — a failed pull is non-fatal because
-    ``WorkerManager._run_container()`` will pull implicitly on first start.
+    ``WorkerManager._run_container()`` will pull implicitly on first
+    start and itself falls back to a locally-present image.
     """
     docker_bin = shutil.which("docker")
     if not docker_bin:
@@ -2316,6 +2360,13 @@ def _pull_worker_image() -> bool:
         return True
 
     image = _resolve_worker_image()
+
+    if _docker_image_present(docker_bin, image):
+        console.print(
+            f"[green]Worker image {image} already present locally — skipping pull.[/green]"
+        )
+        return True
+
     console.print(f"[cyan]Pulling worker image {image}...[/cyan]")
     try:
         _run([docker_bin, "pull", image])
