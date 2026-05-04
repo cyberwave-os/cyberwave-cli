@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NoReturn
 from urllib.error import HTTPError, URLError
@@ -315,8 +316,32 @@ def _preflight_sync(
     return syncable, blocking
 
 
-def _pick_workflow(client, title: str = "Select a workflow", base_url: str | None = None) -> str:
+def _is_edge_active_workflow(w: Any) -> bool:
+    """Return True when ``w`` is an active workflow that runs on the edge.
+
+    Mirrors the gate ``cyberwave workflow sync`` checks after picking a
+    workflow — a workflow must be ``is_active=True`` and ``run_on_edge=True``
+    to be eligible for edge sync. Centralising the predicate keeps the
+    ``--edge-active`` selector and the post-selection validation in lockstep.
+    """
+    return bool(getattr(w, "is_active", False)) and bool(
+        getattr(w, "run_on_edge", False)
+    )
+
+
+def _pick_workflow(
+    client,
+    title: str = "Select a workflow",
+    base_url: str | None = None,
+    predicate: Callable[[Any], bool] | None = None,
+    empty_message: str = "No workflows found.",
+) -> str:
     """Fetch workflows and let the user pick one interactively.
+
+    ``predicate`` optionally filters the list before presenting it — used by
+    ``workflow sync --edge-active`` to restrict the selector to active edge
+    workflows. ``empty_message`` is printed (and the command aborts) when the
+    filter excludes everything, so callers can customise the remediation hint.
 
     Returns the selected workflow UUID string.
     """
@@ -328,8 +353,11 @@ def _pick_workflow(client, title: str = "Select a workflow", base_url: str | Non
     except Exception as e:
         _friendly_error("list workflows", e, base_url)
 
+    if predicate is not None:
+        workflows = [w for w in workflows if predicate(w)]
+
     if not workflows:
-        console.print("[dim]No workflows found.[/dim]")
+        console.print(f"[dim]{empty_message}[/dim]")
         raise click.Abort()
 
     options = []
@@ -603,11 +631,21 @@ def show_workflow(uuid: str | None, base_url: str | None):
     help="Run the preflight diagnostic and print what would be synced, "
     "but don't publish the MQTT command.",
 )
+@click.option(
+    "--edge-active",
+    "edge_active",
+    is_flag=True,
+    help="Restrict the interactive selector to workflows that are both "
+    "active (is_active=true) and target edge execution (run_on_edge=true) "
+    "— i.e. the only workflows `sync` will actually ship to an edge node. "
+    "Cannot be combined with an explicit UUID argument.",
+)
 @_base_url_option
 def sync_workflow(
     uuid: str | None,
     force: bool,
     dry_run: bool,
+    edge_active: bool,
     base_url: str | None,
 ):
     """Sync a workflow to its edge node(s).
@@ -623,11 +661,14 @@ def sync_workflow(
     node for the unified edge compiler to render, so the cloud's
     ``/workflows/edge-sync`` response omits it.
 
-    If UUID is omitted, an interactive selector is shown.
+    If UUID is omitted, an interactive selector is shown. Pass
+    ``--edge-active`` to filter that selector to workflows that are already
+    eligible for edge sync (active + ``run_on_edge``).
 
     \b
     Examples:
         cyberwave workflow sync
+        cyberwave workflow sync --edge-active
         cyberwave workflow sync e7f1856c
         cyberwave workflow sync e7f1856c --dry-run
         cyberwave workflow sync e7f1856c --force --base-url http://192.168.10.101:8000
@@ -637,8 +678,28 @@ def sync_workflow(
         console.print("[red]✗[/red] Not logged in or SDK not installed.")
         raise click.Abort()
 
+    if uuid and edge_active:
+        console.print(
+            "[red]✗[/red] --edge-active filters the interactive selector and "
+            "cannot be combined with an explicit workflow UUID."
+        )
+        raise click.Abort()
+
     if not uuid:
-        uuid = _pick_workflow(client, "Select a workflow to sync", base_url)
+        if edge_active:
+            uuid = _pick_workflow(
+                client,
+                "Select an active edge workflow to sync",
+                base_url,
+                predicate=_is_edge_active_workflow,
+                empty_message=(
+                    "No active edge workflows found. Activate an edge workflow "
+                    "with `cyberwave workflow activate <uuid>` or change a "
+                    "workflow's target to edge before syncing."
+                ),
+            )
+        else:
+            uuid = _pick_workflow(client, "Select a workflow to sync", base_url)
 
     try:
         w = client.api.src_app_api_workflows_get_workflow(uuid)

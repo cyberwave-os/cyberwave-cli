@@ -332,6 +332,7 @@ cyberwave workflow show e7f1856c
 
 # Sync workflow to edge device(s)
 cyberwave workflow sync
+cyberwave workflow sync --edge-active                               # only show active edge workflows in the selector
 cyberwave workflow sync e7f1856c --base-url http://192.168.10.101:8000
 
 # Activate / deactivate
