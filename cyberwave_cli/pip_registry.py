@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import re
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
+import httpx
 from packaging.utils import canonicalize_name, parse_sdist_filename, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
@@ -107,15 +107,48 @@ def _extract_version_from_distribution_filename(filename: str, package_name: str
     return parsed_version
 
 
-def _fetch_available_simple_index_versions(index_url: str, package_name: str) -> list[Version]:
+def _redact_buildkite_credentials(text: str, buildkite_read_token: str | None = None) -> str:
+    """Return ``text`` with Buildkite credentials removed."""
+    redacted_text = text
+    if buildkite_read_token:
+        redacted_text = redacted_text.replace(buildkite_read_token, "***")
+    return re.sub(r"(https://buildkite:)[^@\s/]+@", r"\1***@", redacted_text)
+
+
+def _strip_url_credentials(url: str) -> str:
+    """Return ``url`` without userinfo so HTTP clients do not parse embedded tokens."""
+    parsed_url = urllib.parse.urlsplit(url)
+    host = parsed_url.netloc.rsplit("@", 1)[-1]
+    return urllib.parse.urlunsplit(
+        (
+            parsed_url.scheme,
+            host,
+            parsed_url.path,
+            parsed_url.query,
+            parsed_url.fragment,
+        )
+    )
+
+
+def _fetch_available_simple_index_versions(
+    index_url: str,
+    package_name: str,
+    *,
+    buildkite_read_token: str | None = None,
+) -> list[Version]:
     """Fetch and parse available versions from a PEP 503-style simple index page."""
     normalized_name = canonicalize_name(package_name)
-    project_url = f"{index_url.rstrip('/')}/{normalized_name}/"
+    project_url = f"{_strip_url_credentials(index_url).rstrip('/')}/{normalized_name}/"
+    auth = ("buildkite", buildkite_read_token) if buildkite_read_token else None
     try:
-        with urllib.request.urlopen(project_url) as response:
-            html = response.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Failed to query available versions for {package_name}: {exc}") from exc
+        response = httpx.get(project_url, auth=auth, timeout=30.0)
+        response.raise_for_status()
+        html = response.text
+    except httpx.HTTPError as exc:
+        message = _redact_buildkite_credentials(str(exc), buildkite_read_token)
+        raise RuntimeError(
+            f"Failed to query available versions for {package_name}: {message}"
+        ) from exc
 
     hrefs = re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
     parsed_versions: set[Version] = set()
