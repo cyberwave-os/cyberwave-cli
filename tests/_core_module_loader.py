@@ -38,10 +38,10 @@ def load_core_module(monkeypatch):
 
         def status(self, *_args, **_kwargs):
             class _Status:
-                def __enter__(self):
-                    return self
+                def __enter__(self_inner):
+                    return self_inner
 
-                def __exit__(self, exc_type, exc, tb):
+                def __exit__(self_inner, exc_type, exc, tb):
                     return False
 
             return _Status()
@@ -100,17 +100,7 @@ def load_core_module(monkeypatch):
     sys.modules["cyberwave_cli"] = cyberwave_cli_package
 
     sys.modules.pop("cyberwave_cli.macos", None)
-    sys.modules.pop("cyberwave_cli.pip_registry", None)
     sys.modules.pop("cyberwave_cli.core", None)
-
-    pip_registry_spec = importlib.util.spec_from_file_location(
-        "cyberwave_cli.pip_registry",
-        package_root / "pip_registry.py",
-    )
-    assert pip_registry_spec is not None and pip_registry_spec.loader is not None
-    pip_registry_module = importlib.util.module_from_spec(pip_registry_spec)
-    sys.modules["cyberwave_cli.pip_registry"] = pip_registry_module
-    pip_registry_spec.loader.exec_module(pip_registry_module)
 
     spec = importlib.util.spec_from_file_location(
         "cyberwave_cli.core",

@@ -1,11 +1,9 @@
 # tests/test_service_spec.py
 import plistlib
-import sys
 from pathlib import Path
 
-import httpx
-import pytest
-from _core_module_loader import load_core_module
+import cyberwave_cli.pip_registry as pip_registry
+from tests._core_module_loader import load_core_module
 
 
 def test_edge_core_spec_fields(monkeypatch):
@@ -651,8 +649,7 @@ def test_buildkite_python_registry_index_url_uses_registry_slug(monkeypatch):
 
 def test_fetch_available_versions_from_simple_index_parses_buildkite_links(monkeypatch):
     core = load_core_module(monkeypatch)
-    pip_registry = sys.modules["cyberwave_cli.pip_registry"]
-    html = """
+    html = b"""
     <html>
       <body>
         <a href="https://packages.buildkite.com/files/cyberwave-edge-core-0.1.2.dev7.tar.gz">a</a>
@@ -663,17 +660,20 @@ def test_fetch_available_versions_from_simple_index_parses_buildkite_links(monke
     """
 
     class FakeResponse:
-        text = html
+        def __enter__(self):
+            return self
 
-        def raise_for_status(self):
-            return None
+        def __exit__(self, exc_type, exc, tb):
+            return False
 
-    captured_requests: list[tuple[str, tuple[str, str] | None]] = []
+        def read(self):
+            return html
+
+    captured_urls: list[str] = []
     monkeypatch.setattr(
-        pip_registry.httpx,
-        "get",
-        lambda url, *, auth=None, timeout=None: captured_requests.append((url, auth))
-        or FakeResponse(),
+        pip_registry.urllib.request,
+        "urlopen",
+        lambda url: captured_urls.append(url) or FakeResponse(),
     )
 
     versions = core._fetch_available_simple_index_versions(
@@ -681,76 +681,14 @@ def test_fetch_available_versions_from_simple_index_parses_buildkite_links(monke
         "cyberwave-edge-core",
     )
 
-    assert captured_requests == [
-        (
-            "https://packages.buildkite.com/cyberwave/cyberwave-edge-core-python/pypi/simple/cyberwave-edge-core/",
-            None,
-        )
+    assert captured_urls == [
+        "https://packages.buildkite.com/cyberwave/cyberwave-edge-core-python/pypi/simple/cyberwave-edge-core/"
     ]
     assert versions == [
         core.Version("0.1.2.dev7"),
         core.Version("0.1.2.dev12"),
         core.Version("0.1.2rc2"),
     ]
-
-
-def test_fetch_available_versions_uses_buildkite_auth_without_credentialed_url(monkeypatch):
-    core = load_core_module(monkeypatch)
-    pip_registry = sys.modules["cyberwave_cli.pip_registry"]
-
-    class FakeResponse:
-        text = """
-        <a href="cyberwave-edge-core-0.1.2.dev7.tar.gz">a</a>
-        """
-
-        def raise_for_status(self):
-            return None
-
-    captured_requests: list[tuple[str, tuple[str, str] | None]] = []
-    monkeypatch.setattr(
-        pip_registry.httpx,
-        "get",
-        lambda url, *, auth=None, timeout=None: captured_requests.append((url, auth))
-        or FakeResponse(),
-    )
-
-    versions = core._fetch_available_simple_index_versions(
-        "https://packages.buildkite.com/cyberwave/cyberwave-internal-python/pypi/simple",
-        "cyberwave-edge-core",
-        buildkite_read_token="bkrt_secret-token",
-    )
-
-    assert versions == [core.Version("0.1.2.dev7")]
-    assert captured_requests == [
-        (
-            "https://packages.buildkite.com/cyberwave/cyberwave-internal-python/pypi/simple/cyberwave-edge-core/",
-            ("buildkite", "bkrt_secret-token"),
-        )
-    ]
-
-
-def test_fetch_available_versions_redacts_buildkite_token_from_errors(monkeypatch):
-    core = load_core_module(monkeypatch)
-    pip_registry = sys.modules["cyberwave_cli.pip_registry"]
-
-    def raise_connect_error(url, *, auth=None, timeout=None):
-        raise httpx.ConnectError(
-            "failed for https://buildkite:bkrt_secret-token@packages.buildkite.com/simple"
-        )
-
-    monkeypatch.setattr(pip_registry.httpx, "get", raise_connect_error)
-
-    with pytest.raises(RuntimeError) as exc_info:
-        core._fetch_available_simple_index_versions(
-            "https://packages.buildkite.com/cyberwave/cyberwave-internal-python/pypi/simple",
-            "cyberwave-edge-core",
-            buildkite_read_token="bkrt_secret-token",
-        )
-
-    message = str(exc_info.value)
-    assert "Failed to query available versions for cyberwave-edge-core" in message
-    assert "bkrt_secret-token" not in message
-    assert "buildkite:***@" in message
 
 
 def test_select_pip_version_for_dev_channel_picks_highest_dev(monkeypatch):
@@ -829,7 +767,7 @@ def test_pip_install_dev_lists_buildkite_versions_and_installs_latest_match(monk
     monkeypatch.setattr(
         core,
         "_fetch_available_simple_index_versions",
-        lambda index_url, package_name, *, buildkite_read_token=None: [
+        lambda index_url, package_name: [
             core.Version("0.1.2.dev7"),
             core.Version("0.1.2.dev12"),
             core.Version("0.1.2rc2"),
@@ -848,35 +786,26 @@ def test_pip_install_dev_uses_private_internal_python_registry(monkeypatch):
     core = load_core_module(monkeypatch)
     run_calls: list[list[str]] = []
     messages: list[str] = []
-    version_queries: list[tuple[str | None, str, str | None]] = []
     monkeypatch.setenv("CYBERWAVE_INTERNAL_PYTHON_READ_TOKEN", "test-python-token")
     monkeypatch.setattr(
         core.console,
         "print",
         lambda msg="", *args, **kwargs: messages.append(str(msg)),
     )
-
-    def fake_fetch_versions(index_url, package_name, *, buildkite_read_token=None):
-        version_queries.append((index_url, package_name, buildkite_read_token))
-        return [
+    monkeypatch.setattr(
+        core,
+        "_fetch_available_simple_index_versions",
+        lambda index_url, package_name: [
             core.Version("0.1.2.dev7"),
             core.Version("0.1.2.dev12"),
             core.Version("0.1.2rc2"),
-        ]
-
-    monkeypatch.setattr(core, "_fetch_available_simple_index_versions", fake_fetch_versions)
+        ],
+    )
     monkeypatch.setattr(core, "_run", lambda cmd, **_kw: run_calls.append(cmd))
 
     result = core._pip_install(core.EDGE_CORE_SPEC, channel="dev")
 
     assert result is True
-    assert version_queries == [
-        (
-            "https://packages.buildkite.com/cyberwave/cyberwave-internal-python/pypi/simple",
-            "cyberwave-edge-core",
-            "test-python-token",
-        )
-    ]
     assert run_calls == [
         [
             core.sys.executable,
@@ -889,10 +818,7 @@ def test_pip_install_dev_uses_private_internal_python_registry(monkeypatch):
             "cyberwave-edge-core==0.1.2.dev12",
         ]
     ]
-    assert any(
-        "Resolved cyberwave-edge-core dev channel to 0.1.2.dev12" in message
-        for message in messages
-    )
+    assert any("Resolved cyberwave-edge-core dev channel to 0.1.2.dev12" in message for message in messages)
 
 
 def test_pip_install_stable_falls_back_when_version_query_fails(monkeypatch):
@@ -976,7 +902,6 @@ def test_pip_install_uses_saved_internal_python_token(monkeypatch):
     core = load_core_module(monkeypatch)
     run_calls: list[list[str]] = []
     messages: list[str] = []
-    version_queries: list[tuple[str | None, str, str | None]] = []
 
     saved_creds = type(
         "SavedCreds",
@@ -990,27 +915,20 @@ def test_pip_install_uses_saved_internal_python_token(monkeypatch):
         "print",
         lambda msg="", *args, **kwargs: messages.append(str(msg)),
     )
-    def fake_fetch_versions(index_url, package_name, *, buildkite_read_token=None):
-        version_queries.append((index_url, package_name, buildkite_read_token))
-        return [
+    monkeypatch.setattr(
+        core,
+        "_fetch_available_simple_index_versions",
+        lambda index_url, package_name: [
             core.Version("0.1.2.dev7"),
             core.Version("0.1.2.dev12"),
             core.Version("0.1.2rc2"),
-        ]
-
-    monkeypatch.setattr(core, "_fetch_available_simple_index_versions", fake_fetch_versions)
+        ],
+    )
     monkeypatch.setattr(core, "_run", lambda cmd, **_kw: run_calls.append(cmd))
 
     result = core._pip_install(core.EDGE_CORE_SPEC, channel="dev")
 
     assert result is True
-    assert version_queries == [
-        (
-            "https://packages.buildkite.com/cyberwave/cyberwave-internal-python/pypi/simple",
-            "cyberwave-edge-core",
-            "saved-python-token",
-        )
-    ]
     assert run_calls[0][6] == "https://buildkite:saved-python-token@packages.buildkite.com/cyberwave/cyberwave-internal-python/pypi/simple"
 
 

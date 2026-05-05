@@ -1377,19 +1377,13 @@ def _pip_install(
                     )
                     return False
                 if normalized_channel != "stable":
-                    version_lookup_index_url = _buildkite_python_registry_index_url(
-                        _resolve_buildkite_python_registry_slug(
-                            spec.package_name, normalized_channel
-                        )
+                    buildkite_index_url = _buildkite_python_registry_index_url(
+                        _resolve_buildkite_python_registry_slug(spec.package_name, normalized_channel),
+                        registry_read_token,
                     )
-                else:
-                    version_lookup_index_url = buildkite_index_url
                 available_versions = _fetch_available_simple_index_versions(
-                    version_lookup_index_url,
+                    buildkite_index_url,
                     spec.package_name,
-                    buildkite_read_token=registry_read_token
-                    if normalized_channel != "stable"
-                    else None,
                 )
                 resolved_version = _select_pip_version_for_channel(
                     available_versions,
