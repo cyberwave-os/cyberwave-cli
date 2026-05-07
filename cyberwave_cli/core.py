@@ -1566,14 +1566,18 @@ def _resolve_service_binary(spec: ServiceSpec) -> str:
     Resolution order:
     1. spec.binary_path if it exists (Linux apt install)
     2. Venv-local bin used by install-local-cli-mac.sh
-    3. PATH lookup via shutil.which
-    4. spec.binary_path as a fallback (may not exist)
+    3. Current Python environment bin used by pip installs
+    4. PATH lookup via shutil.which
+    5. spec.binary_path as a fallback (may not exist)
     """
     if spec.binary_path.exists():
         return str(spec.binary_path)
     venv_bin = Path.home() / ".cyberwave-cli" / "venv-local" / "bin" / spec.package_name
     if venv_bin.exists():
         return str(venv_bin)
+    current_env_bin = Path(sys.executable).parent / spec.package_name
+    if current_env_bin.exists():
+        return str(current_env_bin)
     return shutil.which(spec.package_name) or str(spec.binary_path)
 
 

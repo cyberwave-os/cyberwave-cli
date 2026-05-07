@@ -139,6 +139,53 @@ def test_create_launchagent_service_writes_plist_with_config(monkeypatch, tmp_pa
     assert plist_data["KeepAlive"] is True
 
 
+def test_create_launchagent_service_prefers_local_venv_binary(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    home_dir = tmp_path / "home"
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    current_venv_binary = venv_python.parent / "cyberwave-edge-core"
+    local_venv_binary = home_dir / ".cyberwave-cli" / "venv-local" / "bin" / "cyberwave-edge-core"
+    current_venv_binary.parent.mkdir(parents=True)
+    local_venv_binary.parent.mkdir(parents=True)
+    venv_python.write_text("#!/bin/sh\n")
+    current_venv_binary.write_text("#!/bin/sh\n")
+    local_venv_binary.write_text("#!/bin/sh\n")
+
+    monkeypatch.setattr(core.Path, "home", staticmethod(lambda: home_dir))
+    monkeypatch.setattr(core.sys, "executable", str(venv_python))
+    monkeypatch.setattr(core.EDGE_CORE_SPEC, "binary_path", Path("/usr/bin/cyberwave-edge-core"))
+    monkeypatch.setattr(core.shutil, "which", lambda _name: None)
+
+    result = core.create_launchagent_service(core.EDGE_CORE_SPEC)
+
+    assert result is True
+    plist_path = home_dir / "Library" / "LaunchAgents" / "com.cyberwave.edge.core.plist"
+    plist_data = plistlib.loads(plist_path.read_bytes())
+    assert plist_data["ProgramArguments"] == [str(local_venv_binary)]
+
+
+def test_create_launchagent_service_uses_current_venv_without_local_venv(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    home_dir = tmp_path / "home"
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    current_venv_binary = venv_python.parent / "cyberwave-edge-core"
+    current_venv_binary.parent.mkdir(parents=True)
+    venv_python.write_text("#!/bin/sh\n")
+    current_venv_binary.write_text("#!/bin/sh\n")
+
+    monkeypatch.setattr(core.Path, "home", staticmethod(lambda: home_dir))
+    monkeypatch.setattr(core.sys, "executable", str(venv_python))
+    monkeypatch.setattr(core.EDGE_CORE_SPEC, "binary_path", Path("/usr/bin/cyberwave-edge-core"))
+    monkeypatch.setattr(core.shutil, "which", lambda _name: None)
+
+    result = core.create_launchagent_service(core.EDGE_CORE_SPEC)
+
+    assert result is True
+    plist_path = home_dir / "Library" / "LaunchAgents" / "com.cyberwave.edge.core.plist"
+    plist_data = plistlib.loads(plist_path.read_bytes())
+    assert plist_data["ProgramArguments"] == [str(current_venv_binary)]
+
+
 def test_load_launchagent_service_bootstraps_current_gui_user(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
     bootout_calls: list[list[str]] = []
