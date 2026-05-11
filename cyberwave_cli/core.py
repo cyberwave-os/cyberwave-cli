@@ -941,6 +941,98 @@ def _detach_edge_fingerprint_from_other_twins(
     return detached, failed
 
 
+_NON_TWIN_JSON_FILES = frozenset({
+    "credentials.json",
+    "environment.json",
+    "cameras.json",
+    "camera_streams.json",
+    "fingerprint.json",
+})
+
+
+def _detect_existing_edge_configuration() -> tuple[str | None, list[Path]]:
+    """Check CONFIG_DIR for an existing edge environment configuration.
+
+    Returns:
+        (environment_name_or_uuid, list_of_twin_json_paths)
+        *environment_name_or_uuid* is ``None`` when no prior configuration
+        is detected.
+    """
+    twin_json_files = [
+        p
+        for p in sorted(CONFIG_DIR.glob("*.json"))
+        if p.name not in _NON_TWIN_JSON_FILES
+    ]
+    if not twin_json_files:
+        return None, []
+
+    env_label: str | None = None
+    if ENVIRONMENT_FILE.exists():
+        try:
+            data = json.loads(ENVIRONMENT_FILE.read_text(encoding="utf-8"))
+            env_label = data.get("name") or data.get("uuid")
+        except Exception:
+            pass
+
+    return env_label, twin_json_files
+
+
+def _cleanup_existing_edge_configuration(
+    *,
+    twin_json_files: list[Path],
+    creds: Credentials | None = None,
+) -> None:
+    """Remove local twin/environment files and backend edge registrations.
+
+    This mirrors the cleanup performed by ``cyberwave edge uninstall`` but
+    intentionally preserves credentials, fingerprint, the installed
+    package, and the system service so that the subsequent install flow can
+    continue seamlessly.
+    """
+    for path in twin_json_files:
+        try:
+            path.unlink()
+        except OSError:
+            console.print(f"[yellow]Could not remove {path}[/yellow]")
+
+    if ENVIRONMENT_FILE.exists():
+        try:
+            ENVIRONMENT_FILE.unlink()
+        except OSError:
+            console.print(f"[yellow]Could not remove {ENVIRONMENT_FILE}[/yellow]")
+
+    edge_fingerprint = _load_or_generate_edge_fingerprint()
+    token = creds.token if creds else None
+    base_url = (
+        str(getattr(creds, "cyberwave_base_url", "") or "") if creds else None
+    )
+    workspace_uuid = (
+        str(getattr(creds, "workspace_uuid", "") or "") if creds else None
+    )
+
+    if token:
+        from .commands.edge import _delete_registered_edges_for_fingerprint
+
+        deleted, failed = _delete_registered_edges_for_fingerprint(
+            fingerprint=edge_fingerprint,
+            token=token,
+            base_url=base_url,
+            workspace_uuid=workspace_uuid,
+        )
+        if deleted:
+            console.print(
+                f"[green]Removed backend edge registration(s): "
+                f"{deleted} (fingerprint: {edge_fingerprint}).[/green]"
+            )
+        if failed:
+            console.print(
+                f"[yellow]Failed to remove {failed} backend edge "
+                f"registration(s).[/yellow]"
+            )
+
+    console.print("[green]Previous edge configuration cleared.[/green]")
+
+
 def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
     """Select workspace + environment and save /etc/cyberwave/environment.json."""
     creds = load_credentials()
@@ -948,6 +1040,21 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
         console.print("[red]No credentials found.[/red]")
         console.print("[dim]Run 'cyberwave login' first.[/dim]")
         return False
+
+    if not skip_confirm:
+        env_label, twin_json_files = _detect_existing_edge_configuration()
+        if env_label is not None:
+            display_name = env_label or "an unknown environment"
+            disconnect = Confirm.ask(
+                f"This edge is already connected to [bold]{display_name}[/bold]. "
+                "Do you want to disconnect it first before installing again?",
+                default=True,
+            )
+            if disconnect:
+                _cleanup_existing_edge_configuration(
+                    twin_json_files=twin_json_files,
+                    creds=creds,
+                )
 
     try:
         creds_base_url = creds.cyberwave_base_url
