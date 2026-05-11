@@ -191,9 +191,14 @@ def test_load_launchagent_service_bootstraps_current_gui_user(monkeypatch, tmp_p
     so the bootout-wait-bootstrap dance happens with proper synchronization.
 
     The helpers themselves are unit-tested in tests/test_macos.py; here we
-    only verify the wiring (right label, right domain, right plist path)."""
+    only verify the wiring (right label, right domain, right plist path).
+
+    ``core.py`` imports the helpers at module level, so they live as
+    attributes on the ``core`` module — patching ``macos`` would have no
+    effect on the already-bound names.  We patch them where they're
+    looked up (per the standard ``unittest.mock`` rule).
+    """
     core = load_core_module(monkeypatch)
-    import cyberwave_cli.macos as macos_mod
 
     unload_calls: list[str] = []
     bootstrap_calls: list[tuple[str, Path]] = []
@@ -203,12 +208,12 @@ def test_load_launchagent_service_bootstraps_current_gui_user(monkeypatch, tmp_p
     monkeypatch.setattr(core, "_launchagent_plist_path", lambda spec: plist_path, raising=False)
     monkeypatch.setattr(core, "os", type("os", (), {"getuid": staticmethod(lambda: 501)})())
     monkeypatch.setattr(
-        macos_mod,
+        core,
         "wait_for_launchd_unload",
         lambda label, **kw: unload_calls.append(label) or True,
     )
     monkeypatch.setattr(
-        macos_mod,
+        core,
         "bootstrap_launchd_service",
         lambda domain, path, **kw: bootstrap_calls.append((domain, path)),
     )
@@ -226,7 +231,6 @@ def test_load_launchagent_service_reports_persistent_exit_5(monkeypatch, tmp_pat
     import subprocess as _subprocess
 
     core = load_core_module(monkeypatch)
-    import cyberwave_cli.macos as macos_mod
 
     plist_path = tmp_path / "com.cyberwave.cloud-node.plist"
     plist_path.write_text("plist")
@@ -241,12 +245,12 @@ def test_load_launchagent_service_reports_persistent_exit_5(monkeypatch, tmp_pat
         },
     )()
     monkeypatch.setattr(core, "os", fake_os)
-    monkeypatch.setattr(macos_mod, "wait_for_launchd_unload", lambda label, **kw: True)
+    monkeypatch.setattr(core, "wait_for_launchd_unload", lambda label, **kw: True)
 
     def fail_bootstrap(domain, path, **kw):
         raise _subprocess.CalledProcessError(returncode=5, cmd=["launchctl"])
 
-    monkeypatch.setattr(macos_mod, "bootstrap_launchd_service", fail_bootstrap)
+    monkeypatch.setattr(core, "bootstrap_launchd_service", fail_bootstrap)
 
     printed: list[str] = []
     monkeypatch.setattr(

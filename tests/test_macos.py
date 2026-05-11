@@ -675,6 +675,20 @@ def test_legacy_labels_for_package_returns_edge_core_history(monkeypatch):
     assert macos.legacy_labels_for_package("unrelated") == ()
 
 
+def _executable_lines(rendered: str) -> list[str]:
+    """Strip comments and blank lines so the structural assertions below
+    don't trip over comment text that happens to contain the very tokens
+    we're forbidding (e.g. the comment explaining *why* ``set -e`` is
+    intentionally absent)."""
+    result: list[str] = []
+    for raw in rendered.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        result.append(raw)
+    return result
+
+
 def test_camera_stream_wrapper_template_uses_persistent_loop(monkeypatch):
     """The wrapper script must loop ffmpeg in bash so that launchd's
     spawn-throttle never disables the service.  ``-listen 1`` is one-shot
@@ -682,19 +696,55 @@ def test_camera_stream_wrapper_template_uses_persistent_loop(monkeypatch):
     short burst of consumer reconnects."""
     macos = _load_macos(monkeypatch)
     rendered = macos._CAMERA_STREAM_WRAPPER_TEMPLATE.format(port=8091)
+    code_only = "\n".join(_executable_lines(rendered))
 
-    assert "while true; do" in rendered
-    assert "|| true" in rendered, (
-        "Inner ffmpeg invocation must not propagate failure to bash"
-    )
-    assert "sleep 1" in rendered, (
+    assert "while true; do" in code_only
+    assert "sleep 1" in code_only, (
         "Need a small backoff between restarts to avoid tight spinning"
     )
-    assert "exec ffmpeg" not in rendered, (
+    assert "exec ffmpeg" not in code_only, (
         "exec would replace bash with ffmpeg, defeating the outer loop"
     )
-    assert "trap 'exit 0' INT TERM" in rendered, (
+    assert "trap 'exit 0' INT TERM" in code_only, (
         "launchctl bootout must cleanly stop the wrapper"
+    )
+    # ``set -e`` would propagate ffmpeg's non-zero exit, collapsing the
+    # outer loop after the first restart.  Pin its absence in executable
+    # code (the surrounding comment text is allowed to mention it).
+    assert "set -e" not in code_only, (
+        "set -e would abort the wrapper on the first ffmpeg failure"
+    )
+    # Captured ffmpeg exit status enables the logger line below to
+    # attribute restarts; if a future edit reintroduces ``|| true`` it
+    # would silently zero out ``$?`` and the logs would all read
+    # ``status 0``.  Pin the capture explicitly.
+    assert "ffmpeg_status=$?" in code_only, (
+        "Wrapper must capture ffmpeg's real exit status for logging"
+    )
+    assert "|| true" not in code_only, (
+        "|| true after ffmpeg would mask the real exit code in $?"
+    )
+
+
+def test_camera_stream_wrapper_logs_restarts_via_unified_log(monkeypatch):
+    """macOS unified-log integration: when ffmpeg dies and the wrapper
+    restarts it, a tagged ``logger`` line lands in ``log show`` so the
+    user can diagnose a hung restart loop without digging into the
+    StandardError file."""
+    macos = _load_macos(monkeypatch)
+    rendered = macos._CAMERA_STREAM_WRAPPER_TEMPLATE.format(port=8091)
+
+    assert "logger -t cyberwave-camera-stream" in rendered, (
+        "Restarts must be visible via 'log show ... cyberwave-camera-stream'"
+    )
+    # Two logger calls: one announcing the initial start, one inside the
+    # loop body for each restart.  Both must use the same tag so the
+    # ``log show`` filter pulls a complete trail.
+    assert rendered.count("logger -t cyberwave-camera-stream") >= 2, (
+        "Expected both a startup line and a per-restart line"
+    )
+    assert "ffmpeg exited" in rendered, (
+        "Restart line should mention ffmpeg + its captured exit status"
     )
 
 
@@ -716,6 +766,73 @@ def test_wait_for_launchd_unload_polls_until_label_disappears(monkeypatch):
     monkeypatch.setattr(macos.time, "sleep", lambda _s: None)
 
     assert macos.wait_for_launchd_unload("com.example.svc", timeout=2.0) is True
+
+
+def test_wait_for_launchd_unload_stays_silent_when_label_already_gone(monkeypatch):
+    """Happy path: bootout was instant, so the first poll already sees the
+    label as unloaded.  We must NOT print the "Waiting for launchd…" line
+    in that case — it would confuse users on a fresh install where there
+    is nothing to wait on at all."""
+    macos = _load_macos(monkeypatch)
+    _stub_real_user(macos, monkeypatch)
+
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *a, **kw: SimpleNamespace(returncode=64, stdout=b"", stderr=b""),
+    )
+    monkeypatch.setattr(macos.time, "sleep", lambda _s: None)
+
+    fake_console = MagicMock()
+    monkeypatch.setattr(macos, "_get_console", lambda: fake_console)
+
+    assert macos.wait_for_launchd_unload("com.example.svc", timeout=2.0) is True
+    waiting_calls = [
+        call for call in fake_console.print.call_args_list
+        if "Waiting for launchd" in str(call)
+    ]
+    assert waiting_calls == [], (
+        "No need to print a waiting line when the bootout was instant"
+    )
+
+
+def test_wait_for_launchd_unload_announces_wait_once(monkeypatch):
+    """When the label is still loaded after the bootouts, surface a
+    one-shot status line so the CLI doesn't appear frozen during the
+    up-to-10s poll.  The line must be printed exactly once, regardless
+    of how many poll iterations are required."""
+    macos = _load_macos(monkeypatch)
+    _stub_real_user(macos, monkeypatch)
+
+    # 5 ``True`` responses then ``False`` → 5 poll iterations before the
+    # label disappears; the waiting line must still appear exactly once.
+    print_responses = iter([0, 0, 0, 0, 0, 1])
+
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        if "print" in cmd:
+            return SimpleNamespace(
+                returncode=next(print_responses, 1), stdout=b"", stderr=b""
+            )
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(macos.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(macos.time, "sleep", lambda _s: None)
+
+    fake_console = MagicMock()
+    monkeypatch.setattr(macos, "_get_console", lambda: fake_console)
+
+    assert macos.wait_for_launchd_unload("com.example.svc", timeout=5.0) is True
+
+    waiting_calls = [
+        call for call in fake_console.print.call_args_list
+        if "Waiting for launchd" in str(call)
+    ]
+    assert len(waiting_calls) == 1, (
+        f"Expected exactly one waiting-line announcement, got {len(waiting_calls)}"
+    )
+    assert "com.example.svc" in str(waiting_calls[0]), (
+        "Waiting line should mention which label is being waited on"
+    )
 
 
 def test_wait_for_launchd_unload_times_out_when_label_stays_loaded(monkeypatch):

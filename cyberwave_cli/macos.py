@@ -226,12 +226,22 @@ def wait_for_launchd_unload(
 
     deadline = time.monotonic() + timeout
     poll_interval = 0.1
+    # ``announced`` keeps the CLI quiet on the happy path (launchd already
+    # released the label by the time we poll) and only surfaces a one-shot
+    # status line when the user is actually about to sit through the wait.
+    announced = False
     while time.monotonic() < deadline:
         still_loaded = any(
             _launchd_label_is_loaded(f"{domain}/{label}") for domain in domains
         )
         if not still_loaded:
             return True
+        if not announced:
+            _get_console().print(
+                f"[dim]Waiting for launchd to release {label} "
+                f"(up to {timeout:.0f}s)...[/dim]"
+            )
+            announced = True
         time.sleep(poll_interval)
         poll_interval = min(poll_interval * 1.5, 0.5)
     return False
@@ -259,14 +269,16 @@ def bootstrap_launchd_service(
             attempt, or fails with a non-transient error.
         FileNotFoundError: If ``launchctl`` itself is missing.
     """
-    last_exc: Optional[subprocess.CalledProcessError] = None
+    # The loop body always either ``return``s on success or ``raise``s on the
+    # terminal attempt (final retry exhausted, or non-transient exit code), so
+    # no fall-through path can reach the end of the function — keeping a
+    # ``last_exc`` accumulator + post-loop ``raise`` would be unreachable.
     delay = retry_initial_delay
     for attempt in range(retries + 1):
         try:
             _run(_launchctl_as_user(["bootstrap", domain, str(plist_path)]))
             return
         except subprocess.CalledProcessError as exc:
-            last_exc = exc
             if exc.returncode != 5 or attempt == retries:
                 raise
             _get_console().print(
@@ -276,8 +288,6 @@ def bootstrap_launchd_service(
             )
             time.sleep(delay)
             delay *= 2
-    if last_exc is not None:
-        raise last_exc
 
 
 def _resolve_real_user() -> tuple[Optional[str], Optional[int], Optional[int]]:
@@ -690,6 +700,19 @@ _CAMERA_STREAM_WRAPPER_TEMPLATE = textwrap.dedent("""\
     # the service after a short burst of restarts.
     trap 'exit 0' INT TERM
 
+    # macOS ``logger`` routes to the unified log so each restart is visible
+    # via ``log show --predicate 'process == "logger"' --info`` (or filter on
+    # the ``cyberwave-camera-stream`` tag).  This makes a wedged loop (e.g.
+    # ffmpeg crashing instantly because of a bad ``$DEVICE``) diagnosable
+    # without grepping the StandardErrorPath file.
+    logger -t cyberwave-camera-stream \\
+        "Starting MJPEG server on port $PORT (device=$DEVICE, ${{RESOLUTION}}@${{FPS}})"
+
+    # No ``set -e`` and no ``|| true`` here on purpose: we want to read
+    # ffmpeg's real exit status into ``$?`` so the logger line can attribute
+    # restarts (139 = SIGSEGV, 143 = SIGTERM from launchd bootout, 1 =
+    # port-in-use / device-busy, etc.).  Wrapping with ``|| true`` would
+    # always collapse it to 0 and hide the cause.
     while true; do
         ffmpeg -hide_banner -loglevel warning \\
             -fflags nobuffer -flags low_delay -avioflags direct \\
@@ -699,7 +722,9 @@ _CAMERA_STREAM_WRAPPER_TEMPLATE = textwrap.dedent("""\
             -fflags nobuffer -flush_packets 1 \\
             -f mjpeg \\
             -listen 1 \\
-            "http://0.0.0.0:$PORT" || true
+            "http://0.0.0.0:$PORT"
+        ffmpeg_status=$?
+        logger -t cyberwave-camera-stream "ffmpeg exited (status $ffmpeg_status); restarting in 1s"
         sleep 1
     done
 """)

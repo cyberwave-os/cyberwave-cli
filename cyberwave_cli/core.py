@@ -42,12 +42,15 @@ from .credentials import (
     load_credentials,
     save_credentials,
 )
-from .macos import init_console as _init_macos_console
 from .macos import (
+    bootstrap_launchd_service,
     is_macos,
+    legacy_labels_for_package,
     setup_camera_stream_server,
     setup_usbip_server,
+    wait_for_launchd_unload,
 )
+from .macos import init_console as _init_macos_console
 
 console = Console()
 _init_macos_console(console)
@@ -1763,12 +1766,6 @@ def load_launchagent_service(spec: ServiceSpec = CLOUD_NODE_SPEC) -> bool:
 
     label = _launchagent_label(spec)
     domain, _bootout_target = _launchagent_target(spec)
-
-    from .macos import (
-        bootstrap_launchd_service,
-        legacy_labels_for_package,
-        wait_for_launchd_unload,
-    )
 
     try:
         wait_for_launchd_unload(
