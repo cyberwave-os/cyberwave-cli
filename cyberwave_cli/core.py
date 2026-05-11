@@ -1762,25 +1762,38 @@ def load_launchagent_service(spec: ServiceSpec = CLOUD_NODE_SPEC) -> bool:
         return False
 
     label = _launchagent_label(spec)
-    domain, bootout_target = _launchagent_target(spec)
+    domain, _bootout_target = _launchagent_target(spec)
+
+    from .macos import (
+        bootstrap_launchd_service,
+        legacy_labels_for_package,
+        wait_for_launchd_unload,
+    )
 
     try:
-        result = subprocess.run(
-            ["launchctl", "bootout", bootout_target],
-            env=clean_subprocess_env(),
-            capture_output=True,
+        wait_for_launchd_unload(
+            label, legacy_labels=legacy_labels_for_package(spec.package_name)
         )
-        if result.returncode == 0:
-            # Give launchd a moment to fully unload the previous instance before
-            # bootstrapping the new plist to avoid transient I/O errors (exit 5).
-            time.sleep(1)
-        _run(["launchctl", "bootstrap", domain, str(plist_path)])
+        bootstrap_launchd_service(domain, plist_path)
     except FileNotFoundError:
         console.print("[red]launchctl not found on this system.[/red]")
         return False
     except subprocess.CalledProcessError as exc:
-        console.print(f"[red]launchctl failed (exit {exc.returncode}).[/red]")
-        console.print("[dim]LaunchAgent loading requires an active macOS GUI login session.[/dim]")
+        console.print(
+            f"[red]launchctl bootstrap failed (exit {exc.returncode}).[/red]"
+        )
+        if exc.returncode == 5:
+            console.print(
+                "[dim]Hint: launchd reports a transient I/O error even after "
+                f"retries. Inspect state with 'launchctl print {domain}/{label}', "
+                "or re-run under sudo for richer launchctl error output.[/dim]"
+            )
+        elif os.getuid() == 0 and not os.getenv("SUDO_USER"):
+            console.print(
+                "[dim]LaunchAgent loading requires an active macOS GUI login "
+                "session and the invoking user's UID (run without sudo, or "
+                "ensure SUDO_USER is set).[/dim]"
+            )
         return False
 
     console.print(f"[green]LaunchAgent loaded:[/green] {label}")

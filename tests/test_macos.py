@@ -5,8 +5,12 @@ live in the SDK test suite (``tests/test_edge_platform.py``) since the
 implementation now lives in ``cyberwave.edge.platform``.
 """
 
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 from tests._core_module_loader import load_core_module
 
@@ -590,3 +594,254 @@ def test_init_console_injects_shared_instance(monkeypatch):
     mock_console = MagicMock()
     macos.init_console(mock_console)
     assert macos._get_console() is mock_console
+
+
+# ---- launchd timing helpers --------------------------------------------------
+
+
+def _stub_real_user(macos, monkeypatch, *, uid=501):
+    monkeypatch.setattr(
+        macos, "_resolve_real_user", lambda: (f"user{uid}", uid, 20)
+    )
+
+
+def test_wait_for_launchd_unload_returns_true_when_label_never_loaded(
+    monkeypatch,
+):
+    """If launchctl print never returns 0, the label is already gone."""
+    macos = _load_macos(monkeypatch)
+    _stub_real_user(macos, monkeypatch)
+
+    calls: list[list[str]] = []
+
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        if "bootout" in cmd:
+            return SimpleNamespace(returncode=113, stdout=b"", stderr=b"")
+        return SimpleNamespace(returncode=64, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(macos.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(macos.time, "sleep", lambda _s: None)
+
+    assert macos.wait_for_launchd_unload("com.example.svc", timeout=2.0) is True
+
+    bootout_targets = [
+        cmd[cmd.index("bootout") + 1] for cmd in calls if "bootout" in cmd
+    ]
+    assert "gui/501/com.example.svc" in bootout_targets
+    assert "system/com.example.svc" in bootout_targets
+
+
+def test_wait_for_launchd_unload_bootouts_legacy_labels_too(monkeypatch):
+    """legacy_labels are booted out alongside the primary label so users
+    upgrading from older CLI builds don't end up with two LaunchAgents
+    running the same logical service under different labels."""
+    macos = _load_macos(monkeypatch)
+    _stub_real_user(macos, monkeypatch)
+
+    bootout_targets: list[str] = []
+
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        if "bootout" in cmd:
+            bootout_targets.append(cmd[cmd.index("bootout") + 1])
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        return SimpleNamespace(returncode=64, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(macos.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(macos.time, "sleep", lambda _s: None)
+
+    assert (
+        macos.wait_for_launchd_unload(
+            "com.cyberwave.edge.core",
+            timeout=2.0,
+            legacy_labels=("com.cyberwave.edge-core",),
+        )
+        is True
+    )
+
+    # Both primary and legacy labels must be booted out in both domains.
+    assert "gui/501/com.cyberwave.edge.core" in bootout_targets
+    assert "system/com.cyberwave.edge.core" in bootout_targets
+    assert "gui/501/com.cyberwave.edge-core" in bootout_targets
+    assert "system/com.cyberwave.edge-core" in bootout_targets
+
+
+def test_legacy_labels_for_package_returns_edge_core_history(monkeypatch):
+    macos = _load_macos(monkeypatch)
+    assert macos.legacy_labels_for_package("cyberwave-edge-core") == (
+        "com.cyberwave.edge-core",
+    )
+    assert macos.legacy_labels_for_package("cyberwave-cloud-node") == ()
+    assert macos.legacy_labels_for_package("unrelated") == ()
+
+
+def test_camera_stream_wrapper_template_uses_persistent_loop(monkeypatch):
+    """The wrapper script must loop ffmpeg in bash so that launchd's
+    spawn-throttle never disables the service.  ``-listen 1`` is one-shot
+    by design, so without an outer loop the agent gets removed after a
+    short burst of consumer reconnects."""
+    macos = _load_macos(monkeypatch)
+    rendered = macos._CAMERA_STREAM_WRAPPER_TEMPLATE.format(port=8091)
+
+    assert "while true; do" in rendered
+    assert "|| true" in rendered, (
+        "Inner ffmpeg invocation must not propagate failure to bash"
+    )
+    assert "sleep 1" in rendered, (
+        "Need a small backoff between restarts to avoid tight spinning"
+    )
+    assert "exec ffmpeg" not in rendered, (
+        "exec would replace bash with ffmpeg, defeating the outer loop"
+    )
+    assert "trap 'exit 0' INT TERM" in rendered, (
+        "launchctl bootout must cleanly stop the wrapper"
+    )
+
+
+def test_wait_for_launchd_unload_polls_until_label_disappears(monkeypatch):
+    """Returns True after launchd reports the label is no longer loaded."""
+    macos = _load_macos(monkeypatch)
+    _stub_real_user(macos, monkeypatch)
+
+    print_responses = iter([0, 0, 0, 1])
+
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        if "print" in cmd:
+            return SimpleNamespace(
+                returncode=next(print_responses, 1), stdout=b"", stderr=b""
+            )
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(macos.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(macos.time, "sleep", lambda _s: None)
+
+    assert macos.wait_for_launchd_unload("com.example.svc", timeout=2.0) is True
+
+
+def test_wait_for_launchd_unload_times_out_when_label_stays_loaded(monkeypatch):
+    """Returns False if launchctl print keeps reporting the label as loaded."""
+    macos = _load_macos(monkeypatch)
+    _stub_real_user(macos, monkeypatch)
+
+    monotonic_values = iter([0.0, 0.1, 0.2, 3.0])
+
+    monkeypatch.setattr(
+        macos.time, "monotonic", lambda: next(monotonic_values, 99.0)
+    )
+    monkeypatch.setattr(macos.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *a, **kw: SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+    )
+
+    assert macos.wait_for_launchd_unload("com.example.svc", timeout=1.0) is False
+
+
+def test_bootstrap_launchd_service_retries_exit_5_then_succeeds(monkeypatch):
+    """Transient exit-5 should trigger a retry and eventually succeed."""
+    macos = _load_macos(monkeypatch)
+    attempts: list[int] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) < 2:
+            raise subprocess.CalledProcessError(
+                returncode=5, cmd=cmd, output=b"", stderr=b"5: I/O error"
+            )
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(macos, "_run", fake_run)
+    monkeypatch.setattr(macos.time, "sleep", lambda _s: None)
+
+    macos.bootstrap_launchd_service(
+        "gui/501", Path("/tmp/com.example.svc.plist"), retries=2
+    )
+
+    assert len(attempts) == 2, "first attempt failed, second attempt succeeded"
+
+
+def test_bootstrap_launchd_service_does_not_retry_other_exit_codes(monkeypatch):
+    """Non-5 exit codes (e.g. permission denied) must fail fast."""
+    macos = _load_macos(monkeypatch)
+    attempts: list[int] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        attempts.append(len(attempts) + 1)
+        raise subprocess.CalledProcessError(
+            returncode=119, cmd=cmd, output=b"", stderr=b"permission denied"
+        )
+
+    monkeypatch.setattr(macos, "_run", fake_run)
+    monkeypatch.setattr(macos.time, "sleep", lambda _s: None)
+
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        macos.bootstrap_launchd_service(
+            "gui/501", Path("/tmp/com.example.svc.plist"), retries=3
+        )
+
+    assert exc_info.value.returncode == 119
+    assert len(attempts) == 1, "permission errors must not be retried"
+
+
+def test_bootstrap_launchd_service_raises_after_exhausting_retries(monkeypatch):
+    """If exit 5 persists across every retry, raise on the final attempt."""
+    macos = _load_macos(monkeypatch)
+    attempts: list[int] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        attempts.append(len(attempts) + 1)
+        raise subprocess.CalledProcessError(
+            returncode=5, cmd=cmd, output=b"", stderr=b"5: I/O error"
+        )
+
+    monkeypatch.setattr(macos, "_run", fake_run)
+    monkeypatch.setattr(macos.time, "sleep", lambda _s: None)
+
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        macos.bootstrap_launchd_service(
+            "gui/501", Path("/tmp/com.example.svc.plist"), retries=2
+        )
+
+    assert exc_info.value.returncode == 5
+    assert len(attempts) == 3, "initial attempt + 2 retries"
+
+
+# ---- edge-core label migration ----------------------------------------------
+
+
+def test_teardown_edge_core_removes_legacy_dash_named_plist(monkeypatch, tmp_path):
+    """Pre-unification CLI installs created com.cyberwave.edge-core.plist;
+    teardown must clean it up alongside the current dot-named plist so users
+    upgrading from older CLIs don't end up with orphan LaunchAgents."""
+    macos = _load_macos(monkeypatch)
+
+    launch_agents = tmp_path / "Library" / "LaunchAgents"
+    launch_agents.mkdir(parents=True)
+
+    current_plist = launch_agents / "com.cyberwave.edge.core.plist"
+    legacy_plist = launch_agents / "com.cyberwave.edge-core.plist"
+    wrapper = tmp_path / ".cyberwave" / "edge_core.sh"
+    wrapper.parent.mkdir(parents=True)
+
+    for path in (current_plist, legacy_plist, wrapper):
+        path.write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(macos, "_user_home", lambda: tmp_path)
+    monkeypatch.setattr(macos, "edge_core_plist_path", lambda: current_plist)
+    monkeypatch.setattr(macos, "_edge_core_wrapper_path", lambda: wrapper)
+
+    booted_out: list[str] = []
+    monkeypatch.setattr(
+        macos,
+        "_bootout_launchd_service",
+        lambda label: booted_out.append(label),
+    )
+
+    macos.teardown_edge_core_launchd_service()
+
+    assert not current_plist.exists()
+    assert not legacy_plist.exists()
+    assert not wrapper.exists()
+    assert "com.cyberwave.edge.core" in booted_out
+    assert "com.cyberwave.edge-core" in booted_out

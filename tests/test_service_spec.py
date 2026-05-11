@@ -187,36 +187,77 @@ def test_create_launchagent_service_uses_current_venv_without_local_venv(monkeyp
 
 
 def test_load_launchagent_service_bootstraps_current_gui_user(monkeypatch, tmp_path):
+    """load_launchagent_service delegates to the launchd helpers in macos.py
+    so the bootout-wait-bootstrap dance happens with proper synchronization.
+
+    The helpers themselves are unit-tested in tests/test_macos.py; here we
+    only verify the wiring (right label, right domain, right plist path)."""
     core = load_core_module(monkeypatch)
-    bootout_calls: list[list[str]] = []
-    bootstrap_calls: list[tuple[list[str], bool]] = []
+    import cyberwave_cli.macos as macos_mod
+
+    unload_calls: list[str] = []
+    bootstrap_calls: list[tuple[str, Path]] = []
     plist_path = tmp_path / "com.cyberwave.cloud-node.plist"
     plist_path.write_text("plist")
 
     monkeypatch.setattr(core, "_launchagent_plist_path", lambda spec: plist_path, raising=False)
     monkeypatch.setattr(core, "os", type("os", (), {"getuid": staticmethod(lambda: 501)})())
-
-    def fake_subprocess_run(cmd, **_kwargs):
-        bootout_calls.append(cmd)
-        return type("R", (), {"returncode": 36})()
-
-    monkeypatch.setattr(core.subprocess, "run", fake_subprocess_run)
     monkeypatch.setattr(
-        core,
-        "_run",
-        lambda cmd, **kwargs: bootstrap_calls.append((cmd, kwargs.get("check", True)))
-        or type("R", (), {"returncode": 0})(),
+        macos_mod,
+        "wait_for_launchd_unload",
+        lambda label, **kw: unload_calls.append(label) or True,
+    )
+    monkeypatch.setattr(
+        macos_mod,
+        "bootstrap_launchd_service",
+        lambda domain, path, **kw: bootstrap_calls.append((domain, path)),
     )
 
     result = core.load_launchagent_service(core.CLOUD_NODE_SPEC)
 
     assert result is True
-    assert bootout_calls == [
-        ["launchctl", "bootout", "gui/501/com.cyberwave.cloud-node"],
-    ]
-    assert bootstrap_calls == [
-        (["launchctl", "bootstrap", "gui/501", str(plist_path)], True),
-    ]
+    assert unload_calls == ["com.cyberwave.cloud-node"]
+    assert bootstrap_calls == [("gui/501", plist_path)]
+
+
+def test_load_launchagent_service_reports_persistent_exit_5(monkeypatch, tmp_path):
+    """If bootstrap exhausts retries with exit 5, surface a helpful hint
+    instead of the misleading 'GUI session' message."""
+    import subprocess as _subprocess
+
+    core = load_core_module(monkeypatch)
+    import cyberwave_cli.macos as macos_mod
+
+    plist_path = tmp_path / "com.cyberwave.cloud-node.plist"
+    plist_path.write_text("plist")
+
+    monkeypatch.setattr(core, "_launchagent_plist_path", lambda spec: plist_path, raising=False)
+    fake_os = type(
+        "os",
+        (),
+        {
+            "getuid": staticmethod(lambda: 501),
+            "getenv": staticmethod(lambda *_a, **_kw: None),
+        },
+    )()
+    monkeypatch.setattr(core, "os", fake_os)
+    monkeypatch.setattr(macos_mod, "wait_for_launchd_unload", lambda label, **kw: True)
+
+    def fail_bootstrap(domain, path, **kw):
+        raise _subprocess.CalledProcessError(returncode=5, cmd=["launchctl"])
+
+    monkeypatch.setattr(macos_mod, "bootstrap_launchd_service", fail_bootstrap)
+
+    printed: list[str] = []
+    monkeypatch.setattr(
+        core.console, "print", lambda msg, *a, **kw: printed.append(str(msg))
+    )
+
+    assert core.load_launchagent_service(core.CLOUD_NODE_SPEC) is False
+    assert any("exit 5" in m for m in printed)
+    assert any("launchctl print" in m for m in printed), (
+        "Expected the new diagnostic hint suggesting 'launchctl print' for inspection"
+    )
 
 
 def test_write_service_override_quotes_config_path_and_reloads(monkeypatch, tmp_path):

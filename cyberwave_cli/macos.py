@@ -157,6 +157,129 @@ def _launchctl_as_user(args: list[str]) -> list[str]:
     return ["launchctl", *args]
 
 
+# ---- launchd timing helpers --------------------------------------------------
+# ``launchctl bootout`` is asynchronous: it returns immediately while launchd
+# continues unloading the service.  If a subsequent ``bootstrap`` happens before
+# launchd has released the label, it fails with the notoriously generic
+# ``5: Input/output error``.  These helpers actively wait for launchd to settle
+# instead of relying on fixed sleeps.
+
+
+def _launchd_label_is_loaded(target: str) -> bool:
+    """Return True when launchctl can still see ``<domain>/<label>``."""
+    try:
+        result = subprocess.run(
+            _launchctl_as_user(["print", target]),
+            capture_output=True,
+            timeout=5,
+            env=clean_subprocess_env(),
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def wait_for_launchd_unload(
+    label: str,
+    *,
+    timeout: float = 10.0,
+    domains: Optional[tuple[str, ...]] = None,
+    legacy_labels: tuple[str, ...] = (),
+) -> bool:
+    """Bootout *label* across the relevant domains and wait until launchd
+    has fully released it.
+
+    Polls ``launchctl print`` until the label is gone, so callers can chain
+    ``bootstrap`` without hitting the transient exit-5 race.
+
+    Args:
+        label: The launchd label (e.g. ``com.cyberwave.edge.core``).
+        timeout: Maximum total time to wait for unload, in seconds.
+        domains: Explicit list of ``<domain>`` strings to bootout from.
+            Defaults to ``("gui/<real-uid>", "system")``.
+        legacy_labels: Historical labels that should also be booted out
+            (best-effort, no wait for unload).  Used to migrate users from
+            older CLI versions that registered the same logical service
+            under a different label.
+
+    Returns:
+        True if the label is unloaded (or was never loaded) by the deadline,
+        False if it is still loaded when the deadline elapses.
+    """
+    if domains is None:
+        _, real_uid, _ = _resolve_real_user()
+        gui_domain = f"gui/{real_uid}" if real_uid is not None else None
+        domains = tuple(d for d in (gui_domain, "system") if d)
+
+    for target_label in (label, *legacy_labels):
+        for domain in domains:
+            target = f"{domain}/{target_label}"
+            try:
+                subprocess.run(
+                    _launchctl_as_user(["bootout", target]),
+                    capture_output=True,
+                    timeout=10,
+                    env=clean_subprocess_env(),
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+    deadline = time.monotonic() + timeout
+    poll_interval = 0.1
+    while time.monotonic() < deadline:
+        still_loaded = any(
+            _launchd_label_is_loaded(f"{domain}/{label}") for domain in domains
+        )
+        if not still_loaded:
+            return True
+        time.sleep(poll_interval)
+        poll_interval = min(poll_interval * 1.5, 0.5)
+    return False
+
+
+def bootstrap_launchd_service(
+    domain: str,
+    plist_path: Path,
+    *,
+    retries: int = 2,
+    retry_initial_delay: float = 0.5,
+) -> None:
+    """Run ``launchctl bootstrap <domain> <plist>`` with retry on transient
+    I/O errors.
+
+    Exit code 5 ("Input/output error") is launchd's catch-all for stale-state
+    races: the previous service hasn't been fully released yet, the
+    spawn-throttle window has not elapsed, etc.  Retrying after a short
+    backoff resolves the vast majority of these cases.  Other exit codes
+    (permission denied, malformed plist, missing binary) are surfaced
+    immediately without retry.
+
+    Raises:
+        subprocess.CalledProcessError: If bootstrap fails on the final
+            attempt, or fails with a non-transient error.
+        FileNotFoundError: If ``launchctl`` itself is missing.
+    """
+    last_exc: Optional[subprocess.CalledProcessError] = None
+    delay = retry_initial_delay
+    for attempt in range(retries + 1):
+        try:
+            _run(_launchctl_as_user(["bootstrap", domain, str(plist_path)]))
+            return
+        except subprocess.CalledProcessError as exc:
+            last_exc = exc
+            if exc.returncode != 5 or attempt == retries:
+                raise
+            _get_console().print(
+                f"[yellow]launchctl bootstrap hit a transient I/O error, "
+                f"retrying in {delay:.1f}s "
+                f"(attempt {attempt + 2}/{retries + 1})...[/yellow]"
+            )
+            time.sleep(delay)
+            delay *= 2
+    if last_exc is not None:
+        raise last_exc
+
+
 def _resolve_real_user() -> tuple[Optional[str], Optional[int], Optional[int]]:
     """Return (username, uid, gid) for the real user, even under sudo."""
     sudo_user = os.getenv("SUDO_USER", "").strip()
@@ -417,11 +540,11 @@ def _create_usbip_launchd_service() -> bool:
     _, real_uid, _ = _resolve_real_user()
     gui_domain = f"gui/{real_uid}" if real_uid is not None else None
 
-    _bootout_launchd_service(USBIP_LAUNCHD_LABEL)
+    wait_for_launchd_unload(USBIP_LAUNCHD_LABEL)
 
     if gui_domain:
         try:
-            _run(_launchctl_as_user(["bootstrap", gui_domain, str(plist_path)]))
+            bootstrap_launchd_service(gui_domain, plist_path)
         except subprocess.CalledProcessError:
             console.print("[yellow]launchctl bootstrap failed, falling back to load...[/yellow]")
             try:
@@ -561,15 +684,24 @@ _CAMERA_STREAM_WRAPPER_TEMPLATE = textwrap.dedent("""\
     RESOLUTION="${{CYBERWAVE_CAMERA_STREAM_RESOLUTION:-1280x720}}"
     FPS="${{CYBERWAVE_CAMERA_STREAM_FPS:-30}}"
 
-    exec ffmpeg -hide_banner -loglevel warning \\
-        -fflags nobuffer -flags low_delay -avioflags direct \\
-        -f avfoundation -framerate "$FPS" -video_size "$RESOLUTION" \\
-        -thread_queue_size 1 -i "$DEVICE" \\
-        -c:v mjpeg -q:v 5 \\
-        -fflags nobuffer -flush_packets 1 \\
-        -f mjpeg \\
-        -listen 1 \\
-        "http://0.0.0.0:$PORT"
+    # ffmpeg's ``-listen 1`` HTTP server is single-shot: when the consumer
+    # disconnects, ffmpeg exits.  Looping in bash here keeps the stream alive
+    # across reconnects and prevents launchd's spawn-throttle from disabling
+    # the service after a short burst of restarts.
+    trap 'exit 0' INT TERM
+
+    while true; do
+        ffmpeg -hide_banner -loglevel warning \\
+            -fflags nobuffer -flags low_delay -avioflags direct \\
+            -f avfoundation -framerate "$FPS" -video_size "$RESOLUTION" \\
+            -thread_queue_size 1 -i "$DEVICE" \\
+            -c:v mjpeg -q:v 5 \\
+            -fflags nobuffer -flush_packets 1 \\
+            -f mjpeg \\
+            -listen 1 \\
+            "http://0.0.0.0:$PORT" || true
+        sleep 1
+    done
 """)
 
 _CAMERA_STREAM_PLIST_TEMPLATE = textwrap.dedent("""\
@@ -803,11 +935,11 @@ def _bring_up_camera_stream_slot(
     _, real_uid, _ = _resolve_real_user()
     gui_domain = f"gui/{real_uid}" if real_uid is not None else None
 
-    _bootout_launchd_service(label)
+    wait_for_launchd_unload(label)
 
     if gui_domain:
         try:
-            _run(_launchctl_as_user(["bootstrap", gui_domain, str(plist_path)]))
+            bootstrap_launchd_service(gui_domain, plist_path)
         except subprocess.CalledProcessError:
             console.print(
                 "[yellow]launchctl bootstrap failed, falling back to load...[/yellow]"
@@ -1245,7 +1377,23 @@ def _print_multi_camera_summary(
 # LaunchAgent for cyberwave-edge-core, giving macOS the same
 # start/stop/restart/status/logs experience as systemd on Linux.
 
-EDGE_CORE_LAUNCHD_LABEL = "com.cyberwave.edge-core"
+EDGE_CORE_LAUNCHD_LABEL = "com.cyberwave.edge.core"
+# Legacy label used by earlier CLI builds; tracked so teardown / bootout sweeps
+# still clean it up on machines installed before the labels were unified.
+_LEGACY_EDGE_CORE_LAUNCHD_LABELS: tuple[str, ...] = ("com.cyberwave.edge-core",)
+
+
+def legacy_labels_for_package(package_name: str) -> tuple[str, ...]:
+    """Return historical launchd labels that should be cleaned up before
+    bootstrapping a fresh install of *package_name*.
+
+    Older CLI versions used different label conventions; this lets the
+    install path quietly migrate users without leaving zombie services
+    behind under stale labels.
+    """
+    if package_name == "cyberwave-edge-core":
+        return _LEGACY_EDGE_CORE_LAUNCHD_LABELS
+    return ()
 
 _EDGE_CORE_WRAPPER_TEMPLATE = textwrap.dedent("""\
     #!/bin/bash
@@ -1340,10 +1488,19 @@ def teardown_edge_core_launchd_service() -> None:
     console.print("[cyan]Tearing down edge-core launchd service...[/cyan]")
 
     _bootout_launchd_service(EDGE_CORE_LAUNCHD_LABEL)
+    for legacy_label in _LEGACY_EDGE_CORE_LAUNCHD_LABELS:
+        _bootout_launchd_service(legacy_label)
+
+    launch_agents_dir = _user_home() / "Library" / "LaunchAgents"
+    legacy_plist_paths = [
+        launch_agents_dir / f"{label}.plist"
+        for label in _LEGACY_EDGE_CORE_LAUNCHD_LABELS
+    ]
 
     for path in [
         edge_core_plist_path(),
         _edge_core_wrapper_path(),
+        *legacy_plist_paths,
     ]:
         try:
             path.unlink(missing_ok=True)
@@ -1380,11 +1537,12 @@ def start_edge_core_service() -> bool:
             pass
 
     gui_domain = f"gui/{uid}"
+    wait_for_launchd_unload(
+        EDGE_CORE_LAUNCHD_LABEL,
+        legacy_labels=_LEGACY_EDGE_CORE_LAUNCHD_LABELS,
+    )
     try:
-        _run(
-            _launchctl_as_user(["bootstrap", gui_domain, str(edge_core_plist_path())]),
-            check=True,
-        )
+        bootstrap_launchd_service(gui_domain, edge_core_plist_path())
     except subprocess.CalledProcessError:
         try:
             _run(
@@ -1463,14 +1621,17 @@ def setup_edge_core_launchd_service(*, force: bool = False) -> bool:
 
     console.print(f"Created: {plist_path}")
 
-    _bootout_launchd_service(EDGE_CORE_LAUNCHD_LABEL)
+    wait_for_launchd_unload(
+        EDGE_CORE_LAUNCHD_LABEL,
+        legacy_labels=_LEGACY_EDGE_CORE_LAUNCHD_LABELS,
+    )
 
     _, real_uid, _ = _resolve_real_user()
     uid = real_uid if real_uid is not None else os.getuid()
     gui_domain = f"gui/{uid}"
 
     try:
-        _run(_launchctl_as_user(["bootstrap", gui_domain, str(plist_path)]))
+        bootstrap_launchd_service(gui_domain, plist_path)
     except subprocess.CalledProcessError:
         console.print(
             "[yellow]launchctl bootstrap failed, falling back to load...[/yellow]"
