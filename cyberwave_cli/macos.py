@@ -1005,6 +1005,193 @@ def _bring_up_camera_stream_slot(
     return True, False
 
 
+def _installed_camera_stream_slots() -> list[int]:
+    """Slots whose plist actually exists on disk.
+
+    ``_discover_camera_stream_slots`` always includes slot 0 as a baseline
+    so install paths can fall back to it.  For lifecycle checks (kickstart,
+    drift detection) we want the literal set of installed services — a
+    spurious slot 0 would make us try to kickstart a label that isn't
+    bootstrapped.
+    """
+    return [
+        slot
+        for slot in _discover_camera_stream_slots()
+        if _camera_stream_plist_path(slot).is_file()
+    ]
+
+
+def kickstart_unhealthy_camera_streams(
+    *, wait_secs: int = 5
+) -> list[dict[str, Any]]:
+    """Kickstart any installed camera-stream LaunchAgent whose port is silent.
+
+    Walks every plist under ``~/Library/LaunchAgents`` matching the
+    ``com.cyberwave.camera-stream*`` label, checks whether the matching
+    MJPEG port is listening, and runs ``launchctl kickstart -k`` on the
+    ones that aren't.  Healthy slots are left alone — bouncing them
+    would needlessly drop ~1–2s of video on a working host, which is
+    why this is detect-and-recover rather than a blanket reload.
+
+    No-op on non-macOS.  Returns a list of per-slot result dicts so the
+    caller (and tests) can see what happened::
+
+        [{"slot": 1, "label": "...", "port": 8092,
+          "was_listening": False, "kickstarted": True,
+          "healthy_after": True}]
+
+    The ``edge restart`` command calls this right after the edge-core
+    LaunchAgent has been reloaded, so a wedged ffmpeg child or a slot
+    that hit launchd's spawn-throttle gets unstuck without the operator
+    needing to know about ``launchctl`` or about the bridge being a
+    separate service from edge-core.
+    """
+    if not is_macos():
+        return []
+
+    slots = _installed_camera_stream_slots()
+    if not slots:
+        return []
+
+    console = _get_console()
+    _, real_uid, _ = _resolve_real_user()
+    uid = real_uid if real_uid is not None else os.getuid()
+
+    results: list[dict[str, Any]] = []
+    for slot in slots:
+        label = _camera_stream_launchd_label(slot)
+        port = _camera_stream_port(slot)
+        was_listening = _is_port_listening(port)
+        result: dict[str, Any] = {
+            "slot": slot,
+            "label": label,
+            "port": port,
+            "was_listening": was_listening,
+            "kickstarted": False,
+            "healthy_after": was_listening,
+        }
+        if was_listening:
+            results.append(result)
+            continue
+
+        console.print(
+            f"[yellow]Camera stream slot {slot} (port {port}) is silent — "
+            f"kickstarting {label}...[/yellow]"
+        )
+        try:
+            _run(
+                _launchctl_as_user(
+                    ["kickstart", "-k", f"gui/{uid}/{label}"]
+                ),
+                check=True,
+            )
+            result["kickstarted"] = True
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            # ``FileNotFoundError`` only happens if launchctl itself is
+            # missing (extremely unlikely on macOS but cheap to guard).
+            # ``CalledProcessError`` typically means the label isn't
+            # bootstrapped — point the operator at the supported recovery
+            # path instead of asking them to read launchctl docs.
+            console.print(
+                f"[red]Failed to kickstart {label} (exit "
+                f"{getattr(exc, 'returncode', 'n/a')}). "
+                f"Try: sudo cyberwave edge install --reconfigure-camera[/red]"
+            )
+            results.append(result)
+            continue
+
+        for _ in range(max(wait_secs, 1) * 2):
+            if _is_port_listening(port):
+                result["healthy_after"] = True
+                break
+            time.sleep(0.5)
+
+        if result["healthy_after"]:
+            console.print(
+                f"[green]Camera stream slot {slot} healthy on port {port}.[/green]"
+            )
+        else:
+            log_path = _camera_stream_log_path(slot)
+            console.print(
+                f"[yellow]Camera stream slot {slot} still not listening on "
+                f"port {port} after kickstart. Check {log_path} (camera in "
+                f"use by another app, missing TCC permission, or device "
+                f"unplugged).[/yellow]"
+            )
+        results.append(result)
+
+    return results
+
+
+def warn_on_camera_stream_config_drift() -> list[dict[str, Any]]:
+    """Warn when ``camera_streams.json`` references ports no slot serves.
+
+    The mapping file pins each twin to a specific MJPEG port (e.g.
+    ``http://host.docker.internal:8092``).  If a camera was unplugged,
+    the install was partial, or the user added a twin without re-running
+    ``--reconfigure-camera``, the JSON can drift out of sync with what
+    launchd actually has loaded.  ``kickstart_unhealthy_camera_streams``
+    won't help in that case — there's no plist to kickstart — so surface
+    a one-line yellow hint per orphaned twin pointing at the supported
+    recovery command.
+
+    No-op on non-macOS.  Returns the list of orphans so callers/tests
+    can inspect.
+    """
+    if not is_macos():
+        return []
+
+    config_path = _camera_streams_config_path()
+    if not config_path.is_file():
+        return []
+
+    import json
+    from urllib.parse import urlparse
+
+    try:
+        raw = config_path.read_text()
+        data = json.loads(raw) if raw.strip() else {}
+    except (OSError, ValueError):
+        # Malformed JSON shouldn't crash a routine restart; the install
+        # path will rewrite this file when the operator re-runs camera
+        # selection.
+        return []
+
+    twin_to_url = data.get("twin_to_stream_url") or {}
+    if not isinstance(twin_to_url, dict) or not twin_to_url:
+        return []
+
+    served_ports = {
+        _camera_stream_port(slot) for slot in _installed_camera_stream_slots()
+    }
+
+    orphans: list[dict[str, Any]] = []
+    for twin_uuid, url in twin_to_url.items():
+        if not isinstance(url, str):
+            continue
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            continue
+        port = parsed.port
+        if port is None or port in served_ports:
+            continue
+        orphans.append({"twin_uuid": twin_uuid, "url": url, "port": port})
+
+    if not orphans:
+        return []
+
+    console = _get_console()
+    for orphan in orphans:
+        console.print(
+            f"[yellow]Twin {orphan['twin_uuid']} expects "
+            f"{orphan['url']} but no camera-stream slot serves port "
+            f"{orphan['port']}.[/yellow]\n"
+            f"[dim]Run: sudo cyberwave edge install --reconfigure-camera[/dim]"
+        )
+    return orphans
+
+
 def _prompt_single_camera(
     cameras: list[tuple[int, str]], *, prompt_label: str, default_idx: int
 ) -> Optional[tuple[int, str]]:

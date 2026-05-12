@@ -861,6 +861,19 @@ def restart_edge(env_file):
         console.print("[cyan]Restarting edge LaunchAgent...[/cyan]")
         if not load_launchagent_service(EDGE_CORE_SPEC):
             raise SystemExit(1)
+        # The MJPEG camera bridge is a separate LaunchAgent
+        # (com.cyberwave.camera-stream*) installed by ``edge install``,
+        # so an edge-core reload alone won't recover a wedged ffmpeg
+        # child or a slot that hit launchd's spawn-throttle.  Detect
+        # silent ports and kickstart only the unhealthy ones — healthy
+        # slots are left alone to avoid an unnecessary video gap.
+        from ...macos import (
+            kickstart_unhealthy_camera_streams,
+            warn_on_camera_stream_config_drift,
+        )
+
+        kickstart_unhealthy_camera_streams()
+        warn_on_camera_stream_config_drift()
         return
 
     # Fallback: stop running process, then start a new one
