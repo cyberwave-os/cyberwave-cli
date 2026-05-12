@@ -1611,6 +1611,59 @@ def _ensure_docker_installed() -> bool:
     return True
 
 
+def _check_docker_macos() -> bool:
+    """Verify that Docker Desktop is installed and running on macOS.
+
+    On macOS we do not auto-install Docker (Docker Desktop is a GUI app
+    that requires interactive setup), so the pre-flight check just
+    surfaces a clear, copy-pasteable hint and aborts the install if
+    Docker is missing or the daemon is not yet running.
+
+    Returns True when ``docker info`` succeeds.
+    """
+    if shutil.which("docker"):
+        try:
+            proc = subprocess.run(
+                ["docker", "info"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                env=clean_subprocess_env(),
+            )
+        except FileNotFoundError:
+            proc = None
+
+        if proc is not None and proc.returncode == 0:
+            return True
+
+        console.print(
+            "[red]Docker is installed, but the daemon is not running.[/red]\n"
+            "[dim]Open Docker Desktop (or Colima) and wait for the daemon to be "
+            "ready, then re-run 'cyberwave edge install'.[/dim]"
+        )
+        return False
+
+    console.print(
+        "[red]Docker Desktop is required for the edge drivers and ML workers, "
+        "but it was not found on this Mac.[/red]"
+    )
+    if shutil.which("brew"):
+        console.print(
+            "[dim]Install with Homebrew:\n"
+            "    brew install --cask docker\n"
+            "Then open Docker Desktop once so the daemon starts, "
+            "and re-run 'cyberwave edge install'.[/dim]"
+        )
+    else:
+        console.print(
+            "[dim]Download Docker Desktop from "
+            "https://docs.docker.com/desktop/install/mac-install/, "
+            "open it once so the daemon starts, then re-run "
+            "'cyberwave edge install'.[/dim]"
+        )
+    return False
+
+
 def _install_docker() -> bool:
     """Install Docker if not present in the edge device."""
     if shutil.which("docker"):
@@ -2361,6 +2414,14 @@ def setup_service(
             console.print("[dim]Aborted.[/dim]")
             return False
 
+    # Pre-flight: on macOS we cannot auto-install Docker Desktop, so check
+    # before pip-installing edge-core. Catches the common "I forgot to open
+    # Docker Desktop" failure mode early instead of leaving the user with a
+    # registered LaunchAgent that crash-loops trying to spawn drivers.
+    if is_macos() and spec.requires_docker:
+        if not _check_docker_macos():
+            return False
+
     if not install_service_package(spec, channel=channel, version=version):
         return False
 
@@ -2375,7 +2436,7 @@ def setup_service(
         )
 
     if is_macos() and spec.requires_docker:
-        if not setup_usbip_server(force=force_reinstall):
+        if not setup_usbip_server(force=force_reinstall, skip_confirm=skip_confirm):
             console.print(
                 "[yellow]USB/IP setup failed. USB devices will not be "
                 "available inside Docker containers.[/yellow]\n"

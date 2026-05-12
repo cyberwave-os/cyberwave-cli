@@ -130,6 +130,96 @@ def _has_git() -> bool:
     return shutil.which("git") is not None
 
 
+_RUSTUP_INSTALL_COMMAND = (
+    "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
+    "| sh -s -- -y --default-toolchain stable --profile minimal"
+)
+
+
+def _install_rust_toolchain(*, skip_confirm: bool = False) -> bool:
+    """Install Rust (rustup + cargo) non-interactively for the current user.
+
+    The USB/IP host server is built from source with cargo, so a missing
+    Rust toolchain blocks ``cyberwave edge install`` on macOS.  Rather
+    than just printing a hint, prompt the user and run the official
+    rustup one-liner with ``--profile minimal`` to skip rust-docs/etc.
+
+    Adds ``~/.cargo/bin`` to the in-process ``PATH`` on success so the
+    subsequent ``shutil.which("cargo")`` lookup finds the freshly
+    installed toolchain without restarting the CLI.
+
+    Returns True on success, False if the user declines or rustup fails.
+    """
+    console = _get_console()
+
+    if not skip_confirm:
+        from rich.prompt import Confirm
+
+        console.print(
+            "[dim]This runs the official rustup installer non-interactively:\n"
+            f"  {_RUSTUP_INSTALL_COMMAND}[/dim]"
+        )
+        if not Confirm.ask(
+            "Install Rust toolchain (rustup) now? It is required to build the USB/IP server.",
+            default=True,
+        ):
+            console.print(
+                "[yellow]Rust install declined. USB/IP setup cannot continue.[/yellow]\n"
+                "[dim]Install manually later: "
+                f"{_RUSTUP_INSTALL_COMMAND}[/dim]"
+            )
+            return False
+
+    console.print("[cyan]Installing Rust via rustup (non-interactive)...[/cyan]")
+
+    install_env = clean_subprocess_env()
+    for key in ("PATH", "HOME", "USER", "CARGO_HOME", "RUSTUP_HOME"):
+        val = os.environ.get(key)
+        if val:
+            install_env[key] = val
+
+    try:
+        proc = subprocess.run(
+            ["bash", "-c", _RUSTUP_INSTALL_COMMAND],
+            check=False,
+            env=install_env,
+        )
+    except FileNotFoundError as exc:
+        console.print(
+            f"[red]Required command not found: {exc.filename}[/red]\n"
+            "[dim]Install Xcode command-line tools first: xcode-select --install[/dim]"
+        )
+        return False
+
+    if proc.returncode != 0:
+        console.print(
+            f"[red]rustup install failed (exit {proc.returncode}).[/red]\n"
+            f"[dim]Try running it manually: {_RUSTUP_INSTALL_COMMAND}[/dim]"
+        )
+        return False
+
+    cargo_bin = _user_home() / ".cargo" / "bin"
+    if cargo_bin.is_dir():
+        existing_path = os.environ.get("PATH", "")
+        if str(cargo_bin) not in existing_path.split(os.pathsep):
+            os.environ["PATH"] = (
+                f"{cargo_bin}{os.pathsep}{existing_path}"
+                if existing_path
+                else str(cargo_bin)
+            )
+
+    if not _has_cargo():
+        console.print(
+            "[red]rustup completed but 'cargo' is still not on PATH.[/red]\n"
+            "[dim]Open a new shell (so ~/.cargo/env is sourced) and re-run "
+            "'cyberwave edge install'.[/dim]"
+        )
+        return False
+
+    console.print("[green]Rust toolchain installed.[/green]")
+    return True
+
+
 def is_usbip_server_installed() -> bool:
     return _usbip_binary_path().is_file()
 
@@ -427,8 +517,12 @@ def _strip_xattrs(path: Path) -> None:
 # ---- USB/IP server -----------------------------------------------------------
 
 
-def _install_usbip_server() -> bool:
+def _install_usbip_server(*, skip_confirm: bool = False) -> bool:
     """Build the jiegec/usbip host server from source using cargo.
+
+    When the Rust toolchain is missing, attempts to install it via rustup
+    (with confirmation unless *skip_confirm* is True) instead of bailing
+    out with a hint.
 
     Returns True on success.
     """
@@ -443,10 +537,10 @@ def _install_usbip_server() -> bool:
 
     if not _has_cargo():
         console.print(
-            "[red]Rust (cargo) is required to build the USB/IP server.[/red]\n"
-            "[dim]Install Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh[/dim]"
+            "[yellow]Rust (cargo) is required to build the USB/IP server.[/yellow]"
         )
-        return False
+        if not _install_rust_toolchain(skip_confirm=skip_confirm):
+            return False
 
     binary_path = _usbip_binary_path()
     if binary_path.is_file():
@@ -636,7 +730,7 @@ def _teardown_usbip_server() -> None:
 # ---- public API --------------------------------------------------------------
 
 
-def setup_usbip_server(*, force: bool = False) -> bool:
+def setup_usbip_server(*, force: bool = False, skip_confirm: bool = False) -> bool:
     """Install and start the USB/IP host server on macOS.
 
     This enables Docker Desktop containers to access USB devices
@@ -644,6 +738,10 @@ def setup_usbip_server(*, force: bool = False) -> bool:
 
     When *force* is True, the existing installation is torn down first
     and rebuilt from scratch (equivalent to ``--force-reinstall``).
+
+    When *skip_confirm* is True (e.g. ``cyberwave edge install -y``),
+    the rustup auto-install prompt is skipped and Rust is installed
+    automatically when missing.
 
     Returns True on success.  Returns True immediately on non-macOS platforms.
     """
@@ -664,7 +762,7 @@ def setup_usbip_server(*, force: bool = False) -> bool:
         "USB/IP bridges this gap by sharing USB devices over the network.\n"
     )
 
-    if not _install_usbip_server():
+    if not _install_usbip_server(skip_confirm=skip_confirm):
         return False
 
     return _create_usbip_launchd_service()

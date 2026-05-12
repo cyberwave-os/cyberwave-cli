@@ -82,10 +82,43 @@ def test_install_fails_without_git(monkeypatch):
     assert macos._install_usbip_server() is False
 
 
-def test_install_fails_without_cargo(monkeypatch):
+def test_install_usbip_invokes_rust_auto_install_when_cargo_missing(monkeypatch):
+    """A missing cargo must trigger the new rustup auto-install path,
+    not abort with a hint like the legacy behavior did. The
+    skip_confirm flag must propagate through so ``cyberwave edge install -y``
+    skips the rustup confirmation as well."""
+    macos = _load_macos(monkeypatch)
+
+    monkeypatch.setattr(macos, "_has_git", lambda: True)
+    monkeypatch.setattr(macos, "_has_cargo", lambda: False)
+
+    rust_install_calls: list[dict] = []
+
+    def fake_rust_install(*, skip_confirm: bool = False):
+        rust_install_calls.append({"skip_confirm": skip_confirm})
+        return True
+
+    monkeypatch.setattr(macos, "_install_rust_toolchain", fake_rust_install)
+    monkeypatch.setattr(macos, "_usbip_binary_path", lambda: Path("/fake/host"))
+    monkeypatch.setattr(Path, "is_file", lambda self: True)
+
+    assert macos._install_usbip_server(skip_confirm=True) is True
+    assert rust_install_calls == [{"skip_confirm": True}], (
+        "Missing cargo must invoke _install_rust_toolchain with the same "
+        "skip_confirm flag the caller passed in."
+    )
+
+
+def test_install_fails_when_rust_auto_install_fails(monkeypatch):
+    """If rustup auto-install returns False (user declined, network
+    error, rustup crashed, etc.), _install_usbip_server must abort
+    instead of trying to invoke cargo build with no toolchain."""
     macos = _load_macos(monkeypatch)
     monkeypatch.setattr(macos, "_has_git", lambda: True)
     monkeypatch.setattr(macos, "_has_cargo", lambda: False)
+    monkeypatch.setattr(
+        macos, "_install_rust_toolchain", lambda **_kw: False
+    )
 
     assert macos._install_usbip_server() is False
 
@@ -111,7 +144,7 @@ def test_setup_returns_false_when_install_fails(monkeypatch):
     macos = _load_macos(monkeypatch)
     monkeypatch.setattr(macos, "is_macos", lambda: True)
     monkeypatch.setattr(macos, "is_usbip_server_running", lambda: False)
-    monkeypatch.setattr(macos, "_install_usbip_server", lambda: False)
+    monkeypatch.setattr(macos, "_install_usbip_server", lambda **_kw: False)
 
     assert macos.setup_usbip_server() is False
 
@@ -181,7 +214,9 @@ def test_setup_usbip_force_calls_teardown_then_installs(monkeypatch):
         macos, "_teardown_usbip_server", lambda: calls.append("teardown")
     )
     monkeypatch.setattr(
-        macos, "_install_usbip_server", lambda: calls.append("install") or True
+        macos,
+        "_install_usbip_server",
+        lambda **_kw: calls.append("install") or True,
     )
     monkeypatch.setattr(
         macos, "_create_usbip_launchd_service", lambda: calls.append("launchd") or True
@@ -197,7 +232,7 @@ def test_setup_usbip_force_skips_running_check(monkeypatch):
     monkeypatch.setattr(macos, "is_macos", lambda: True)
     monkeypatch.setattr(macos, "is_usbip_server_running", lambda: True)
     monkeypatch.setattr(macos, "_teardown_usbip_server", lambda: None)
-    monkeypatch.setattr(macos, "_install_usbip_server", lambda: True)
+    monkeypatch.setattr(macos, "_install_usbip_server", lambda **_kw: True)
     monkeypatch.setattr(macos, "_create_usbip_launchd_service", lambda: True)
 
     assert macos.setup_usbip_server(force=True) is True

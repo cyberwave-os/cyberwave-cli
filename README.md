@@ -444,6 +444,14 @@ Manage the edge node service lifecycle, configuration, and monitoring.
 
 Installs the `cyberwave-edge-core` package (via apt-get on Debian/Ubuntu) and creates a systemd service so it starts on boot. Guides you through workspace, environment, and twin selection.
 
+**Prerequisites — Linux:** Docker is auto-installed via `apt-get` when missing (Ubuntu / Debian / Raspbian, amd64 / arm64). No manual setup required.
+
+**Prerequisites — macOS:**
+
+- **Docker Desktop** is required for driver and ML worker containers. The installer pre-flights `docker info` and aborts with a copy-pasteable hint (`brew install --cask docker` if Homebrew is present, otherwise the [Docker Desktop install URL](https://docs.docker.com/desktop/install/mac-install/)) if it is missing or the daemon is not running. Open Docker Desktop once so the daemon starts, then re-run `cyberwave edge install`.
+- **Rust toolchain** is needed only to compile the USB/IP host server. If `cargo` is missing the installer offers to run the official `rustup` one-liner non-interactively (`-y --profile minimal`); pass `-y` to `cyberwave edge install` to accept without prompting. `~/.cargo/bin` is added to the in-process `PATH` so the build proceeds in the same run.
+- **Xcode command-line tools** (`git`) are still expected; the installer prints `xcode-select --install` if they are missing.
+
 On **macOS**, the installer also sets up an MJPEG camera stream bridge (using `ffmpeg` and AVFoundation) and prompts you to select which camera to use. The selected camera is stored by **device name** (not index) so it persists across USB reconnections and reboots. With multiple camera-bearing twins and multiple AVFoundation devices, the installer walks you through a per-twin mapping and launches one `ffmpeg` MJPEG service per distinct camera (sequential ports starting at `8091`). Assignments are persisted in `~/.cyberwave/camera_streams.json` under `twin_to_stream_url` and honored by edge-core when it wires each driver container.
 
 On **Linux** with multiple camera-bearing twins, the installer walks you through a per-twin mapping so each twin is bound to a specific `/dev/video*` device. The mapping is persisted in `~/.cyberwave/cameras.json` under `twin_to_device` and honored by edge-core when it launches each driver container. A single-camera host automatically shares the device across every selected camera twin.
