@@ -89,6 +89,7 @@ SYSTEMD_UNIT_TEMPLATE = textwrap.dedent("""\
     Restart=always
     RestartSec=5
     WatchdogSec=60
+    TimeoutStartSec=300
     Environment=CYBERWAVE_EDGE_CONFIG_DIR={config_dir}
     OOMScoreAdjust=-800
     StandardOutput=journal
