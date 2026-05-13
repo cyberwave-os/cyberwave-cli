@@ -730,11 +730,38 @@ def _twin_has_asset(twin: Any) -> bool:
     return bool(getattr(twin, "asset_uuid", None) or getattr(twin, "asset_id", None))
 
 
+def _twin_has_docker_driver(twin: Any) -> bool:
+    """Return ``True`` when the twin's metadata declares at least one Docker-based driver.
+
+    The edge-core can only spawn drivers distributed as Docker images. Twins
+    whose ``metadata.drivers`` dict is missing or contains only non-Docker
+    entries (e.g. ``android``) are not usable on a Docker-based edge device.
+    """
+    metadata = getattr(twin, "metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    drivers = metadata.get("drivers")
+    if not isinstance(drivers, dict):
+        return False
+    return any(
+        isinstance(drv, dict) and "docker_image" in drv
+        for drv in drivers.values()
+    )
+
+
 def _select_connected_twins(client: Any, environment_uuid: str, *, skip_confirm: bool) -> list[str]:
     """List twins in environment and ask user which ones are connected."""
-    twins = client.twins.list(environment_id=environment_uuid)
-    if not twins:
+    all_twins = client.twins.list(environment_id=environment_uuid)
+    if not all_twins:
         console.print("[yellow]No twins found in selected environment.[/yellow]")
+        return []
+
+    twins = [t for t in all_twins if _twin_has_docker_driver(t)]
+    if not twins:
+        console.print(
+            "[yellow]No edge-compatible twins found in selected environment. "
+            "Twins must have Docker-based drivers in their metadata.[/yellow]"
+        )
         return []
 
     if skip_confirm:
