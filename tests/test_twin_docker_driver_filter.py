@@ -90,6 +90,51 @@ def test_twin_with_non_dict_driver_entry_returns_false(monkeypatch):
     assert core._twin_has_docker_driver(twin) is False
 
 
+def test_twin_with_services_driver_returns_true(monkeypatch):
+    core = _load_core_module(monkeypatch)
+    twin = SimpleNamespace(
+        uuid="twin-1",
+        metadata={
+            "drivers": {
+                "default": {
+                    "services": {
+                        "driver": {"docker_image": "img:latest"},
+                        "sidecar": {"docker_image": "sidecar:latest"},
+                    },
+                },
+            },
+        },
+    )
+    assert core._twin_has_docker_driver(twin) is True
+
+
+def test_twin_with_services_and_no_docker_image_still_matches(monkeypatch):
+    core = _load_core_module(monkeypatch)
+    twin = SimpleNamespace(
+        uuid="twin-1",
+        metadata={
+            "drivers": {
+                "default": {"services": {"a": {}, "b": {}}},
+            },
+        },
+    )
+    assert core._twin_has_docker_driver(twin) is True
+
+
+def test_twin_with_multiple_drivers_one_services(monkeypatch):
+    core = _load_core_module(monkeypatch)
+    twin = SimpleNamespace(
+        uuid="twin-1",
+        metadata={
+            "drivers": {
+                "android": {"android": "com.example"},
+                "multi": {"services": {"a": {"docker_image": "img:latest"}}},
+            },
+        },
+    )
+    assert core._twin_has_docker_driver(twin) is True
+
+
 # --- _select_connected_twins filtering tests ---
 
 
@@ -110,6 +155,12 @@ def test_select_connected_twins_filters_out_non_docker_twins(monkeypatch):
         asset_uuid="asset-1",
         metadata={"drivers": {"default": {"docker_image": "img:latest"}}},
     )
+    services_twin = SimpleNamespace(
+        uuid="twin-services",
+        name="MultiBot",
+        asset_uuid="asset-4",
+        metadata={"drivers": {"default": {"services": {"a": {"docker_image": "img:v2"}}}}},
+    )
     android_twin = SimpleNamespace(
         uuid="twin-android",
         name="AndroidBot",
@@ -123,16 +174,18 @@ def test_select_connected_twins_filters_out_non_docker_twins(monkeypatch):
         metadata={},
     )
 
-    client = SimpleNamespace(twins=_FakeTwinsManager([docker_twin, android_twin, no_drivers_twin]))
+    client = SimpleNamespace(
+        twins=_FakeTwinsManager([docker_twin, services_twin, android_twin, no_drivers_twin])
+    )
 
     monkeypatch.setattr(
         core,
         "_select_multiple_with_arrows",
-        lambda _title, _labels: [0],
+        lambda _title, _labels: [0, 1],
     )
 
     result = core._select_connected_twins(client, "env-1", skip_confirm=False)
-    assert result == ["twin-docker"]
+    assert result == ["twin-docker", "twin-services"]
 
 
 def test_select_connected_twins_skip_confirm_picks_first_docker_twin(monkeypatch):

@@ -736,9 +736,11 @@ def _twin_has_asset(twin: Any) -> bool:
 def _twin_has_docker_driver(twin: Any) -> bool:
     """Return ``True`` when the twin's metadata declares at least one Docker-based driver.
 
-    The edge-core can only spawn drivers distributed as Docker images. Twins
-    whose ``metadata.drivers`` dict is missing or contains only non-Docker
-    entries (e.g. ``android``) are not usable on a Docker-based edge device.
+    A driver entry is considered Docker-compatible when it contains either
+    ``docker_image`` (single container) or ``services`` (multi-container).
+    Twins whose ``metadata.drivers`` dict is missing or contains only
+    non-Docker entries (e.g. ``android``) are not usable on a Docker-based
+    edge device.
     """
     metadata = getattr(twin, "metadata", None)
     if not isinstance(metadata, dict):
@@ -747,7 +749,7 @@ def _twin_has_docker_driver(twin: Any) -> bool:
     if not isinstance(drivers, dict):
         return False
     return any(
-        isinstance(drv, dict) and "docker_image" in drv
+        isinstance(drv, dict) and ("docker_image" in drv or "services" in drv)
         for drv in drivers.values()
     )
 
