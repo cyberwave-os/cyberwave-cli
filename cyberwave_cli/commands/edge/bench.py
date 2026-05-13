@@ -49,13 +49,13 @@ REGRESSION_THRESHOLD_DEFAULT = 0.15
 # stable JSON key used in baseline files; ``display_label`` is what we show in
 # the Rich table.
 METRIC_SPEC: list[tuple[str, str]] = [
-    ("header_pack",      "HeaderTemplate.pack()"),
+    ("header_pack", "HeaderTemplate.pack()"),
     ("decode_zero_copy", "decode (zero-copy)"),
     ("decode_with_copy", "decode (with .copy())"),
-    ("stats_lockfree",   "stats (lock-free)"),
-    ("stats_locked",     "stats (with lock)"),
-    ("seq_itertools",    "seq (itertools.count)"),
-    ("seq_locked",       "seq (threading.Lock)"),
+    ("stats_lockfree", "stats (lock-free)"),
+    ("stats_locked", "stats (with lock)"),
+    ("seq_itertools", "seq (itertools.count)"),
+    ("seq_locked", "seq (threading.Lock)"),
 ]
 
 # Shape used for the frame-sized header/decode tests.
@@ -66,6 +66,7 @@ FRAME_SHAPE: tuple[int, int, int] = (480, 640, 3)
 # CLI registration
 # ---------------------------------------------------------------------------
 
+
 def register(edge_group: click.Group) -> None:
     """Register the ``bench`` command on the edge group."""
     edge_group.add_command(bench)
@@ -74,6 +75,7 @@ def register(edge_group: click.Group) -> None:
 # ---------------------------------------------------------------------------
 # Device fingerprint
 # ---------------------------------------------------------------------------
+
 
 def _detect_device_class() -> str:
     """Best-effort slug identifying the device family for baseline lookup."""
@@ -147,7 +149,10 @@ def _apple_silicon_chip_tier() -> str | None:
     try:
         out = subprocess.run(
             ["sysctl", "-n", "machdep.cpu.brand_string"],
-            capture_output=True, text=True, timeout=2, check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
         )
     except Exception:
         return None
@@ -174,7 +179,10 @@ def _cpu_model() -> str:
     try:
         out = subprocess.run(
             ["sysctl", "-n", "machdep.cpu.brand_string"],
-            capture_output=True, text=True, timeout=2, check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
         )
         if out.returncode == 0 and out.stdout.strip():
             return out.stdout.strip()
@@ -185,14 +193,17 @@ def _cpu_model() -> str:
 
 def _cpu_freq_mhz_max() -> float | None:
     try:
-        text = Path(
-            "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"
-        ).read_text(errors="ignore").strip()
+        text = (
+            Path("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+            .read_text(errors="ignore")
+            .strip()
+        )
         return round(int(text) / 1000.0, 1)
     except Exception:
         pass
     try:
         import psutil  # type: ignore
+
         f = psutil.cpu_freq()
         if f and f.max:
             return float(f.max)
@@ -202,11 +213,15 @@ def _cpu_freq_mhz_max() -> float | None:
 
 
 def _ram_gb() -> float | None:
+    # Linux: delegate to the shared SDK reader so ``cyberwave edge bench``,
+    # ``cyberwave monitor`` and ``cyberwave-edge-core`` all parse
+    # ``/proc/meminfo`` the same way.
     try:
-        text = Path("/proc/meminfo").read_text(errors="ignore")
-        match = re.search(r"MemTotal:\s+(\d+)\s+kB", text)
-        if match:
-            return round(int(match.group(1)) / 1024 / 1024, 1)
+        from cyberwave.edge.host_metrics import read_host_memory
+
+        info = read_host_memory()
+        if info is not None:
+            return round(info.total_mb / 1024, 1)
     except Exception:
         pass
     # macOS / *BSD: ask the kernel directly. `hw.memsize` returns total RAM
@@ -214,7 +229,10 @@ def _ram_gb() -> float | None:
     try:
         out = subprocess.run(
             ["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True, timeout=2, check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
         )
         if out.returncode == 0 and out.stdout.strip().isdigit():
             return round(int(out.stdout.strip()) / 1024**3, 1)
@@ -222,6 +240,7 @@ def _ram_gb() -> float | None:
         pass
     try:
         import psutil  # type: ignore
+
         return round(psutil.virtual_memory().total / 1024**3, 1)
     except Exception:
         pass
@@ -240,6 +259,7 @@ def _storage() -> dict[str, Any]:
     info: dict[str, Any] = {"total_gb": None, "free_gb": None, "kind": None}
     try:
         import shutil
+
         usage = shutil.disk_usage("/")
         info["total_gb"] = round(usage.total / 1024**3, 1)
         info["free_gb"] = round(usage.free / 1024**3, 1)
@@ -257,7 +277,10 @@ def _storage_kind() -> str | None:
         try:
             out = subprocess.run(
                 ["diskutil", "info", "/"],
-                capture_output=True, text=True, timeout=3, check=False,
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
             )
         except Exception:
             return None
@@ -294,9 +317,9 @@ def _storage_kind() -> str | None:
                 pass
             return "sd"
         try:
-            rotational = Path(f"/sys/block/{dev}/queue/rotational").read_text(
-                errors="ignore"
-            ).strip()
+            rotational = (
+                Path(f"/sys/block/{dev}/queue/rotational").read_text(errors="ignore").strip()
+            )
             if rotational == "1":
                 return "hdd"
             if rotational == "0":
@@ -318,7 +341,7 @@ def _linux_root_block_device() -> str | None:
         parts = line.split()
         if len(parts) < 2 or parts[1] != "/" or not parts[0].startswith("/dev/"):
             continue
-        name = parts[0][len("/dev/"):]
+        name = parts[0][len("/dev/") :]
         # Strip partition suffix to get the whole-disk device.
         m = re.match(r"^(nvme\d+n\d+)p\d+$", name)
         if m:
@@ -338,6 +361,7 @@ def _accelerator() -> dict[str, Any]:
         return {"kind": "tegra", "name": "NVIDIA Tegra"}
     try:
         import torch  # type: ignore
+
         if torch.cuda.is_available():
             return {
                 "kind": "cuda",
@@ -352,7 +376,10 @@ def _accelerator() -> dict[str, Any]:
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=2, check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
         )
         if out.returncode == 0 and out.stdout.strip():
             return {"kind": "cuda", "name": out.stdout.strip().splitlines()[0]}
@@ -373,6 +400,7 @@ def _zenoh_version() -> str | None:
     even benchmarking the same stack that the edge containers run.
     """
     from importlib.metadata import PackageNotFoundError, version
+
     try:
         return version("eclipse-zenoh")
     except PackageNotFoundError:
@@ -384,6 +412,7 @@ def _zenoh_version() -> str | None:
 def _cyberwave_version() -> str | None:
     try:
         from importlib.metadata import version
+
         return version("cyberwave")
     except Exception:
         return None
@@ -392,6 +421,7 @@ def _cyberwave_version() -> str | None:
 def _cli_version() -> str | None:
     try:
         from importlib.metadata import version
+
         return version("cyberwave-cli")
     except Exception:
         return None
@@ -407,6 +437,7 @@ def _collect_fingerprint() -> dict[str, Any]:
     physical_cores: int | None = None
     try:
         import psutil  # type: ignore
+
         physical_cores = psutil.cpu_count(logical=False)
     except Exception:
         pass
@@ -497,14 +528,14 @@ def _render_fingerprint_header(fp: dict[str, Any]) -> None:
 # Rigorous timing
 # ---------------------------------------------------------------------------
 
+
 def _maybe_pin_cpu(pin: bool) -> None:
     if not pin:
         return
     sched_setaffinity = getattr(os, "sched_setaffinity", None)
     if sched_setaffinity is None:
         console.print(
-            "[dim]--pin requested but os.sched_setaffinity is not available on "
-            "this platform[/dim]"
+            "[dim]--pin requested but os.sched_setaffinity is not available on this platform[/dim]"
         )
         return
     try:
@@ -583,6 +614,7 @@ def _run_bench(
 # ---------------------------------------------------------------------------
 # Baseline loading / comparison
 # ---------------------------------------------------------------------------
+
 
 def _load_baseline(
     device_class: str,
@@ -711,9 +743,9 @@ def _format_delta(delta: float | None) -> str:
 def _status_style(status: str) -> str:
     return {
         "regressed": "bold red",
-        "improved":  "bold green",
-        "ok":        "green",
-        "n/a":       "dim",
+        "improved": "bold green",
+        "ok": "green",
+        "n/a": "dim",
     }.get(status, "")
 
 
@@ -760,6 +792,7 @@ def _render_delta_cell(delta: float | None, threshold: float) -> str:
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
+
 
 def _metrics_payload(
     results: dict[str, dict[str, Any]],
@@ -834,41 +867,62 @@ def _write_saved_baseline(
 # Main command
 # ---------------------------------------------------------------------------
 
+
 @click.command("bench")
 @click.option(
-    "--rounds", "-n", default=100_000, show_default=True,
+    "--rounds",
+    "-n",
+    default=100_000,
+    show_default=True,
     help="Number of iterations per timed pass.",
 )
 @click.option(
-    "--warmup", default=2000, show_default=True,
+    "--warmup",
+    default=2000,
+    show_default=True,
     help="Warmup iterations executed before each benchmark (discarded).",
 )
 @click.option(
-    "--repeat", default=3, show_default=True,
+    "--repeat",
+    default=3,
+    show_default=True,
     help="Number of timed passes per benchmark; the median is reported.",
 )
 @click.option(
-    "--threshold", default=REGRESSION_THRESHOLD_DEFAULT, show_default=True, type=float,
+    "--threshold",
+    default=REGRESSION_THRESHOLD_DEFAULT,
+    show_default=True,
+    type=float,
     help="Regression threshold as a fraction (0.15 = +/-15%).",
 )
 @click.option(
-    "--baseline", "baseline_path", default=None,
+    "--baseline",
+    "baseline_path",
+    default=None,
     help="Override the baseline file used for comparison (JSON).",
 )
 @click.option(
-    "--save-baseline", "save_baseline_path", default=None,
+    "--save-baseline",
+    "save_baseline_path",
+    default=None,
     help="Write this run's metrics as a baseline file at the given path.",
 )
 @click.option(
-    "--output", "output_path", default=None,
+    "--output",
+    "output_path",
+    default=None,
     help="Write the full run result (fingerprint + metrics + baseline) to this JSON file.",
 )
 @click.option(
-    "--pin", is_flag=True, default=False,
+    "--pin",
+    is_flag=True,
+    default=False,
     help="Pin the benchmark to CPU 0 (Linux only).",
 )
 @click.option(
-    "--no-compare", is_flag=True, default=False,
+    "--no-compare",
+    is_flag=True,
+    default=False,
     help="Skip baseline lookup and comparison.",
 )
 @click.pass_context
@@ -1061,6 +1115,7 @@ def bench(
 # Result rendering
 # ---------------------------------------------------------------------------
 
+
 def _render_results_table(
     *,
     results: dict[str, dict[str, Any]],
@@ -1100,7 +1155,8 @@ def _render_results_table(
             f"{base_ops:,.0f}" if base_ops is not None else "-",
             _render_delta_cell(deltas.get(key), threshold),
             f"[{_status_style(status)}]{status}[/{_status_style(status)}]"
-            if _status_style(status) else status,
+            if _status_style(status)
+            else status,
         )
 
     decode_mb_baseline = _baseline_scalar(baseline, "decode_mb_s")
@@ -1111,9 +1167,9 @@ def _render_results_table(
         "-",
         f"{decode_mb_baseline:,.0f}" if decode_mb_baseline is not None else "-",
         _render_delta_cell(deltas.get("decode_mb_s"), threshold),
-        f"[{_status_style(decode_mb_status)}]{decode_mb_status}"
-        f"[/{_status_style(decode_mb_status)}]"
-        if _status_style(decode_mb_status) else decode_mb_status,
+        f"[{_status_style(decode_mb_status)}]{decode_mb_status}[/{_status_style(decode_mb_status)}]"
+        if _status_style(decode_mb_status)
+        else decode_mb_status,
     )
 
     console.print(table)

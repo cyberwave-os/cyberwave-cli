@@ -17,6 +17,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from rich.console import Group as RenderGroup
@@ -804,12 +805,17 @@ class LinuxThermalReader:
     """Read temperature from sysfs and power from RAPL / Jetson INA / battery.
 
     All data comes from the kernel's sysfs interface -- no external tools.
+    Thermal-zone discovery delegates to
+    :func:`cyberwave.edge.host_metrics.discover_cpu_thermal_zones` so the
+    CLI, ``cyberwave edge bench`` and ``cyberwave-edge-core`` share the
+    same CPU-zone heuristic.
     """
 
-    _CPU_ZONE_TYPES = {"x86_pkg_temp", "coretemp", "cpu-thermal", "cpu_thermal", "soc_thermal"}
-
     def __init__(self) -> None:
-        self._thermal_zones: list[str] = []
+        # ``_thermal_zones`` holds ``Path`` objects — discovery and per-zone
+        # reads both go through ``cyberwave.edge.host_metrics`` which takes
+        # ``Path``, so we avoid a Path→str→Path round trip on every refresh.
+        self._thermal_zones: list[Path] = []
         self._rapl_path: str | None = None
         self._jetson_power_path: str | None = None
         self._battery_power_path: str | None = None
@@ -820,27 +826,10 @@ class LinuxThermalReader:
         self._available = False
 
     def start(self) -> bool:
-        from pathlib import Path
+        from cyberwave.edge.host_metrics import discover_cpu_thermal_zones
 
         # -- Discover thermal zones (prefer CPU-specific ones) --
-        thermal_base = Path("/sys/class/thermal")
-        cpu_zones: list[str] = []
-        all_zones: list[str] = []
-        if thermal_base.exists():
-            for zone in sorted(thermal_base.glob("thermal_zone*")):
-                temp_file = zone / "temp"
-                if not temp_file.exists():
-                    continue
-                all_zones.append(str(temp_file))
-                type_file = zone / "type"
-                if type_file.exists():
-                    try:
-                        zone_type = type_file.read_text().strip().lower()
-                    except OSError:
-                        continue
-                    if zone_type in self._CPU_ZONE_TYPES or "cpu" in zone_type:
-                        cpu_zones.append(str(temp_file))
-        self._thermal_zones = cpu_zones if cpu_zones else all_zones
+        self._thermal_zones = discover_cpu_thermal_zones()
 
         # -- Discover power source (priority order) --
         # 1. RAPL (x86)
@@ -906,16 +895,13 @@ class LinuxThermalReader:
 
     def _read_thermal_zones(self) -> float:
         """Return the smoothed highest CPU thermal zone reading in Celsius."""
+        from cyberwave.edge.host_metrics import read_thermal_zone_celsius
+
         max_temp = 0.0
         for path in self._thermal_zones:
-            try:
-                with open(path) as f:
-                    raw = f.read().strip()
-                temp_c = int(raw) / 1000.0
-                if temp_c > max_temp:
-                    max_temp = temp_c
-            except (OSError, ValueError):
-                continue
+            celsius = read_thermal_zone_celsius(path)
+            if celsius is not None and celsius > max_temp:
+                max_temp = celsius
         if max_temp > 0:
             return self._temp_ema.add(max_temp)
         return max_temp

@@ -80,15 +80,18 @@ BUILDKITE_KEYRING_PATH = Path("/etc/apt/keyrings/cyberwave_cyberwave-edge-core-a
 SYSTEMD_UNIT_TEMPLATE = textwrap.dedent("""\
     [Unit]
     Description=Cyberwave Edge Core Orchestrator
-    After=network-online.target
-    Wants=network-online.target
+    After=network-online.target docker.service
+    Wants=network-online.target docker.service
 
     [Service]
-    Type=simple
+    Type=notify
     ExecStart={binary_path}
-    Restart=on-failure
+    Restart=always
     RestartSec=5
+    WatchdogSec=60
+    TimeoutStartSec=300
     Environment=CYBERWAVE_EDGE_CONFIG_DIR={config_dir}
+    OOMScoreAdjust=-800
     StandardOutput=journal
     StandardError=journal
     SyslogIdentifier=cyberwave-edge-core
