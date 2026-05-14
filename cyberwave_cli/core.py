@@ -782,9 +782,7 @@ def _select_connected_twins(client: Any, environment_uuid: str, *, skip_confirm:
         else:
             # Broken twins are visibly flagged so the user doesn't silently pick
             # a twin that the edge-core will later fail to spawn a driver for.
-            labels.append(
-                f"{name} ({uuid_short}...)  \u26a0  NO ASSET ATTACHED — fix on dashboard"
-            )
+            labels.append(f"{name} ({uuid_short}...)  \u26a0  NO ASSET ATTACHED — fix on dashboard")
 
     base_title = "Which twins are physically connected to your edge?"
     prompt_title = base_title
@@ -799,9 +797,7 @@ def _select_connected_twins(client: Any, environment_uuid: str, *, skip_confirm:
                 continue
             selected_uuids.append(twin_uuid)
             if not _twin_has_asset(twin):
-                selected_without_asset.append(
-                    (getattr(twin, "name", "Unnamed"), twin_uuid)
-                )
+                selected_without_asset.append((getattr(twin, "name", "Unnamed"), twin_uuid))
 
         if selected_uuids:
             if selected_without_asset:
@@ -914,8 +910,7 @@ def _attach_edge_fingerprint_to_twins(
             updated += 1
         except Exception as exc:
             console.print(
-                f"[yellow]Failed to attach fingerprint to twin "
-                f"{twin_uuid[:8]}…: {exc}[/yellow]"
+                f"[yellow]Failed to attach fingerprint to twin {twin_uuid[:8]}…: {exc}[/yellow]"
             )
             failed += 1
     return updated, failed
@@ -946,9 +941,7 @@ def _detach_edge_fingerprint_from_other_twins(
     try:
         twins = client.twins.list(environment_id=environment_uuid)
     except Exception as exc:
-        console.print(
-            f"[yellow]Could not list twins to clear stale fingerprints: {exc}[/yellow]"
-        )
+        console.print(f"[yellow]Could not list twins to clear stale fingerprints: {exc}[/yellow]")
         return detached, 1
 
     for twin in twins:
@@ -968,21 +961,22 @@ def _detach_edge_fingerprint_from_other_twins(
             detached += 1
         except Exception as exc:
             console.print(
-                f"[yellow]Failed to detach fingerprint from twin "
-                f"{twin_uuid[:8]}…: {exc}[/yellow]"
+                f"[yellow]Failed to detach fingerprint from twin {twin_uuid[:8]}…: {exc}[/yellow]"
             )
             failed += 1
 
     return detached, failed
 
 
-_NON_TWIN_JSON_FILES = frozenset({
-    "credentials.json",
-    "environment.json",
-    "cameras.json",
-    "camera_streams.json",
-    "fingerprint.json",
-})
+_NON_TWIN_JSON_FILES = frozenset(
+    {
+        "credentials.json",
+        "environment.json",
+        "cameras.json",
+        "camera_streams.json",
+        "fingerprint.json",
+    }
+)
 
 
 def _detect_existing_edge_configuration() -> tuple[str | None, list[Path]]:
@@ -994,9 +988,7 @@ def _detect_existing_edge_configuration() -> tuple[str | None, list[Path]]:
         is detected.
     """
     twin_json_files = [
-        p
-        for p in sorted(CONFIG_DIR.glob("*.json"))
-        if p.name not in _NON_TWIN_JSON_FILES
+        p for p in sorted(CONFIG_DIR.glob("*.json")) if p.name not in _NON_TWIN_JSON_FILES
     ]
     if not twin_json_files:
         return None, []
@@ -1038,12 +1030,8 @@ def _cleanup_existing_edge_configuration(
 
     edge_fingerprint = _load_or_generate_edge_fingerprint()
     token = creds.token if creds else None
-    base_url = (
-        str(getattr(creds, "cyberwave_base_url", "") or "") if creds else None
-    )
-    workspace_uuid = (
-        str(getattr(creds, "workspace_uuid", "") or "") if creds else None
-    )
+    base_url = str(getattr(creds, "cyberwave_base_url", "") or "") if creds else None
+    workspace_uuid = str(getattr(creds, "workspace_uuid", "") or "") if creds else None
 
     if token:
         from .commands.edge import _delete_registered_edges_for_fingerprint
@@ -1061,8 +1049,7 @@ def _cleanup_existing_edge_configuration(
             )
         if failed:
             console.print(
-                f"[yellow]Failed to remove {failed} backend edge "
-                f"registration(s).[/yellow]"
+                f"[yellow]Failed to remove {failed} backend edge registration(s).[/yellow]"
             )
 
     console.print("[green]Previous edge configuration cleared.[/green]")
@@ -1350,7 +1337,9 @@ def _apt_get_install(
             )
             if not curl.stdout:
                 console.print("[red]Downloaded GPG key is empty.[/red]")
-                console.print(f"[dim]URL: {_resolve_deb_registry_gpg_key_fetch_url(spec, channel)}[/dim]")
+                console.print(
+                    f"[dim]URL: {_resolve_deb_registry_gpg_key_fetch_url(spec, channel)}[/dim]"
+                )
                 return False
 
             # Dearmor into the keyring file
@@ -1374,7 +1363,9 @@ def _apt_get_install(
             console.print(f"[red]Failed to download GPG key (exit {exc.returncode}).[/red]")
             if stderr_msg:
                 console.print(f"[dim]{stderr_msg}[/dim]")
-            console.print(f"[dim]URL: {_resolve_deb_registry_gpg_key_fetch_url(spec, channel)}[/dim]")
+            console.print(
+                f"[dim]URL: {_resolve_deb_registry_gpg_key_fetch_url(spec, channel)}[/dim]"
+            )
             return False
         except FileNotFoundError as exc:
             console.print(f"[red]Required command not found: {exc.filename}[/red]")
@@ -1853,17 +1844,13 @@ def load_launchagent_service(spec: ServiceSpec = CLOUD_NODE_SPEC) -> bool:
     domain, _bootout_target = _launchagent_target(spec)
 
     try:
-        wait_for_launchd_unload(
-            label, legacy_labels=legacy_labels_for_package(spec.package_name)
-        )
+        wait_for_launchd_unload(label, legacy_labels=legacy_labels_for_package(spec.package_name))
         bootstrap_launchd_service(domain, plist_path)
     except FileNotFoundError:
         console.print("[red]launchctl not found on this system.[/red]")
         return False
     except subprocess.CalledProcessError as exc:
-        console.print(
-            f"[red]launchctl bootstrap failed (exit {exc.returncode}).[/red]"
-        )
+        console.print(f"[red]launchctl bootstrap failed (exit {exc.returncode}).[/red]")
         if exc.returncode == 5:
             console.print(
                 "[dim]Hint: launchd reports a transient I/O error even after "
@@ -2120,7 +2107,12 @@ def _list_camera_twins() -> list[tuple[str, str]]:
     selected_uuids = _load_selected_twin_uuids()
     results: list[tuple[str, str]] = []
     for path in sorted(CONFIG_DIR.glob("*.json")):
-        if path.name in ("credentials.json", "environment.json", "cameras.json", "fingerprint.json"):
+        if path.name in (
+            "credentials.json",
+            "environment.json",
+            "cameras.json",
+            "fingerprint.json",
+        ):
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -2215,7 +2207,9 @@ def _detect_and_select_cameras() -> None:
 
     cameras = discover_usb_cameras()
     if not cameras:
-        console.print("[dim]No cameras detected. You can add one later: cyberwave edge cameras[/dim]")
+        console.print(
+            "[dim]No cameras detected. You can add one later: cyberwave edge cameras[/dim]"
+        )
         return
 
     camera_twins = _list_camera_twins()
@@ -2255,9 +2249,7 @@ def _detect_and_select_cameras() -> None:
         if selected is None:
             return
         console.print(f"[green]Selected:[/green] {valid_indices[selected].card}")
-        twin_to_device = (
-            {camera_twins[0][0]: selected} if camera_twins else {}
-        )
+        twin_to_device = {camera_twins[0][0]: selected} if camera_twins else {}
         write_cameras_json(
             cameras,
             CONFIG_DIR,
@@ -2269,8 +2261,7 @@ def _detect_and_select_cameras() -> None:
 
     # Multiple camera twins AND multiple cameras: map each twin to a camera.
     console.print(
-        f"\n[bold]Detected {len(cameras)} camera(s) and "
-        f"{len(camera_twins)} camera twin(s).[/bold]"
+        f"\n[bold]Detected {len(cameras)} camera(s) and {len(camera_twins)} camera twin(s).[/bold]"
     )
     console.print(
         "[dim]Map each twin to the physical camera it is wired to. "
@@ -2304,9 +2295,7 @@ def _detect_and_select_cameras() -> None:
             first_selected = selected
         # Prefer an unassigned device as the next default, but keep the current
         # choice if every device has been touched.
-        remaining = [
-            idx for idx in valid_indices if idx not in assignments_label
-        ]
+        remaining = [idx for idx in valid_indices if idx not in assignments_label]
         if remaining:
             remaining_default = remaining[0]
         console.print(f"[green]Selected:[/green] {valid_indices[selected].card}\n")
@@ -2364,9 +2353,12 @@ def setup_service(
                 "CYBERWAVE_EDGE_CONFIG_DIR": str(CONFIG_DIR),
                 "_CYBERWAVE_SUDO_ESCALATED": "1",
             }
+            preserve_keys = sorted(
+                k for k in child_env if k.startswith("CYBERWAVE_") or k.startswith("_CYBERWAVE_")
+            )
+            preserve_arg = f"--preserve-env={','.join(preserve_keys)}"
             result = subprocess.run(
-                ["sudo", "--preserve-env=CYBERWAVE_EDGE_CONFIG_DIR,_CYBERWAVE_SUDO_ESCALATED"]
-                + sys.argv,
+                ["sudo", preserve_arg] + sys.argv,
                 env=child_env,
             )
             return result.returncode == 0

@@ -115,3 +115,52 @@ def test_setup_service_attempts_sudo_when_not_root(monkeypatch):
     assert len(sudo_calls) == 1
     assert sudo_calls[0][0] == "sudo"
     assert "_CYBERWAVE_SUDO_ESCALATED" in sudo_calls[0][1]
+
+
+def test_setup_service_sudo_preserves_cyberwave_env_vars(monkeypatch):
+    """Env vars like CYBERWAVE_BASE_URL must survive sudo escalation."""
+    core = load_core_module(monkeypatch)
+
+    monkeypatch.setattr(core, "_is_linux", lambda: True)
+    monkeypatch.setattr(core, "_is_macos", lambda: False)
+    monkeypatch.setattr(core.os, "geteuid", lambda: 1000)
+    monkeypatch.delenv("_CYBERWAVE_SUDO_ESCALATED", raising=False)
+
+    monkeypatch.setenv("CYBERWAVE_BASE_URL", "https://api-dev.example.test")
+    monkeypatch.setenv("CYBERWAVE_ENVIRONMENT", "dev")
+    monkeypatch.setenv("CYBERWAVE_MQTT_HOST", "dev.mqtt.example.test")
+    monkeypatch.setenv("CYBERWAVE_INTERNAL_DEB_READ_TOKEN", "tok_deb")
+
+    sudo_calls: list[tuple[list[str], dict]] = []
+
+    class FakeCompletedProcess:
+        returncode = 0
+
+    def fake_subprocess_run(cmd, **kwargs):
+        sudo_calls.append((cmd, kwargs))
+        return FakeCompletedProcess()
+
+    monkeypatch.setattr(core.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(core, "_migrate_legacy_config_dir", lambda: None)
+
+    result = core.setup_service(core.EDGE_CORE_SPEC, skip_confirm=True)
+    assert result is True
+    assert len(sudo_calls) == 1
+
+    cmd, kwargs = sudo_calls[0]
+    assert cmd[0] == "sudo"
+    preserve_arg = cmd[1]
+    assert preserve_arg.startswith("--preserve-env=")
+    preserved_vars = preserve_arg.split("=", 1)[1].split(",")
+
+    assert "CYBERWAVE_BASE_URL" in preserved_vars
+    assert "CYBERWAVE_ENVIRONMENT" in preserved_vars
+    assert "CYBERWAVE_MQTT_HOST" in preserved_vars
+    assert "CYBERWAVE_INTERNAL_DEB_READ_TOKEN" in preserved_vars
+    assert "CYBERWAVE_EDGE_CONFIG_DIR" in preserved_vars
+    assert "_CYBERWAVE_SUDO_ESCALATED" in preserved_vars
+
+    child_env = kwargs.get("env", {})
+    assert child_env.get("CYBERWAVE_BASE_URL") == "https://api-dev.example.test"
+    assert child_env.get("CYBERWAVE_ENVIRONMENT") == "dev"
+    assert child_env.get("CYBERWAVE_MQTT_HOST") == "dev.mqtt.example.test"
