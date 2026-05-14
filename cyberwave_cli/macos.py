@@ -27,19 +27,66 @@ from pathlib import Path
 from typing import Any, Optional
 from xml.sax.saxutils import escape as _xml_escape
 
-logger = logging.getLogger(__name__)
-
-from cyberwave.edge.platform import (
-    USBIP_LAUNCHD_LABEL,
-    USBIP_PORT,
-    is_usbip_server_running,
-)
-from cyberwave.edge.platform import (
-    is_port_listening as _is_port_listening,
-)
 from rich.console import Console
 
 from .config import _resolve_sudo_user_home, clean_subprocess_env
+
+logger = logging.getLogger(__name__)
+
+
+def _lazy_edge_platform():
+    """Deferred import of cyberwave.edge.platform to avoid pulling in the
+    full SDK (and numpy) at CLI startup time."""
+    from cyberwave.edge.platform import (
+        USBIP_LAUNCHD_LABEL,
+        USBIP_PORT,
+        is_port_listening,
+        is_usbip_server_running,
+    )
+
+    return USBIP_LAUNCHD_LABEL, USBIP_PORT, is_port_listening, is_usbip_server_running
+
+
+class _EdgePlatformProxy:
+    """Lazy proxy that imports cyberwave.edge.platform on first attribute access."""
+
+    _loaded = False
+    USBIP_LAUNCHD_LABEL: str
+    USBIP_PORT: int
+    is_port_listening: Any
+    is_usbip_server_running: Any
+
+    @classmethod
+    def _ensure_loaded(cls) -> None:
+        if not cls._loaded:
+            (
+                cls.USBIP_LAUNCHD_LABEL,
+                cls.USBIP_PORT,
+                cls.is_port_listening,
+                cls.is_usbip_server_running,
+            ) = _lazy_edge_platform()
+            cls._loaded = True
+
+
+def _get_usbip_launchd_label() -> str:
+    _EdgePlatformProxy._ensure_loaded()
+    return _EdgePlatformProxy.USBIP_LAUNCHD_LABEL
+
+
+def _get_usbip_port() -> int:
+    _EdgePlatformProxy._ensure_loaded()
+    return _EdgePlatformProxy.USBIP_PORT
+
+
+def _is_port_listening(port: int) -> bool:
+    _EdgePlatformProxy._ensure_loaded()
+    return _EdgePlatformProxy.is_port_listening(port)
+
+
+def is_usbip_server_running() -> bool:
+    _EdgePlatformProxy._ensure_loaded()
+    return _EdgePlatformProxy.is_usbip_server_running()
+
 
 USBIP_REPO_URL = "https://github.com/jiegec/usbip.git"
 
@@ -108,7 +155,7 @@ def _usbip_wrapper_path() -> Path:
 
 
 def _usbip_launchd_plist() -> Path:
-    return _user_home() / "Library" / "LaunchAgents" / f"{USBIP_LAUNCHD_LABEL}.plist"
+    return _user_home() / "Library" / "LaunchAgents" / f"{_get_usbip_launchd_label()}.plist"
 
 
 def _usbip_log_path() -> Path:
@@ -625,7 +672,7 @@ def _create_usbip_launchd_service() -> bool:
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     plist_contents = _USBIP_LAUNCHD_PLIST_TEMPLATE.format(
-        label=USBIP_LAUNCHD_LABEL,
+        label=_get_usbip_launchd_label(),
         wrapper_path=str(_usbip_wrapper_path()),
         log_path=str(log_path),
     )
@@ -644,7 +691,7 @@ def _create_usbip_launchd_service() -> bool:
     _, real_uid, _ = _resolve_real_user()
     gui_domain = f"gui/{real_uid}" if real_uid is not None else None
 
-    wait_for_launchd_unload(USBIP_LAUNCHD_LABEL)
+    wait_for_launchd_unload(_get_usbip_launchd_label())
 
     if gui_domain:
         try:
@@ -665,13 +712,14 @@ def _create_usbip_launchd_service() -> bool:
 
     max_wait_secs = 10
     for i in range(max_wait_secs * 2):
-        if _is_port_listening(USBIP_PORT):
-            console.print(f"[green]USB/IP server is running ({USBIP_LAUNCHD_LABEL}).[/green]")
+        if _is_port_listening(_get_usbip_port()):
+            label = _get_usbip_launchd_label()
+            console.print(f"[green]USB/IP server is running ({label}).[/green]")
             break
         time.sleep(0.5)
     else:
         console.print(
-            f"[yellow]USB/IP service loaded but port {USBIP_PORT} is not listening "
+            f"[yellow]USB/IP service loaded but port {_get_usbip_port()} is not listening "
             f"after {max_wait_secs}s. Check logs at {log_path}[/yellow]"
         )
     return True
@@ -712,7 +760,7 @@ def _teardown_usbip_server() -> None:
     console = _get_console()
     console.print("[cyan]Tearing down existing USB/IP server...[/cyan]")
 
-    _bootout_launchd_service(USBIP_LAUNCHD_LABEL)
+    _bootout_launchd_service(_get_usbip_launchd_label())
 
     for path in [
         _usbip_launchd_plist(),

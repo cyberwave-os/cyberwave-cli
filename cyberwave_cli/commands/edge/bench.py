@@ -36,7 +36,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import click
-import numpy as np
 from rich.console import Console
 from rich.table import Table
 
@@ -441,6 +440,8 @@ def _collect_fingerprint() -> dict[str, Any]:
         physical_cores = psutil.cpu_count(logical=False)
     except Exception:
         pass
+
+    import numpy as np
 
     return {
         "device_class": _detect_device_class(),
@@ -945,6 +946,7 @@ def bench(
     baseline shipped for the detected device class.  Exits with code 2 when
     any metric regresses beyond ``--threshold``.
     """
+    import numpy as np
     from cyberwave.data.header import CONTENT_TYPE_NUMPY, HeaderTemplate, decode
 
     console.print("[bold]Cyberwave Edge Bench[/bold]")

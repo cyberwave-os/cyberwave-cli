@@ -23,11 +23,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cyberwave.fingerprint import generate_fingerprint
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
-from .auth import APIToken, AuthClient, AuthenticationError
 from .config import (
     CONFIG_DIR,
     LEGACY_SYSTEM_CONFIG_DIR,
@@ -42,6 +40,7 @@ from .credentials import (
     load_credentials,
     save_credentials,
 )
+
 from .macos import (
     bootstrap_launchd_service,
     is_macos,
@@ -377,6 +376,8 @@ def _load_or_generate_edge_fingerprint() -> str:
         except Exception:
             pass
 
+    from cyberwave.fingerprint import generate_fingerprint
+
     return generate_fingerprint()
 
 
@@ -394,6 +395,8 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
     If saved credentials are found and valid, returns True immediately.
     Otherwise prompts for email/password and runs the full login flow.
     """
+    from .auth import APIToken, AuthClient, AuthenticationError
+
     creds = load_credentials()
     if creds and creds.token:
         try:
@@ -1057,6 +1060,8 @@ def _cleanup_existing_edge_configuration(
 
 def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
     """Select workspace + environment and save /etc/cyberwave/environment.json."""
+    from .auth import AuthenticationError
+
     creds = load_credentials()
     if not creds or not creds.token:
         console.print("[red]No credentials found.[/red]")

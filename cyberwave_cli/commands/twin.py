@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any
 
 import click
-import httpx
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
@@ -335,6 +334,8 @@ def _register_and_pair_edge(twin_uuid: str, fingerprint: str, device_info: dict,
 
     Returns edge_uuid on success, None on failure (fallback to legacy).
     """
+    import httpx
+
     from ..config import get_api_url
     from ..credentials import load_credentials
 
@@ -642,6 +643,8 @@ def pair_twin(ctx: click.Context, twin_uuid: str, target_dir: str, yes: bool):
         2. cyberwave twin pair <uuid>         # Pair device with twin
         3. cyberwave edge start               # Start streaming
     """
+    import httpx
+
     from ..config import get_api_url
     from ..credentials import load_credentials
     from cyberwave.fingerprint import generate_fingerprint, get_device_info

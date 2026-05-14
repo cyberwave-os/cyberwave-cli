@@ -2,29 +2,13 @@
 
 from __future__ import annotations
 
+import importlib
+from typing import Any
+
 import click
 from rich.console import Console
 
 from . import __version__
-from .commands import (
-    camera,
-    compute,
-    completion,
-    config_dir,
-    configure,
-    edge,
-    environment,
-    login,
-    logout,
-    manifest,
-    model,
-    plugin,
-    scan,
-    so101,
-    twin,
-    workflow,
-    worker,
-)
 
 console = Console()
 
@@ -39,6 +23,64 @@ BANNER = """
  ╚═════╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝  ╚═══╝  ╚══════╝
 [/#00b3db]
 """
+
+# Maps CLI command names to their (module_path, attribute_name) for lazy loading.
+# Each command module is only imported when the user actually invokes that command.
+_LAZY_COMMANDS: dict[str, tuple[str, str]] = {
+    "camera": (".commands.camera", "camera"),
+    "compute": (".commands.compute", "compute"),
+    "completion": (".commands.completion", "completion"),
+    "config-dir": (".commands.config_dir", "config_dir"),
+    "configure": (".commands.configure", "configure"),
+    "edge": (".commands.edge", "edge"),
+    "environment": (".commands.environment", "environment"),
+    "login": (".commands.login", "login"),
+    "logout": (".commands.logout", "logout"),
+    "manifest": (".commands.manifest", "manifest"),
+    "model": (".commands.model", "model"),
+    "plugin": (".commands.plugin", "plugin"),
+    "scan": (".commands.scan", "scan"),
+    "so101": (".commands.so101", "so101"),
+    "twin": (".commands.twin", "twin"),
+    "workflow": (".commands.workflow", "workflow"),
+    "worker": (".commands.worker", "worker"),
+}
+
+
+class _LazyGroup(click.Group):
+    """Click group that defers command module imports until invocation.
+
+    Only the command the user is actually running gets imported,
+    avoiding the cost of loading all 17+ command modules on every
+    CLI invocation.  ``--help`` still lists all commands by name
+    because the names are known statically from ``_LAZY_COMMANDS``.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        lazy_commands: dict[str, tuple[str, str]] | None = None,
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+        self._lazy_commands = lazy_commands or {}
+
+    def list_commands(self, ctx: click.Context) -> list[str]:
+        base = super().list_commands(ctx)
+        lazy = sorted(self._lazy_commands.keys())
+        return sorted(set(base + lazy))
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.BaseCommand | None:
+        rv = super().get_command(ctx, cmd_name)
+        if rv is not None:
+            return rv
+        if cmd_name not in self._lazy_commands:
+            return None
+        module_path, attr_name = self._lazy_commands[cmd_name]
+        mod = importlib.import_module(module_path, package=__package__)
+        cmd = getattr(mod, attr_name)
+        self.add_command(cmd, cmd_name)
+        return cmd
 
 
 def _load_sdk_default_api():
@@ -64,7 +106,7 @@ def run_sdk_selfcheck() -> int:
     return 0
 
 
-@click.group(invoke_without_command=True)
+@click.group(cls=_LazyGroup, lazy_commands=_LAZY_COMMANDS, invoke_without_command=True)
 @click.version_option(version=__version__, prog_name="cyberwave")
 @click.pass_context
 def cli(ctx: click.Context) -> None:
@@ -107,26 +149,6 @@ def cli(ctx: click.Context) -> None:
     if ctx.invoked_subcommand is None:
         console.print(BANNER)
         console.print("[dim]Type [bold]cyberwave --help[/bold] for available commands.[/dim]\n")
-
-
-# Register commands
-cli.add_command(camera)
-cli.add_command(compute)
-cli.add_command(completion)
-cli.add_command(config_dir)
-cli.add_command(configure)
-cli.add_command(edge)
-cli.add_command(environment)
-cli.add_command(login)
-cli.add_command(logout)
-cli.add_command(manifest)
-cli.add_command(model)
-cli.add_command(plugin)
-cli.add_command(scan)
-cli.add_command(so101)
-cli.add_command(twin)
-cli.add_command(workflow)
-cli.add_command(worker)
 
 
 @cli.command(name="__selfcheck_sdk", hidden=True)

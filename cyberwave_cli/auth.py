@@ -9,8 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-import httpx
-
 from .config import get_api_url
 
 # Auth-specific endpoints — these are not part of the Cyberwave Python SDK
@@ -109,6 +107,8 @@ class AuthClient:
     """Client for authentication API calls."""
 
     def __init__(self, base_url: Optional[str] = None):
+        import httpx
+
         self.base_url = base_url or get_api_url()
         self._client = httpx.Client(
             base_url=self.base_url,
@@ -139,6 +139,8 @@ class AuthClient:
         Raises:
             AuthenticationError: If authentication fails
         """
+        import httpx
+
         try:
             response = self._client.post(
                 AUTH_LOGIN_ENDPOINT,
@@ -197,6 +199,8 @@ class AuthClient:
         Raises:
             AuthenticationError: If the token is invalid
         """
+        import httpx
+
         try:
             response = self._client.get(
                 AUTH_USER_ENDPOINT,
@@ -230,6 +234,8 @@ class AuthClient:
         Raises:
             AuthenticationError: If the token is invalid
         """
+        import httpx
+
         try:
             response = self._client.get(
                 WORKSPACES_ENDPOINT,
@@ -264,6 +270,8 @@ class AuthClient:
         Raises:
             AuthenticationError: If the token is invalid or unsupported
         """
+        import httpx
+
         try:
             response = self._client.get(
                 API_TOKEN_CONTEXT_ENDPOINT,
@@ -307,6 +315,8 @@ class AuthClient:
         Raises:
             AuthenticationError: If token creation fails
         """
+        import httpx
+
         try:
             # Use a fresh client without cookies to avoid CSRF issues
             # (session cookies trigger Django's SessionAuthentication which enforces CSRF)
