@@ -84,6 +84,7 @@ SYSTEMD_UNIT_TEMPLATE = textwrap.dedent("""\
 
     [Service]
     Type=notify
+    NotifyAccess=all
     ExecStart={binary_path}
     Restart=always
     RestartSec=5
