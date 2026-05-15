@@ -248,10 +248,7 @@ def _remove_config_dir_reliably(config_dir: Path, *, retries: int = 5, delay: fl
         try:
             shutil.rmtree(config_dir)
         except PermissionError:
-            console.print(
-                "[red]Permission denied removing edge config directory.[/red]\n"
-                "[dim]Re-run with sudo: sudo cyberwave edge uninstall[/dim]"
-            )
+            console.print("[red]Permission denied removing edge config directory.[/red]")
             return False
         except OSError as exc:
             console.print(f"[yellow]Could not fully remove {config_dir}: {exc}[/yellow]")
@@ -387,15 +384,17 @@ def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, wit
     pip elsewhere) and creates a systemd service so it starts automatically on boot.
     By default the ML worker Docker image is also pulled.
 
+    On Linux, this command requires root privileges.
+
     \b
     Examples:
-        cyberwave edge install
-        cyberwave edge install -y
-        cyberwave edge install --without-workers
-        cyberwave edge install --force-reinstall
-        cyberwave edge install --reconfigure-camera
-        cyberwave edge install --channel dev
-        cyberwave edge install --channel staging --version 0.0.42.595
+        sudo cyberwave edge install
+        sudo cyberwave edge install -y
+        sudo cyberwave edge install --without-workers
+        sudo cyberwave edge install --force-reinstall
+        sudo cyberwave edge install --reconfigure-camera
+        sudo cyberwave edge install --channel dev
+        sudo cyberwave edge install --channel staging --version 0.0.42.595
     """
     if reconfigure_camera:
         from ...macos import is_macos
@@ -451,14 +450,14 @@ def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, wit
 def uninstall_edge(yes):
     """Stop and remove the cyberwave-edge-core service.
 
-    On Linux: disables the systemd service, removes the unit file.
+    On Linux: disables the systemd service, removes the unit file (requires root).
     On macOS: tears down the launchd LaunchAgent.
     On both: removes the edge config directory and optionally the package.
 
     \b
     Examples:
-        cyberwave edge uninstall
-        cyberwave edge uninstall -y
+        sudo cyberwave edge uninstall
+        sudo cyberwave edge uninstall -y
     """
     from ...config import CONFIG_DIR
     from ...core import (
@@ -578,17 +577,14 @@ def uninstall_edge(yes):
         console.print(f"[green]{EDGE_CORE_SPEC.package_name} service removed.[/green]")
         return
 
-    from ...core import SYSTEMD_UNIT_PATH, _run, _sudo_run
+    from ...core import SYSTEMD_UNIT_PATH, _run, require_root
 
-    if os.geteuid() != 0:
-        console.print(
-            "[cyan]Root privileges required — requesting sudo for service management...[/cyan]"
-        )
+    require_root("sudo cyberwave edge uninstall")
 
     # Stop and disable the service
     try:
-        _sudo_run(["systemctl", "stop", SYSTEMD_UNIT_NAME], check=False)
-        _sudo_run(["systemctl", "disable", SYSTEMD_UNIT_NAME], check=False)
+        _run(["systemctl", "stop", SYSTEMD_UNIT_NAME], check=False)
+        _run(["systemctl", "disable", SYSTEMD_UNIT_NAME], check=False)
     except FileNotFoundError:
         console.print("[yellow]systemctl not found — skipping service cleanup.[/yellow]")
 
@@ -597,17 +593,14 @@ def uninstall_edge(yes):
     # Remove the systemd unit file
     if SYSTEMD_UNIT_PATH.exists():
         try:
-            _sudo_run(["rm", "-f", str(SYSTEMD_UNIT_PATH)], check=True)
+            _run(["rm", "-f", str(SYSTEMD_UNIT_PATH)], check=True)
             console.print(f"[green]Removed:[/green] {SYSTEMD_UNIT_PATH}")
             try:
-                _sudo_run(["systemctl", "daemon-reload"], check=False)
+                _run(["systemctl", "daemon-reload"], check=False)
             except FileNotFoundError:
                 pass
         except subprocess.CalledProcessError:
-            console.print(
-                f"[red]Failed to remove {SYSTEMD_UNIT_PATH}.[/red]\n"
-                "[dim]Re-run with sudo: sudo cyberwave edge uninstall[/dim]"
-            )
+            console.print(f"[red]Failed to remove {SYSTEMD_UNIT_PATH}.[/red]")
 
     stopped_driver_containers = _stop_edge_driver_containers(_run)
     if stopped_driver_containers:
@@ -623,17 +616,9 @@ def uninstall_edge(yes):
 
         installed_package_name = _resolve_installed_edge_core_package_name()
         if RichConfirm.ask(f"Also uninstall {installed_package_name} package?", default=False):
-            if is_macos():
+            if shutil.which("apt-get"):
                 try:
-                    _run(
-                        [sys.executable, "-m", "pip", "uninstall", "-y", installed_package_name],
-                        check=False,
-                    )
-                except OSError:
-                    console.print("[yellow]pip uninstall failed — remove manually.[/yellow]")
-            elif shutil.which("apt-get"):
-                try:
-                    _sudo_run(["apt-get", "remove", "-y", installed_package_name], check=False)
+                    _run(["apt-get", "remove", "-y", installed_package_name], check=False)
                 except FileNotFoundError:
                     console.print("[yellow]apt-get not found — remove manually with pip.[/yellow]")
             else:
@@ -847,8 +832,8 @@ def stop_edge():
 def restart_edge(env_file):
     """Restart the edge node service.
 
-    If the edge was installed as a systemd service, restarts it via systemctl.
-    On macOS with a LaunchAgent, restarts via launchctl.
+    If the edge was installed as a systemd service, restarts it via systemctl
+    (requires root).  On macOS with a LaunchAgent, restarts via launchctl.
     Otherwise falls back to stopping and re-starting the background process.
 
     \b
