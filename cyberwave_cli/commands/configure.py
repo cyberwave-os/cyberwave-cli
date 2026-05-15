@@ -148,6 +148,8 @@ def configure(
         or (existing_credentials.cyberwave_environment if existing_credentials else None),
         cyberwave_edge_log_level=runtime_overrides.get("CYBERWAVE_EDGE_LOG_LEVEL")
         or (existing_credentials.cyberwave_edge_log_level if existing_credentials else None),
+        cyberwave_worker_log_level=runtime_overrides.get("CYBERWAVE_WORKER_LOG_LEVEL")
+        or (existing_credentials.cyberwave_worker_log_level if existing_credentials else None),
         cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL")
         or (existing_credentials.cyberwave_base_url if existing_credentials else None),
         cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST")
