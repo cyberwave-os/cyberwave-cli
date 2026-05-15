@@ -44,6 +44,7 @@ from cyberwave_cli.utils import colorize_log_line
 
 console = Console()
 DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
+CYBERWAVE_CONTAINER_PREFIX = "cyberwave"
 
 
 def _delete_registered_edges_for_fingerprint(
@@ -174,6 +175,85 @@ def _stop_edge_driver_containers(run_command) -> list[str]:
         return []
 
     return containers
+
+
+def _prune_stopped_cyberwave_containers() -> int:
+    """Remove all stopped containers whose name starts with ``cyberwave``."""
+    if not shutil.which("docker"):
+        return 0
+
+    try:
+        all_result = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--format",
+                "{{.Names}}",
+                "--filter",
+                f"name=^{CYBERWAVE_CONTAINER_PREFIX}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return 0
+
+    try:
+        running_result = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "--format",
+                "{{.Names}}",
+                "--filter",
+                f"name=^{CYBERWAVE_CONTAINER_PREFIX}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return 0
+
+    all_containers = {l.strip() for l in all_result.stdout.splitlines() if l.strip()}
+    running = {l.strip() for l in running_result.stdout.splitlines() if l.strip()}
+    stopped = all_containers - running
+
+    removed = 0
+    for name in stopped:
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", name],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            removed += 1
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            pass
+    return removed
+
+
+def _prune_unused_docker_images() -> bool:
+    """Run ``docker image prune --all --force`` to remove unused images."""
+    if not shutil.which("docker"):
+        return False
+    try:
+        subprocess.run(
+            ["docker", "image", "prune", "--all", "--force"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return False
 
 
 def _find_edge_core_binary() -> str | None:
@@ -530,6 +610,15 @@ def uninstall_edge(yes):
                 f"[green]Stopped {len(stopped_driver_containers)} edge driver container(s).[/green]"
             )
 
+        pruned_containers = _prune_stopped_cyberwave_containers()
+        if pruned_containers:
+            console.print(
+                f"[green]Pruned {pruned_containers} stopped cyberwave container(s).[/green]"
+            )
+
+        if _prune_unused_docker_images():
+            console.print("[green]Pruned unused Docker images.[/green]")
+
         if _remove_config_dir_reliably(CONFIG_DIR):
             console.print(f"[green]Removed:[/green] {CONFIG_DIR}")
 
@@ -607,6 +696,13 @@ def uninstall_edge(yes):
         console.print(
             f"[green]Stopped {len(stopped_driver_containers)} edge driver container(s).[/green]"
         )
+
+    pruned_containers = _prune_stopped_cyberwave_containers()
+    if pruned_containers:
+        console.print(f"[green]Pruned {pruned_containers} stopped cyberwave container(s).[/green]")
+
+    if _prune_unused_docker_images():
+        console.print("[green]Pruned unused Docker images.[/green]")
 
     if _remove_config_dir_reliably(CONFIG_DIR):
         console.print(f"[green]Removed:[/green] {CONFIG_DIR}")
