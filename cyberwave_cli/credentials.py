@@ -47,6 +47,11 @@ class Credentials:
     workspace_name: Optional[str] = None
     cyberwave_environment: Optional[str] = None
     cyberwave_edge_log_level: Optional[str] = None
+    # Worker-side log level. Separate from ``cyberwave_edge_log_level``
+    # so operators can tune driver verbosity (often raised to DEBUG to
+    # inspect a hardware issue) independently from the per-frame
+    # workflow trace emitted by worker containers.
+    cyberwave_worker_log_level: Optional[str] = None
     cyberwave_base_url: Optional[str] = None
     cyberwave_mqtt_host: Optional[str] = None
     cyberwave_mqtt_port: Optional[str] = None
@@ -60,6 +65,8 @@ class Credentials:
             envs["CYBERWAVE_ENVIRONMENT"] = self.cyberwave_environment
         if self.cyberwave_edge_log_level:
             envs["CYBERWAVE_EDGE_LOG_LEVEL"] = self.cyberwave_edge_log_level
+        if self.cyberwave_worker_log_level:
+            envs["CYBERWAVE_WORKER_LOG_LEVEL"] = self.cyberwave_worker_log_level
         if self.cyberwave_base_url:
             envs["CYBERWAVE_BASE_URL"] = self.cyberwave_base_url
         if self.cyberwave_mqtt_host:
@@ -130,6 +137,7 @@ class Credentials:
             workspace_name=data.get("workspace_name"),
             cyberwave_environment=_env_value("CYBERWAVE_ENVIRONMENT"),
             cyberwave_edge_log_level=_env_value("CYBERWAVE_EDGE_LOG_LEVEL"),
+            cyberwave_worker_log_level=_env_value("CYBERWAVE_WORKER_LOG_LEVEL"),
             cyberwave_base_url=_env_value("CYBERWAVE_BASE_URL"),
             cyberwave_mqtt_host=_env_value("CYBERWAVE_MQTT_HOST"),
             cyberwave_mqtt_port=_env_value("CYBERWAVE_MQTT_PORT"),
@@ -187,6 +195,7 @@ def collect_runtime_env_overrides(*, api_url_override: Optional[str] = None) -> 
     for key in (
         "CYBERWAVE_ENVIRONMENT",
         "CYBERWAVE_EDGE_LOG_LEVEL",
+        "CYBERWAVE_WORKER_LOG_LEVEL",
         "CYBERWAVE_BASE_URL",
         "CYBERWAVE_MQTT_HOST",
         "CYBERWAVE_MQTT_PORT",
@@ -204,10 +213,18 @@ def collect_runtime_env_overrides(*, api_url_override: Optional[str] = None) -> 
         for key, value in _infer_env_from_base_url(base_url).items():
             overrides.setdefault(key, value)
 
-    # In non-production explicit environments, default edge-core to verbose logs.
+    # In non-production explicit environments, default edge-core (and edge
+    # drivers) to verbose logs. Workers get an *explicit* INFO default so
+    # the per-frame workflow trace (now at DEBUG in the codegen) doesn't
+    # drown out useful signal in dev/staging via the worker SDK's
+    # WORKER->EDGE fallback chain. Without this setdefault, workers in dev
+    # would inherit ``CYBERWAVE_EDGE_LOG_LEVEL=debug`` and re-emit the very
+    # noise we demoted from INFO. Operators who want the trace lines back
+    # opt in explicitly with ``CYBERWAVE_WORKER_LOG_LEVEL=debug``.
     env_name = overrides.get("CYBERWAVE_ENVIRONMENT", "").strip().lower()
     if env_name and env_name != "production":
         overrides.setdefault("CYBERWAVE_EDGE_LOG_LEVEL", "debug")
+        overrides.setdefault("CYBERWAVE_WORKER_LOG_LEVEL", "info")
     return overrides
 
 
