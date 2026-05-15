@@ -122,17 +122,13 @@ def test_uninstall_edge_stops_driver_containers(monkeypatch, tmp_path):
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
     fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
+    fake_core.require_root = lambda hint: None
 
     def _fake_run(command, *, check=True, **_kwargs):
         run_calls.append(command)
         return None
 
-    def _fake_sudo_run(command, *, check=True, **_kwargs):
-        run_calls.append(command)
-        return None
-
     fake_core._run = _fake_run
-    fake_core._sudo_run = _fake_sudo_run
 
     fake_credentials = ModuleType("cyberwave_cli.credentials")
     fake_credentials.load_credentials = lambda: SimpleNamespace(
@@ -184,16 +180,14 @@ def test_uninstall_edge_stops_driver_containers(monkeypatch, tmp_path):
     ]
 
 
-def test_uninstall_edge_uses_sudo_when_not_root(monkeypatch, tmp_path):
-    """Verify that privileged commands are run via sudo when euid != 0."""
+def test_uninstall_edge_exits_when_not_root(monkeypatch, tmp_path):
+    """Verify that uninstall exits with an error when not run as root."""
     config_dir = tmp_path / "cyberwave-config"
     config_dir.mkdir()
     (config_dir / "credentials.json").write_text("{}\n", encoding="utf-8")
 
     unit_path = tmp_path / "cyberwave-edge-core.service"
     unit_path.write_text("[Unit]\nDescription=Test\n", encoding="utf-8")
-
-    run_calls: list[list[str]] = []
 
     fake_config = ModuleType("cyberwave_cli.config")
     fake_config.CONFIG_DIR = config_dir
@@ -208,19 +202,11 @@ def test_uninstall_edge_uses_sudo_when_not_root(monkeypatch, tmp_path):
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
     fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
 
-    def _fake_run(command, *, check=True, **_kwargs):
-        run_calls.append(command)
-        return None
+    def _require_root_exits(hint):
+        raise SystemExit(1)
 
-    fake_core._run = _fake_run
-
-    def _fake_sudo_run(command, *, check=True, **_kwargs):
-        if 1000 != 0:  # simulates os.geteuid() != 0 inside _sudo_run
-            command = ["sudo"] + list(command)
-        run_calls.append(command)
-        return None
-
-    fake_core._sudo_run = _fake_sudo_run
+    fake_core.require_root = _require_root_exits
+    fake_core._run = lambda command, **_kw: None
 
     fake_credentials = ModuleType("cyberwave_cli.credentials")
     fake_credentials.load_credentials = lambda: None
@@ -241,12 +227,11 @@ def test_uninstall_edge_uses_sudo_when_not_root(monkeypatch, tmp_path):
     monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", lambda: None)
     monkeypatch.setattr(edge_module.os, "geteuid", lambda: 1000)
 
-    edge_module.uninstall_edge.callback(yes=True)
-
-    assert ["sudo", "systemctl", "stop", "cyberwave-edge-core.service"] in run_calls
-    assert ["sudo", "systemctl", "disable", "cyberwave-edge-core.service"] in run_calls
-    assert ["sudo", "rm", "-f", str(unit_path)] in run_calls
-    assert ["sudo", "systemctl", "daemon-reload"] in run_calls
+    try:
+        edge_module.uninstall_edge.callback(yes=True)
+        raise AssertionError("Expected SystemExit(1)")
+    except SystemExit as exc:
+        assert exc.code == 1
 
 
 def test_uninstall_edge_removes_detected_channel_package(monkeypatch, tmp_path):
@@ -267,17 +252,13 @@ def test_uninstall_edge_removes_detected_channel_package(monkeypatch, tmp_path):
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
     fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core-dev"
+    fake_core.require_root = lambda hint: None
 
     def _fake_run(command, *, check=True, **_kwargs):
         run_calls.append(command)
         return None
 
-    def _fake_sudo_run(command, *, check=True, **_kwargs):
-        run_calls.append(command)
-        return None
-
     fake_core._run = _fake_run
-    fake_core._sudo_run = _fake_sudo_run
 
     fake_credentials = ModuleType("cyberwave_cli.credentials")
     fake_credentials.load_credentials = lambda: None

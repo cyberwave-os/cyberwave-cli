@@ -290,25 +290,20 @@ def _run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.Complete
     return subprocess.run(cmd, check=check, **kwargs)
 
 
-def _sudo_run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.CompletedProcess:
-    """Run a subprocess, prepending ``sudo`` when the current user is not root."""
-    if os.geteuid() != 0:
-        cmd = ["sudo"] + cmd
-    return _run(cmd, check=check, **kwargs)
+def require_root(hint: str) -> None:
+    """Exit with a clear message if the current process is not running as root.
 
-
-def _sudo_systemctl(action: str, unit: str, *, check: bool = True) -> subprocess.CompletedProcess:
-    """Run ``systemctl <action> <unit>``, escalating via ``sudo`` when not root.
-
-    Prints the same "Root privileges required" notification used by
-    ``setup_service`` so the user experience is consistent across all
-    CLI commands that manage systemd services.
+    Call this at the top of any command that needs root privileges so
+    the user gets a single, upfront prompt to re-run with ``sudo``.
     """
-    cmd = ["systemctl", action, unit]
     if os.geteuid() != 0:
-        console.print("[cyan]Root privileges required — requesting sudo...[/cyan]")
-        cmd = ["sudo"] + cmd
-    return _run(cmd, check=check)
+        console.print(
+            f"[red]This command requires root privileges.[/red]\n"
+            f"[dim]Re-run with sudo: {hint}[/dim]"
+        )
+        raise SystemExit(1)
+
+
 
 
 # Re-exported from interactive_select for backward compat.
@@ -1712,7 +1707,7 @@ def _install_docker() -> bool:
 
     if os.geteuid() != 0:
         console.print(
-            "[red]Docker installation requires root permissions.[/red]\n"
+            "[red]Docker installation requires root privileges.[/red]\n"
             "[dim]Re-run with sudo: sudo cyberwave edge install[/dim]"
         )
         return False
@@ -1998,7 +1993,7 @@ def enable_and_start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
 def restart_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
     """Restart the systemd service described by ``spec``.
 
-    Returns True on success.
+    Requires root privileges.  Returns True on success.
     """
     if not _has_systemd():
         console.print("[yellow]systemd not detected — cannot restart via systemd.[/yellow]")
@@ -2008,8 +2003,10 @@ def restart_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
         console.print(f"[red]Service unit not found — run '{spec.sudo_command_hint}' first.[/red]")
         return False
 
+    require_root(f"sudo {spec.install_command_hint.rsplit(' ', 1)[0]} restart")
+
     try:
-        _sudo_systemctl("restart", spec.unit_name)
+        _run(["systemctl", "restart", spec.unit_name])
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]systemctl restart failed (exit {exc.returncode}).[/red]")
         return False
@@ -2021,7 +2018,7 @@ def restart_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
 def stop_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
     """Stop the systemd service described by ``spec``.
 
-    Returns True on success.
+    Requires root privileges.  Returns True on success.
     """
     if not _has_systemd():
         console.print("[yellow]systemd not detected — cannot stop via systemd.[/yellow]")
@@ -2031,8 +2028,10 @@ def stop_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
         console.print(f"[red]Service unit not found — run '{spec.sudo_command_hint}' first.[/red]")
         return False
 
+    require_root(f"sudo {spec.install_command_hint.rsplit(' ', 1)[0]} stop")
+
     try:
-        _sudo_systemctl("stop", spec.unit_name)
+        _run(["systemctl", "stop", spec.unit_name])
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]systemctl stop failed (exit {exc.returncode}).[/red]")
         return False
@@ -2052,7 +2051,8 @@ def start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
     config changes — they should use ``cyberwave edge restart`` for
     that.
 
-    Returns True on success or when the service was already active.
+    Requires root privileges.  Returns True on success or when the
+    service was already active.
     """
     if not _has_systemd():
         return False
@@ -2060,19 +2060,19 @@ def start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
         console.print(f"[red]Service unit not found — run '{spec.sudo_command_hint}' first.[/red]")
         return False
     if is_service_active(spec):
-        # Derive ``cyberwave <namespace> restart`` from the install hint
-        # (e.g. ``cyberwave edge install`` -> ``cyberwave edge restart``)
-        # so the message stays correct for both edge-core and cloud-node.
         restart_hint = spec.install_command_hint.rsplit(" ", 1)[0] + " restart"
         console.print(
             f"[yellow]{spec.unit_name} is already running — `systemctl start` is a no-op.[/yellow]"
         )
         console.print(
             "[dim]To apply config changes (re-run boot-time driver startup, "
-            f"reload twins, etc.) use: {restart_hint}[/dim]"
+            f"reload twins, etc.) use: sudo {restart_hint}[/dim]"
         )
         return True
-    result = _sudo_systemctl("start", spec.unit_name, check=False)
+
+    require_root(f"sudo {spec.install_command_hint.rsplit(' ', 1)[0]} start")
+
+    result = _run(["systemctl", "start", spec.unit_name], check=False)
     if result.returncode == 0:
         console.print(f"[green]✓ Started {spec.unit_name}[/green]")
         return True
@@ -2352,35 +2352,11 @@ def setup_service(
     macos_launchagent_supported = _is_macos() and spec.supports_macos_launchagent
 
     if linux_service_setup and os.geteuid() != 0:
-        if os.environ.get("_CYBERWAVE_SUDO_ESCALATED"):
-            console.print(
-                f"[red]Still not root after sudo escalation.[/red]\n"
-                f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
-            )
-            return False
-        console.print("[cyan]Root privileges required — requesting sudo...[/cyan]")
-        try:
-            child_env = {
-                **os.environ,
-                "CYBERWAVE_EDGE_CONFIG_DIR": str(CONFIG_DIR),
-                "_CYBERWAVE_SUDO_ESCALATED": "1",
-            }
-            preserve_keys = sorted(
-                k for k in child_env if k.startswith("CYBERWAVE_") or k.startswith("_CYBERWAVE_")
-            )
-            preserve_arg = f"--preserve-env={','.join(preserve_keys)}"
-            result = subprocess.run(
-                ["sudo", preserve_arg] + sys.argv,
-                env=child_env,
-            )
-            return result.returncode == 0
-        except FileNotFoundError:
-            console.print(
-                f"[red]sudo not found.[/red]\n[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
-            )
-            return False
-        except KeyboardInterrupt:
-            return False
+        console.print(
+            f"[red]This command requires root privileges.[/red]\n"
+            f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
+        )
+        return False
 
     if macos_launchagent_supported and os.geteuid() == 0:
         console.print(

@@ -132,6 +132,8 @@ def _load_compute_module(monkeypatch, fake_core=None, fake_config=None):
         fake_core.create_launchagent_service = lambda spec, config_path=None: True
     if not hasattr(fake_core, "load_launchagent_service"):
         fake_core.load_launchagent_service = lambda spec: True
+    if not hasattr(fake_core, "require_root"):
+        fake_core.require_root = lambda hint: None
     fake_credentials = sys.modules.get("cyberwave_cli.credentials")
     if fake_credentials is None:
         fake_credentials = ModuleType("cyberwave_cli.credentials")

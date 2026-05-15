@@ -276,7 +276,9 @@ def uninstall_cloud_node(yes: bool) -> None:
         return
 
     # Stop and disable the service
-    from ..core import _run
+    from ..core import _run, require_root
+
+    require_root(spec.sudo_command_hint.replace("install", "uninstall"))
 
     try:
         _run(["systemctl", "stop", spec.unit_name], check=False)
@@ -297,10 +299,7 @@ def uninstall_cloud_node(yes: bool) -> None:
             except FileNotFoundError:
                 pass
         except PermissionError:
-            console.print(
-                "[red]Permission denied removing systemd unit file.[/red]\n"
-                f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
-            )
+            console.print("[red]Permission denied removing systemd unit file.[/red]")
 
     # Remove the package: --yes answers this prompt automatically; otherwise ask.
     installed_pkg = _resolve_installed_service_package_name(spec)
