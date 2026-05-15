@@ -121,15 +121,18 @@ def test_uninstall_edge_stops_driver_containers(monkeypatch, tmp_path):
     fake_core.SYSTEMD_UNIT_PATH = unit_path
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
-    fake_core._resolve_installed_edge_core_package_name = (
-        lambda: "cyberwave-edge-core"
-    )
+    fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
 
     def _fake_run(command, *, check=True, **_kwargs):
         run_calls.append(command)
         return None
 
+    def _fake_sudo_run(command, *, check=True, **_kwargs):
+        run_calls.append(command)
+        return None
+
     fake_core._run = _fake_run
+    fake_core._sudo_run = _fake_sudo_run
 
     fake_credentials = ModuleType("cyberwave_cli.credentials")
     fake_credentials.load_credentials = lambda: SimpleNamespace(
@@ -144,9 +147,13 @@ def test_uninstall_edge_stops_driver_containers(monkeypatch, tmp_path):
         backend_cleanup_calls.append(kwargs)
         return (1, 0)
 
+    fake_macos = ModuleType("cyberwave_cli.macos")
+    fake_macos.is_macos = lambda: False
+
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
 
     def _fake_stop_driver_containers(_runner):
         stop_calls.append(True)
@@ -157,12 +164,15 @@ def test_uninstall_edge_stops_driver_containers(monkeypatch, tmp_path):
         edge_module, "_delete_registered_edges_for_fingerprint", _fake_backend_cleanup
     )
     monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", lambda: None)
+    monkeypatch.setattr(edge_module.os, "geteuid", lambda: 0)
 
     edge_module.uninstall_edge.callback(yes=True)
 
     assert stop_calls == [True]
     assert ["systemctl", "stop", "cyberwave-edge-core.service"] in run_calls
     assert ["systemctl", "disable", "cyberwave-edge-core.service"] in run_calls
+    assert ["rm", "-f", str(unit_path)] in run_calls
+    assert ["systemctl", "daemon-reload"] in run_calls
     assert not config_dir.exists()
     assert backend_cleanup_calls == [
         {
@@ -172,6 +182,71 @@ def test_uninstall_edge_stops_driver_containers(monkeypatch, tmp_path):
             "workspace_uuid": "workspace-123",
         }
     ]
+
+
+def test_uninstall_edge_uses_sudo_when_not_root(monkeypatch, tmp_path):
+    """Verify that privileged commands are run via sudo when euid != 0."""
+    config_dir = tmp_path / "cyberwave-config"
+    config_dir.mkdir()
+    (config_dir / "credentials.json").write_text("{}\n", encoding="utf-8")
+
+    unit_path = tmp_path / "cyberwave-edge-core.service"
+    unit_path.write_text("[Unit]\nDescription=Test\n", encoding="utf-8")
+
+    run_calls: list[list[str]] = []
+
+    fake_config = ModuleType("cyberwave_cli.config")
+    fake_config.CONFIG_DIR = config_dir
+    fake_config.clean_subprocess_env = lambda: {}
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.PACKAGE_NAME = "cyberwave-edge-core"
+    fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
+    fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
+    fake_core.SYSTEMD_UNIT_PATH = unit_path
+    fake_core._is_macos = lambda: False
+    fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
+    fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
+
+    def _fake_run(command, *, check=True, **_kwargs):
+        run_calls.append(command)
+        return None
+
+    fake_core._run = _fake_run
+
+    def _fake_sudo_run(command, *, check=True, **_kwargs):
+        if 1000 != 0:  # simulates os.geteuid() != 0 inside _sudo_run
+            command = ["sudo"] + list(command)
+        run_calls.append(command)
+        return None
+
+    fake_core._sudo_run = _fake_sudo_run
+
+    fake_credentials = ModuleType("cyberwave_cli.credentials")
+    fake_credentials.load_credentials = lambda: None
+
+    fake_macos = ModuleType("cyberwave_cli.macos")
+    fake_macos.is_macos = lambda: False
+
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
+    monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", lambda _runner: [])
+    monkeypatch.setattr(
+        edge_module,
+        "_delete_registered_edges_for_fingerprint",
+        lambda **_kwargs: (0, 0),
+    )
+    monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", lambda: None)
+    monkeypatch.setattr(edge_module.os, "geteuid", lambda: 1000)
+
+    edge_module.uninstall_edge.callback(yes=True)
+
+    assert ["sudo", "systemctl", "stop", "cyberwave-edge-core.service"] in run_calls
+    assert ["sudo", "systemctl", "disable", "cyberwave-edge-core.service"] in run_calls
+    assert ["sudo", "rm", "-f", str(unit_path)] in run_calls
+    assert ["sudo", "systemctl", "daemon-reload"] in run_calls
 
 
 def test_uninstall_edge_removes_detected_channel_package(monkeypatch, tmp_path):
@@ -191,22 +266,29 @@ def test_uninstall_edge_removes_detected_channel_package(monkeypatch, tmp_path):
     fake_core.SYSTEMD_UNIT_PATH = unit_path
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
-    fake_core._resolve_installed_edge_core_package_name = (
-        lambda: "cyberwave-edge-core-dev"
-    )
+    fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core-dev"
 
     def _fake_run(command, *, check=True, **_kwargs):
         run_calls.append(command)
         return None
 
+    def _fake_sudo_run(command, *, check=True, **_kwargs):
+        run_calls.append(command)
+        return None
+
     fake_core._run = _fake_run
+    fake_core._sudo_run = _fake_sudo_run
 
     fake_credentials = ModuleType("cyberwave_cli.credentials")
     fake_credentials.load_credentials = lambda: None
 
+    fake_macos = ModuleType("cyberwave_cli.macos")
+    fake_macos.is_macos = lambda: False
+
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
     monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", lambda _runner: [])
     monkeypatch.setattr(
         edge_module,
@@ -214,6 +296,7 @@ def test_uninstall_edge_removes_detected_channel_package(monkeypatch, tmp_path):
         lambda **_kwargs: (0, 0),
     )
     monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", lambda: None)
+    monkeypatch.setattr(edge_module.os, "geteuid", lambda: 0)
     monkeypatch.setattr(
         edge_module.Confirm,
         "ask",
@@ -251,12 +334,18 @@ def test_uninstall_edge_macos_removes_launchagent_and_uninstalls_package(monkeyp
     fake_credentials = ModuleType("cyberwave_cli.credentials")
     fake_credentials.load_credentials = lambda: None
 
+    fake_macos = ModuleType("cyberwave_cli.macos")
+    fake_macos.is_macos = lambda: True
+
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
     monkeypatch.setattr(edge_module.os, "getuid", lambda: 501)
     monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", lambda _runner: [])
-    monkeypatch.setattr(edge_module, "_delete_registered_edges_for_fingerprint", lambda **_kwargs: (0, 0))
+    monkeypatch.setattr(
+        edge_module, "_delete_registered_edges_for_fingerprint", lambda **_kwargs: (0, 0)
+    )
     monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", lambda: None)
 
     def _fake_run(command, **_kwargs):
@@ -270,7 +359,14 @@ def test_uninstall_edge_macos_removes_launchagent_and_uninstalls_package(monkeyp
     assert not config_dir.exists()
     assert not plist_path.exists()
     assert ["launchctl", "bootout", "gui/501/com.cyberwave.edge.core"] in calls
-    assert [edge_module.sys.executable, "-m", "pip", "uninstall", "-y", "cyberwave-edge-core"] in calls
+    assert [
+        edge_module.sys.executable,
+        "-m",
+        "pip",
+        "uninstall",
+        "-y",
+        "cyberwave-edge-core",
+    ] in calls
 
 
 def test_delete_registered_edges_for_fingerprint_deletes_only_matching_workspace(monkeypatch):

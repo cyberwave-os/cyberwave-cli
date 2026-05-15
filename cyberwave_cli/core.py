@@ -290,6 +290,13 @@ def _run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.Complete
     return subprocess.run(cmd, check=check, **kwargs)
 
 
+def _sudo_run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.CompletedProcess:
+    """Run a subprocess, prepending ``sudo`` when the current user is not root."""
+    if os.geteuid() != 0:
+        cmd = ["sudo"] + cmd
+    return _run(cmd, check=check, **kwargs)
+
+
 def _sudo_systemctl(action: str, unit: str, *, check: bool = True) -> subprocess.CompletedProcess:
     """Run ``systemctl <action> <unit>``, escalating via ``sudo`` when not root.
 

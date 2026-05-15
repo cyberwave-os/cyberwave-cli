@@ -289,8 +289,7 @@ def _ensure_macos_launchagent_installed() -> bool:
     if _macos_launchagent_plist_path().exists():
         return True
     console.print(
-        "[red]LaunchAgent plist not found.[/red]\n"
-        "[dim]Run 'cyberwave edge install' first.[/dim]"
+        "[red]LaunchAgent plist not found.[/red]\n[dim]Run 'cyberwave edge install' first.[/dim]"
     )
     return False
 
@@ -458,8 +457,8 @@ def uninstall_edge(yes):
 
     \b
     Examples:
-        sudo cyberwave edge uninstall
-        sudo cyberwave edge uninstall -y
+        cyberwave edge uninstall
+        cyberwave edge uninstall -y
     """
     from ...config import CONFIG_DIR
     from ...core import (
@@ -478,16 +477,12 @@ def uninstall_edge(yes):
     workspace_uuid = str(getattr(creds, "workspace_uuid", "") or "") if creds else None
     base_url = str(getattr(creds, "cyberwave_base_url", "") or "") if creds else None
 
-    service_label = (
-        "edge-core LaunchAgent" if is_macos() else SYSTEMD_UNIT_NAME
-    )
+    service_label = "edge-core LaunchAgent" if is_macos() else SYSTEMD_UNIT_NAME
 
     if not yes:
         from rich.prompt import Confirm as RichConfirm
 
-        if not RichConfirm.ask(
-            f"Remove {service_label} and disable boot service?", default=False
-        ):
+        if not RichConfirm.ask(f"Remove {service_label} and disable boot service?", default=False):
             console.print("[dim]Aborted.[/dim]")
             return
 
@@ -583,12 +578,17 @@ def uninstall_edge(yes):
         console.print(f"[green]{EDGE_CORE_SPEC.package_name} service removed.[/green]")
         return
 
-    from ...core import SYSTEMD_UNIT_PATH, _run
+    from ...core import SYSTEMD_UNIT_PATH, _run, _sudo_run
+
+    if os.geteuid() != 0:
+        console.print(
+            "[cyan]Root privileges required — requesting sudo for service management...[/cyan]"
+        )
 
     # Stop and disable the service
     try:
-        _run(["systemctl", "stop", SYSTEMD_UNIT_NAME], check=False)
-        _run(["systemctl", "disable", SYSTEMD_UNIT_NAME], check=False)
+        _sudo_run(["systemctl", "stop", SYSTEMD_UNIT_NAME], check=False)
+        _sudo_run(["systemctl", "disable", SYSTEMD_UNIT_NAME], check=False)
     except FileNotFoundError:
         console.print("[yellow]systemctl not found — skipping service cleanup.[/yellow]")
 
@@ -597,15 +597,15 @@ def uninstall_edge(yes):
     # Remove the systemd unit file
     if SYSTEMD_UNIT_PATH.exists():
         try:
-            SYSTEMD_UNIT_PATH.unlink()
+            _sudo_run(["rm", "-f", str(SYSTEMD_UNIT_PATH)], check=True)
             console.print(f"[green]Removed:[/green] {SYSTEMD_UNIT_PATH}")
             try:
-                _run(["systemctl", "daemon-reload"], check=False)
+                _sudo_run(["systemctl", "daemon-reload"], check=False)
             except FileNotFoundError:
                 pass
-        except PermissionError:
+        except subprocess.CalledProcessError:
             console.print(
-                f"[red]Permission denied removing {SYSTEMD_UNIT_PATH}.[/red]\n"
+                f"[red]Failed to remove {SYSTEMD_UNIT_PATH}.[/red]\n"
                 "[dim]Re-run with sudo: sudo cyberwave edge uninstall[/dim]"
             )
 
@@ -622,9 +622,7 @@ def uninstall_edge(yes):
         from rich.prompt import Confirm as RichConfirm
 
         installed_package_name = _resolve_installed_edge_core_package_name()
-        if RichConfirm.ask(
-            f"Also uninstall {installed_package_name} package?", default=False
-        ):
+        if RichConfirm.ask(f"Also uninstall {installed_package_name} package?", default=False):
             if is_macos():
                 try:
                     _run(
@@ -635,7 +633,7 @@ def uninstall_edge(yes):
                     console.print("[yellow]pip uninstall failed — remove manually.[/yellow]")
             elif shutil.which("apt-get"):
                 try:
-                    _run(["apt-get", "remove", "-y", installed_package_name], check=False)
+                    _sudo_run(["apt-get", "remove", "-y", installed_package_name], check=False)
                 except FileNotFoundError:
                     console.print("[yellow]apt-get not found — remove manually with pip.[/yellow]")
             else:
@@ -683,7 +681,14 @@ def start_edge(env_file, foreground):
     ``cyberwave edge restart`` to force a full reload of twin/asset
     metadata and re-spawn driver containers.
     """
-    from ...core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, load_launchagent_service, start_service
+    from ...core import (
+        EDGE_CORE_SPEC,
+        SYSTEMD_UNIT_PATH,
+        _has_systemd,
+        _is_macos,
+        load_launchagent_service,
+        start_service,
+    )
 
     spec = EDGE_CORE_SPEC
 
@@ -808,7 +813,9 @@ def stop_edge():
             return
 
         if result.returncode in {3, 36}:
-            console.print(f"[yellow]{EDGE_CORE_SPEC.package_name} LaunchAgent is not loaded.[/yellow]")
+            console.print(
+                f"[yellow]{EDGE_CORE_SPEC.package_name} LaunchAgent is not loaded.[/yellow]"
+            )
             return
 
         console.print(f"[red]launchctl bootout failed (exit {result.returncode}).[/red]")
@@ -849,7 +856,14 @@ def restart_edge(env_file):
         sudo cyberwave edge restart
         cyberwave edge restart --env-file /path/to/.env
     """
-    from ...core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, load_launchagent_service, restart_service
+    from ...core import (
+        EDGE_CORE_SPEC,
+        SYSTEMD_UNIT_PATH,
+        _has_systemd,
+        _is_macos,
+        load_launchagent_service,
+        restart_service,
+    )
 
     if _has_systemd() and SYSTEMD_UNIT_PATH.exists():
         restart_service()
@@ -929,8 +943,16 @@ def _inspect_container_twin_uuid(container_name: str) -> str:
     """Extract CYBERWAVE_TWIN_UUID from a driver container's env vars."""
     try:
         result = subprocess.run(
-            ["docker", "inspect", "--format", "{{range .Config.Env}}{{println .}}{{end}}", container_name],
-            capture_output=True, text=True, timeout=5,
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{range .Config.Env}}{{println .}}{{end}}",
+                container_name,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         for line in result.stdout.splitlines():
             if line.startswith("CYBERWAVE_TWIN_UUID="):
@@ -944,8 +966,16 @@ def _inspect_container_twin_uuids(container_name: str) -> list[str]:
     """Extract CYBERWAVE_TWIN_UUIDS from a worker container's env vars."""
     try:
         result = subprocess.run(
-            ["docker", "inspect", "--format", "{{range .Config.Env}}{{println .}}{{end}}", container_name],
-            capture_output=True, text=True, timeout=5,
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{range .Config.Env}}{{println .}}{{end}}",
+                container_name,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         for line in result.stdout.splitlines():
             if line.startswith("CYBERWAVE_TWIN_UUIDS="):
@@ -1002,9 +1032,13 @@ def status_edge():
     try:
         result = subprocess.run(
             [
-                "docker", "ps", "-a",
-                "--filter", "name=cyberwave-driver",
-                "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}",
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                "name=cyberwave-driver",
+                "--format",
+                "{{.Names}}\t{{.Image}}\t{{.Status}}",
             ],
             capture_output=True,
             text=True,
@@ -1012,9 +1046,7 @@ def status_edge():
         lines = [ln for ln in result.stdout.strip().splitlines() if ln]
         if lines:
             running_count = sum(1 for ln in lines if "Up " in ln.split("\t", 2)[-1])
-            console.print(
-                f"[green]Driver containers: {running_count}/{len(lines)} running[/green]"
-            )
+            console.print(f"[green]Driver containers: {running_count}/{len(lines)} running[/green]")
             for line in lines:
                 parts = line.split("\t")
                 name = parts[0]
@@ -1039,9 +1071,13 @@ def status_edge():
     try:
         result = subprocess.run(
             [
-                "docker", "ps", "-a",
-                "--filter", "name=cyberwave-worker",
-                "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}",
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                "name=cyberwave-worker",
+                "--format",
+                "{{.Names}}\t{{.Image}}\t{{.Status}}",
             ],
             capture_output=True,
             text=True,
@@ -1123,7 +1159,9 @@ def list_cameras(as_json: bool, save: bool):
             style_open = "[dim]" if dim else ""
             style_close = "[/dim]" if dim else ""
             tag = "  (probably not a camera)" if dim else ""
-            console.print(f"  {style_open}[bold cyan]{idx_str}[/bold cyan])  {cam.card}{tag}{style_close}")
+            console.print(
+                f"  {style_open}[bold cyan]{idx_str}[/bold cyan])  {cam.card}{tag}{style_close}"
+            )
             if cam.primary_path:
                 console.print(f"  {style_open}     Device: {cam.primary_path}{style_close}")
             if cam.bus_info:
@@ -1211,7 +1249,9 @@ def show_logs(follow, lines):
         "journalctl",
         "-u",
         service_name,
-        f"-n{lines}", "--no-pager", "--output=cat",
+        f"-n{lines}",
+        "--no-pager",
+        "--output=cat",
     ]
     if follow:
         cmd.append("-f")
