@@ -1973,6 +1973,11 @@ def create_systemd_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
 def enable_and_start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
     """Enable the service described by ``spec`` to start on boot, then start it now.
 
+    Uses ``restart`` instead of ``start`` so that a re-install picks up
+    the updated ``environment.json`` / twin selection without requiring
+    a manual ``systemctl restart``.  On a fresh install the service is
+    not yet active, so ``restart`` behaves identically to ``start``.
+
     Returns True on success.
     """
     if not spec.unit_path.exists():
@@ -1982,7 +1987,7 @@ def enable_and_start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
     try:
         _run(["systemctl", "daemon-reload"])
         _run(["systemctl", "enable", spec.unit_name])
-        _run(["systemctl", "start", spec.unit_name])
+        _run(["systemctl", "restart", spec.unit_name])
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]systemctl command failed (exit {exc.returncode}).[/red]")
         return False
