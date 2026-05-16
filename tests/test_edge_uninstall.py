@@ -315,8 +315,11 @@ def test_uninstall_edge_macos_removes_launchagent_and_uninstalls_package(monkeyp
     fake_credentials = ModuleType("cyberwave_cli.credentials")
     fake_credentials.load_credentials = lambda: None
 
+    camera_teardown_calls: list[bool] = []
+
     fake_macos = ModuleType("cyberwave_cli.macos")
     fake_macos.is_macos = lambda: True
+    fake_macos._teardown_camera_stream_server = lambda: camera_teardown_calls.append(True)
 
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
@@ -331,7 +334,7 @@ def test_uninstall_edge_macos_removes_launchagent_and_uninstalls_package(monkeyp
 
     def _fake_run(command, **_kwargs):
         calls.append(command)
-        return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(edge_module.subprocess, "run", _fake_run)
 
@@ -339,6 +342,7 @@ def test_uninstall_edge_macos_removes_launchagent_and_uninstalls_package(monkeyp
 
     assert not config_dir.exists()
     assert not plist_path.exists()
+    assert camera_teardown_calls == [True]
     assert ["launchctl", "bootout", "gui/501/com.cyberwave.edge.core"] in calls
     assert [
         edge_module.sys.executable,

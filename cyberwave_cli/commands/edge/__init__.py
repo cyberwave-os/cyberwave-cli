@@ -567,6 +567,7 @@ def uninstall_edge(yes):
 
     if _is_macos():
         from ...config import clean_subprocess_env
+        from ...macos import _teardown_camera_stream_server
 
         _domain, target = _macos_launchagent_target()
         plist_path = _macos_launchagent_plist_path()
@@ -587,6 +588,15 @@ def uninstall_edge(yes):
             console.print("[yellow]launchctl not found — skipping LaunchAgent unload.[/yellow]")
 
         _kill_lingering_edge_processes()
+
+        # Tear down MJPEG camera stream LaunchAgents and kill ffmpeg
+        # processes so the camera LED turns off and the port is released.
+        try:
+            _teardown_camera_stream_server()
+        except Exception as exc:
+            console.print(
+                f"[yellow]Camera stream teardown encountered an error: {exc}[/yellow]"
+            )
 
         if plist_path.exists():
             try:
