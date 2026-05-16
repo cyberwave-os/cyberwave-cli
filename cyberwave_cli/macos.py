@@ -837,7 +837,7 @@ _CAMERA_STREAM_WRAPPER_TEMPLATE = textwrap.dedent("""\
     export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
     DEVICE="${{CYBERWAVE_CAMERA_DEVICE:-0}}"
     PORT="${{CYBERWAVE_CAMERA_STREAM_PORT:-{port}}}"
-    RESOLUTION="${{CYBERWAVE_CAMERA_STREAM_RESOLUTION:-1280x720}}"
+    RESOLUTION="${{CYBERWAVE_CAMERA_STREAM_RESOLUTION:-640x480}}"
     FPS="${{CYBERWAVE_CAMERA_STREAM_FPS:-30}}"
 
     # ffmpeg's ``-listen 1`` HTTP server is single-shot: when the consumer
@@ -860,11 +860,16 @@ _CAMERA_STREAM_WRAPPER_TEMPLATE = textwrap.dedent("""\
     # port-in-use / device-busy, etc.).  Wrapping with ``|| true`` would
     # always collapse it to 0 and hide the cause.
     while true; do
+        # Capture at the camera's native rate (AVFoundation on macOS only
+        # reliably accepts the device's advertised primary fps, e.g. 30 — it
+        # rejects "15" even when the format string lists it).  We rate-control
+        # on the output side via ``-r "$FPS"`` so the published MJPEG stream
+        # is exactly $FPS.
         ffmpeg -hide_banner -loglevel warning \\
             -fflags nobuffer -flags low_delay -avioflags direct \\
-            -f avfoundation -framerate "$FPS" -video_size "$RESOLUTION" \\
+            -f avfoundation -framerate 30 -video_size "$RESOLUTION" \\
             -thread_queue_size 1 -i "$DEVICE" \\
-            -c:v mjpeg -q:v 5 \\
+            -c:v mjpeg -q:v 5 -r "$FPS" \\
             -fflags nobuffer -flush_packets 1 \\
             -f mjpeg \\
             -listen 1 \\
