@@ -837,7 +837,11 @@ _CAMERA_STREAM_WRAPPER_TEMPLATE = textwrap.dedent("""\
     export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
     DEVICE="${{CYBERWAVE_CAMERA_DEVICE:-0}}"
     PORT="${{CYBERWAVE_CAMERA_STREAM_PORT:-{port}}}"
-    RESOLUTION="${{CYBERWAVE_CAMERA_STREAM_RESOLUTION:-640x480}}"
+    # MacBook / USB / phone cameras are 16:9 sensors (1280x720, 1920x1080).
+    # AVFoundation honours 1280x720 directly; 640x480 forces a 4:3 crop or
+    # pillarbox that the 16:9 viewer then has to re-letterbox. Default to
+    # 1280x720; override with CYBERWAVE_CAMERA_STREAM_RESOLUTION when needed.
+    RESOLUTION="${{CYBERWAVE_CAMERA_STREAM_RESOLUTION:-1280x720}}"
     FPS="${{CYBERWAVE_CAMERA_STREAM_FPS:-30}}"
 
     # ffmpeg's ``-listen 1`` HTTP server is single-shot: when the consumer
