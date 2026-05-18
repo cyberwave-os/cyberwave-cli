@@ -8,6 +8,8 @@ Resolves asset identifiers from multiple sources:
 - URL: "https://example.com/asset.json"
 """
 
+from __future__ import annotations
+
 import json
 import logging
 from pathlib import Path

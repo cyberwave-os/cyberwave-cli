@@ -27,6 +27,7 @@ dpkg -i "${PACKAGE_FILE}"
 
 echo "=== Verifying installed binary ==="
 /usr/bin/cyberwave --help
+/usr/bin/cyberwave __selfcheck_sdk
 /usr/bin/cyberwave login --help
 /usr/bin/cyberwave camera --help
 echo "Package install works on ${DEVICE_NAME} (${DEVICE_DISTRO})"

@@ -1,6 +1,6 @@
 [project]
 name = "cyberwave-cli"
-version = "0.11.44"
+version = "0.12.5"
 description = "The official command-line interface for Cyberwave"
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
@@ -22,10 +22,12 @@ classifiers = [
 ]
 
 dependencies = [
-    "click>=8.1.0",
-    "httpx>=0.25.0",
-    "rich>=13.0.0",
-    "cyberwave>=0.3.31",
+    "click==8.3.3",
+    "eclipse-zenoh==1.9.0",
+    "httpx==0.28.1",
+    "packaging==26.2",
+    "rich==15.0.0",
+    "cyberwave>=0.4.6",
 ]
 
 [project.optional-dependencies]

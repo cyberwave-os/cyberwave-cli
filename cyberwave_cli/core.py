@@ -6,37 +6,60 @@ This module provides the logic for:
   3. Enabling and starting the service
 """
 
-import importlib
+from __future__ import annotations
+
 import json
 import os
 import platform
+import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
-from .auth import APIToken, AuthClient, AuthenticationError
-from .config import CONFIG_DIR, clean_subprocess_env, get_api_url
+from .config import (
+    CONFIG_DIR,
+    LEGACY_SYSTEM_CONFIG_DIR,
+    chown_to_sudo_user,
+    clean_subprocess_env,
+    ensure_edge_core_importable,
+    get_api_url,
+)
 from .credentials import (
     Credentials,
     collect_runtime_env_overrides,
     load_credentials,
     save_credentials,
 )
-from cyberwave.fingerprint import generate_fingerprint
+
+from .macos import (
+    bootstrap_launchd_service,
+    is_macos,
+    legacy_labels_for_package,
+    setup_camera_stream_server,
+    setup_usbip_server,
+    wait_for_launchd_unload,
+)
+from .macos import init_console as _init_macos_console
 
 console = Console()
+_init_macos_console(console)
 
 # ---- constants ---------------------------------------------------------------
 
 PACKAGE_NAME = "cyberwave-edge-core"
+BUILDKITE_ORG_SLUG = "cyberwave"
+INTERNAL_DEB_REGISTRY_SLUG = "cyberwave-internal-deb"
+INTERNAL_DEB_READ_TOKEN_ENV = "CYBERWAVE_INTERNAL_DEB_READ_TOKEN"
 EDGE_CORE_PACKAGE_CHANNELS = {
     "stable": PACKAGE_NAME,
     "dev": "cyberwave-edge-core-dev",
@@ -56,15 +79,19 @@ BUILDKITE_KEYRING_PATH = Path("/etc/apt/keyrings/cyberwave_cyberwave-edge-core-a
 SYSTEMD_UNIT_TEMPLATE = textwrap.dedent("""\
     [Unit]
     Description=Cyberwave Edge Core Orchestrator
-    After=network-online.target
-    Wants=network-online.target
+    After=network-online.target docker.service
+    Wants=network-online.target docker.service
 
     [Service]
-    Type=simple
+    Type=notify
+    NotifyAccess=all
     ExecStart={binary_path}
-    Restart=on-failure
+    Restart=always
     RestartSec=5
-    Environment=CYBERWAVE_EDGE_CONFIG_DIR=/etc/cyberwave
+    WatchdogSec=60
+    TimeoutStartSec=300
+    Environment=CYBERWAVE_EDGE_CONFIG_DIR={config_dir}
+    OOMScoreAdjust=-800
     StandardOutput=journal
     StandardError=journal
     SyslogIdentifier=cyberwave-edge-core
@@ -74,6 +101,97 @@ SYSTEMD_UNIT_TEMPLATE = textwrap.dedent("""\
 """)
 
 
+@dataclass
+class ServiceSpec:
+    package_name: str
+    binary_path: Path
+    unit_name: str
+    unit_path: Path
+    package_channels: dict[str, str]
+    public_deb_registry_slug: str
+    deb_repo_url: str
+    gpg_key_url: str
+    keyring_path: Path
+    sources_list_path: Path
+    process_match: str
+    install_command_hint: str
+    sudo_command_hint: str
+    unit_template: str
+    requires_docker: bool
+    supports_macos_launchagent: bool
+    launch_command: tuple[str, ...]
+
+
+EDGE_CORE_SPEC = ServiceSpec(
+    package_name=PACKAGE_NAME,
+    binary_path=BINARY_PATH,
+    unit_name=SYSTEMD_UNIT_NAME,
+    unit_path=SYSTEMD_UNIT_PATH,
+    package_channels=EDGE_CORE_PACKAGE_CHANNELS,
+    public_deb_registry_slug="cyberwave-edge-core",
+    deb_repo_url=BUILDKITE_DEB_REPO_URL,
+    gpg_key_url=BUILDKITE_GPG_KEY_URL,
+    keyring_path=BUILDKITE_KEYRING_PATH,
+    sources_list_path=Path("/etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-edge-core.list"),
+    process_match="cyberwave-edge-core",
+    install_command_hint="cyberwave edge install",
+    sudo_command_hint="sudo cyberwave edge install",
+    unit_template=SYSTEMD_UNIT_TEMPLATE,
+    requires_docker=True,
+    supports_macos_launchagent=True,
+    launch_command=(),
+)
+
+# ---- cloud node service constants -------------------------------------------
+
+_CLOUD_NODE_PACKAGE_NAME = "cyberwave-cloud-node"
+_CLOUD_NODE_UNIT_NAME = "cyberwave-cloud-node.service"
+_CLOUD_NODE_UNIT_PATH = Path(f"/etc/systemd/system/{_CLOUD_NODE_UNIT_NAME}")
+
+_CLOUD_NODE_UNIT_TEMPLATE = textwrap.dedent("""\
+    [Unit]
+    Description=Cyberwave Cloud Node
+    After=network-online.target
+    Wants=network-online.target
+
+    [Service]
+    Type=simple
+    ExecStart={binary_path} start
+    Restart=on-failure
+    RestartSec=5
+    StandardOutput=journal
+    StandardError=journal
+    SyslogIdentifier=cyberwave-cloud-node
+
+    [Install]
+    WantedBy=multi-user.target
+""")
+
+CLOUD_NODE_SPEC = ServiceSpec(
+    package_name=_CLOUD_NODE_PACKAGE_NAME,
+    binary_path=Path("/usr/bin/cyberwave-cloud-node"),
+    unit_name=_CLOUD_NODE_UNIT_NAME,
+    unit_path=_CLOUD_NODE_UNIT_PATH,
+    package_channels={
+        "stable": "cyberwave-cloud-node",
+        "dev": "cyberwave-cloud-node-dev",
+        "staging": "cyberwave-cloud-node-staging",
+    },
+    public_deb_registry_slug="cyberwave-cloud-node",
+    deb_repo_url="https://packages.buildkite.com/cyberwave/cyberwave-cloud-node/any/",
+    gpg_key_url="https://packages.buildkite.com/cyberwave/cyberwave-cloud-node/gpgkey",
+    keyring_path=Path("/etc/apt/keyrings/cyberwave_cyberwave-cloud-node-archive-keyring.gpg"),
+    sources_list_path=Path("/etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-cloud-node.list"),
+    process_match="cyberwave-cloud-node start",
+    install_command_hint="cyberwave compute install",
+    sudo_command_hint="sudo cyberwave compute install",
+    unit_template=_CLOUD_NODE_UNIT_TEMPLATE,
+    requires_docker=False,
+    supports_macos_launchagent=True,
+    launch_command=("start",),
+)
+
+
 # ---- helpers -----------------------------------------------------------------
 
 
@@ -81,17 +199,83 @@ def _is_linux() -> bool:
     return platform.system() == "Linux"
 
 
+def _is_macos() -> bool:
+    return platform.system() == "Darwin"
+
+
 def _has_systemd() -> bool:
     return Path("/run/systemd/system").is_dir()
 
 
-def is_service_active() -> bool:
-    """Return True if the cyberwave-edge-core systemd service is currently active."""
+def _copy_and_harden(src: Path, dst: Path) -> bool:
+    """Copy *src* to *dst*, lock permissions to owner-only, and fix ownership.
+
+    Returns True on success, False on OSError.
+    """
+    try:
+        shutil.copy2(src, dst)
+        if os.name != "nt":
+            os.chmod(dst, 0o600)
+        chown_to_sudo_user(dst)
+        return True
+    except OSError:
+        return False
+
+
+def _migrate_legacy_config_dir() -> None:
+    """Copy config files from ``/etc/cyberwave`` to the user's ``~/.cyberwave``.
+
+    Old CLI versions stored config under ``/etc/cyberwave`` on Linux.  When
+    upgrading, we copy files across so the user doesn't have to re-login or
+    reconfigure.  Existing files in the target directory are never overwritten.
+    """
+    legacy = LEGACY_SYSTEM_CONFIG_DIR
+    target = CONFIG_DIR
+
+    if legacy == target:
+        return
+
+    try:
+        if not legacy.is_dir():
+            return
+    except OSError:
+        return
+
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    migrated = 0
+    try:
+        for name in ("credentials.json", "environment.json", "fingerprint.json"):
+            src = legacy / name
+            dst = target / name
+            if src.is_file() and not dst.exists() and _copy_and_harden(src, dst):
+                migrated += 1
+
+        for src in legacy.glob("*.json"):
+            if src.name in ("credentials.json", "environment.json", "fingerprint.json"):
+                continue
+            dst = target / src.name
+            if not dst.exists() and _copy_and_harden(src, dst):
+                migrated += 1
+    except OSError:
+        pass
+
+    chown_to_sudo_user(target)
+
+    if migrated:
+        console.print(f"[cyan]Migrated {migrated} config file(s) from {legacy} to {target}[/cyan]")
+
+
+def is_service_active(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
+    """Return True if the systemd service described by ``spec`` is currently active."""
     if not _has_systemd():
         return False
     try:
         result = subprocess.run(
-            ["systemctl", "is-active", SYSTEMD_UNIT_NAME],
+            ["systemctl", "is-active", spec.unit_name],
             capture_output=True,
             text=True,
         )
@@ -107,116 +291,24 @@ def _run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.Complete
     return subprocess.run(cmd, check=check, **kwargs)
 
 
-def _select_with_arrows(title: str, options: list[str]) -> int:
-    """Interactive arrow-key selector. Falls back to numeric prompt."""
-    if not options:
-        raise ValueError("options cannot be empty")
+def require_root(hint: str) -> None:
+    """Exit with a clear message if the current process is not running as root.
 
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        console.print(f"\n[bold]{title}[/bold]")
-        for idx, option in enumerate(options, 1):
-            console.print(f"  {idx}. {option}")
-        while True:
-            raw = Prompt.ask("Select option number", default="1")
-            try:
-                chosen = int(raw) - 1
-                if 0 <= chosen < len(options):
-                    return chosen
-            except ValueError:
-                pass
-            console.print(f"[red]Please enter a number between 1 and {len(options)}[/red]")
+    Call this at the top of any command that needs root privileges so
+    the user gets a single, upfront prompt to re-run with ``sudo``.
+    """
+    if os.geteuid() != 0:
+        console.print(
+            f"[red]This command requires root privileges.[/red]\n"
+            f"[dim]Re-run with sudo: {hint}[/dim]"
+        )
+        raise SystemExit(1)
 
-    try:
-        import termios
-        import tty
-    except ImportError:
-        # Non-POSIX fallback
-        console.print(f"\n[bold]{title}[/bold]")
-        for idx, option in enumerate(options, 1):
-            console.print(f"  {idx}. {option}")
-        while True:
-            raw = Prompt.ask("Select option number", default="1")
-            try:
-                chosen = int(raw) - 1
-                if 0 <= chosen < len(options):
-                    return chosen
-            except ValueError:
-                pass
-            console.print(f"[red]Please enter a number between 1 and {len(options)}[/red]")
 
-    selected = 0
-    scroll_offset = 0
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
 
-    try:
-        term_height = shutil.get_terminal_size().lines
-    except Exception:
-        term_height = 24
-    # Reserve lines for: title(1) + instructions(1) + blank(1) + scroll indicators(2)
-    max_visible = max(5, term_height - 5)
 
-    def _tty_write(text: str) -> None:
-        """Write text in raw TTY mode using CRLF line endings."""
-        sys.stdout.write(text.replace("\n", "\r\n"))
-
-    def _render() -> None:
-        nonlocal scroll_offset
-        # Keep selected item within the visible viewport
-        if selected < scroll_offset:
-            scroll_offset = selected
-        elif selected >= scroll_offset + max_visible:
-            scroll_offset = selected - max_visible + 1
-
-        _tty_write("\x1b[2J\x1b[H")
-        _tty_write(f"{title}\n")
-        _tty_write("Use \u2191/\u2193 and press Enter, q/Ctrl-C to abort\n\n")
-
-        visible_end = min(scroll_offset + max_visible, len(options))
-
-        if scroll_offset > 0:
-            _tty_write(f"  \u2191 {scroll_offset} more above\n")
-
-        for idx in range(scroll_offset, visible_end):
-            prefix = "❯" if idx == selected else " "
-            _tty_write(f"{prefix} {options[idx]}\n")
-
-        remaining = len(options) - visible_end
-        if remaining > 0:
-            _tty_write(f"  \u2193 {remaining} more below\n")
-
-        sys.stdout.flush()
-
-    try:
-        tty.setraw(fd)
-        sys.stdout.write("\x1b[?25l")
-        _render()
-        while True:
-            char = sys.stdin.read(1)
-            if char in ("\r", "\n"):
-                return selected
-            if char in ("\x03", "q", "Q"):
-                raise KeyboardInterrupt
-            if char == "\x1b":
-                nxt = sys.stdin.read(1)
-                if nxt == "[":
-                    arrow = sys.stdin.read(1)
-                    if arrow == "A":
-                        selected = (selected - 1) % len(options)
-                        _render()
-                    elif arrow == "B":
-                        selected = (selected + 1) % len(options)
-                        _render()
-            elif char.lower() == "k":
-                selected = (selected - 1) % len(options)
-                _render()
-            elif char.lower() == "j":
-                selected = (selected + 1) % len(options)
-                _render()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        sys.stdout.write("\x1b[?25h")
-        sys.stdout.flush()
+# Re-exported from interactive_select for backward compat.
+from .interactive_select import _select_with_arrows, _select_multiple_with_arrows  # noqa: E402
 
 
 def _get_sdk_client(token: str, *, base_url: str | None = None):
@@ -265,15 +357,15 @@ def _save_environment_file(
 
     os.replace(tmp_path, ENVIRONMENT_FILE)
 
-    # Keep same permission model as credentials.
     if os.name != "nt":
         os.chmod(ENVIRONMENT_FILE, 0o600)
-        # Also fsync the directory to persist the rename event.
         dir_fd = os.open(CONFIG_DIR, os.O_RDONLY)
         try:
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
+
+    chown_to_sudo_user(CONFIG_DIR, ENVIRONMENT_FILE)
 
 
 def _load_or_generate_edge_fingerprint() -> str:
@@ -286,6 +378,8 @@ def _load_or_generate_edge_fingerprint() -> str:
                 return value.strip()
         except Exception:
             pass
+
+    from cyberwave.fingerprint import generate_fingerprint
 
     return generate_fingerprint()
 
@@ -304,6 +398,8 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
     If saved credentials are found and valid, returns True immediately.
     Otherwise prompts for email/password and runs the full login flow.
     """
+    from .auth import APIToken, AuthClient, AuthenticationError
+
     creds = load_credentials()
     if creds and creds.token:
         try:
@@ -325,8 +421,12 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                         workspace_name=creds.workspace_name,
                         cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
                         cyberwave_edge_log_level=_resolved_edge_log_level(runtime_overrides),
+                        cyberwave_worker_log_level=runtime_overrides.get(
+                            "CYBERWAVE_WORKER_LOG_LEVEL"
+                        ),
                         cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
                         cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
+                        cyberwave_mqtt_port=runtime_overrides.get("CYBERWAVE_MQTT_PORT"),
                     )
                 )
             return True
@@ -335,6 +435,40 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
             console.print(e)  # print the error for debugging purposes
 
     console.print("[yellow]No valid credentials found.[/yellow]")
+    env_token = os.getenv("CYBERWAVE_API_KEY", "").strip()
+    if env_token:
+        try:
+            runtime_overrides = collect_runtime_env_overrides()
+            sdk_client = _get_sdk_client(
+                env_token,
+                base_url=runtime_overrides.get("CYBERWAVE_BASE_URL") or None,
+            )
+            with console.status("[dim]Checking CYBERWAVE_API_KEY...[/dim]"):
+                workspace = _select_workspace_from_env_or_default(
+                    sdk_client,
+                    skip_confirm=skip_confirm,
+                )
+
+            save_credentials(
+                Credentials(
+                    token=env_token,
+                    workspace_uuid=str(getattr(workspace, "uuid", "") or ""),
+                    workspace_name=str(getattr(workspace, "name", "") or ""),
+                    cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
+                    cyberwave_edge_log_level=_resolved_edge_log_level(runtime_overrides),
+                    cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
+                    cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
+                    cyberwave_mqtt_port=runtime_overrides.get("CYBERWAVE_MQTT_PORT"),
+                )
+            )
+            console.print("[green]✓[/green] Using CYBERWAVE_API_KEY from environment")
+            console.print(f"[dim]Workspace: {workspace.name}[/dim]")
+            console.print(f"[dim]Credentials saved to {CONFIG_DIR}/[/dim]\n")
+            return True
+        except Exception as e:
+            console.print("[yellow]CYBERWAVE_API_KEY is invalid or incomplete.[/yellow]")
+            console.print(e)
+
     console.print("[cyan]Please log in to continue.[/cyan]\n")
 
     email = Prompt.ask("[bold]Email[/bold]")
@@ -366,7 +500,9 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                 idx = _select_with_arrows("Select a workspace", labels)
                 workspace = workspaces[idx]
 
-            with console.status(f"[dim]Creating API token for workspace '{workspace.name}'...[/dim]"):
+            with console.status(
+                f"[dim]Creating API token for workspace '{workspace.name}'...[/dim]"
+            ):
                 api_token: APIToken = client.create_api_token(session_token, workspace.uuid)
 
             save_credentials(
@@ -379,6 +515,7 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                     cyberwave_edge_log_level=_resolved_edge_log_level(runtime_overrides),
                     cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
                     cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
+                    cyberwave_mqtt_port=runtime_overrides.get("CYBERWAVE_MQTT_PORT"),
                 )
             )
 
@@ -392,27 +529,41 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
         return False
 
 
-def _select_workspace(client: Any, *, skip_confirm: bool) -> Any:
-    """Get workspaces via SDK and let user select one."""
+def _select_workspace_from_env_or_default(client: Any, *, skip_confirm: bool) -> Any:
+    """Pick a workspace, honoring ``CYBERWAVE_WORKSPACE_SLUG`` when provided."""
     workspaces = client.workspaces.list()
-
     if not workspaces:
         raise RuntimeError("No workspaces available for this account.")
 
+    workspace_slug = os.getenv("CYBERWAVE_WORKSPACE_SLUG", "").strip().lower()
+    if workspace_slug:
+        for workspace in workspaces:
+            candidate_slug = str(getattr(workspace, "slug", "") or "").strip().lower()
+            if candidate_slug == workspace_slug:
+                console.print(f"[green]Workspace:[/green] {workspace.name}")
+                return workspace
+        raise RuntimeError(
+            f"Workspace slug '{workspace_slug}' was not found for the provided token."
+        )
+
     if len(workspaces) == 1:
-        ws = workspaces[0]
-        console.print(f"[green]Workspace:[/green] {ws.name}")
-        return ws
+        workspace = workspaces[0]
+        console.print(f"[green]Workspace:[/green] {workspace.name}")
+        return workspace
 
     if skip_confirm:
-        ws = workspaces[0]
-        console.print(f"[yellow]Auto-selecting workspace:[/yellow] {ws.name}")
-        return ws
+        workspace = workspaces[0]
+        console.print(f"[yellow]Auto-selecting workspace:[/yellow] {workspace.name}")
+        return workspace
 
-    labels = [f"{ws.name} ({str(ws.uuid)[:8]}...)" for ws in workspaces]
+    labels = [f"{workspace.name} ({str(workspace.uuid)[:8]}...)" for workspace in workspaces]
     idx = _select_with_arrows("Select a workspace", labels)
-    ws = workspaces[idx]
-    return ws
+    return workspaces[idx]
+
+
+def _select_workspace(client: Any, *, skip_confirm: bool) -> Any:
+    """Get workspaces via SDK and let user select one."""
+    return _select_workspace_from_env_or_default(client, skip_confirm=skip_confirm)
 
 
 def _resolve_workspace_from_credentials(client: Any, workspace_uuid: str) -> Any | None:
@@ -448,9 +599,7 @@ def _workspace_projects(client: Any, workspace_uuid: str) -> list[Any]:
 def _environment_workspace_uuid(environment: Any) -> str:
     """Best-effort workspace UUID extraction for environment objects."""
     workspace_uuid = str(
-        getattr(environment, "workspace_uuid", "")
-        or getattr(environment, "workspace_id", "")
-        or ""
+        getattr(environment, "workspace_uuid", "") or getattr(environment, "workspace_id", "") or ""
     )
     if workspace_uuid:
         return workspace_uuid
@@ -588,168 +737,92 @@ def _select_or_create_environment(client: Any, workspace_uuid: str, *, skip_conf
         return environments[idx]
 
 
-def _select_multiple_with_arrows(title: str, options: list[str]) -> list[int]:
-    """Interactive multi-select. Toggle with Space, confirm with Enter."""
-    if not options:
-        return []
+def _twin_has_asset(twin: Any) -> bool:
+    """Return ``True`` when the twin has an asset attached on the backend."""
+    return bool(getattr(twin, "asset_uuid", None) or getattr(twin, "asset_id", None))
 
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        console.print(f"\n[bold]{title}[/bold]")
-        for idx, option in enumerate(options, 1):
-            console.print(f"  {idx}. {option}")
-        raw = Prompt.ask(
-            "Select one or more (comma-separated numbers, empty for none)",
-            default="",
-        ).strip()
-        if not raw:
-            return []
-        selected: list[int] = []
-        for part in raw.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                idx = int(part) - 1
-            except ValueError:
-                continue
-            if 0 <= idx < len(options) and idx not in selected:
-                selected.append(idx)
-        return selected
 
-    try:
-        import termios
-        import tty
-    except ImportError:
-        console.print(f"\n[bold]{title}[/bold]")
-        for idx, option in enumerate(options, 1):
-            console.print(f"  {idx}. {option}")
-        raw = Prompt.ask(
-            "Select one or more (comma-separated numbers, empty for none)",
-            default="",
-        ).strip()
-        if not raw:
-            return []
-        selected_fallback: list[int] = []
-        for part in raw.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                idx = int(part) - 1
-            except ValueError:
-                continue
-            if 0 <= idx < len(options) and idx not in selected_fallback:
-                selected_fallback.append(idx)
-        return selected_fallback
+def _twin_has_docker_driver(twin: Any) -> bool:
+    """Return ``True`` when the twin's metadata declares at least one Docker-based driver.
 
-    cursor = 0
-    scroll_offset = 0
-    selected: set[int] = set()
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-
-    try:
-        term_height = shutil.get_terminal_size().lines
-    except Exception:
-        term_height = 24
-    max_visible = max(5, term_height - 5)
-
-    def _tty_write(text: str) -> None:
-        """Write text in raw TTY mode using CRLF line endings."""
-        sys.stdout.write(text.replace("\n", "\r\n"))
-
-    def _render() -> None:
-        nonlocal scroll_offset
-        if cursor < scroll_offset:
-            scroll_offset = cursor
-        elif cursor >= scroll_offset + max_visible:
-            scroll_offset = cursor - max_visible + 1
-
-        _tty_write("\x1b[2J\x1b[H")
-        _tty_write(f"{title}\n")
-        _tty_write("Use \u2191/\u2193 to move, Space to toggle, Enter to confirm, q/Ctrl-C to abort\n\n")
-
-        visible_end = min(scroll_offset + max_visible, len(options))
-
-        if scroll_offset > 0:
-            _tty_write(f"  \u2191 {scroll_offset} more above\n")
-
-        for idx in range(scroll_offset, visible_end):
-            cursor_mark = "❯" if idx == cursor else " "
-            selected_mark = "[x]" if idx in selected else "[ ]"
-            _tty_write(f"{cursor_mark} {selected_mark} {options[idx]}\n")
-
-        remaining = len(options) - visible_end
-        if remaining > 0:
-            _tty_write(f"  \u2193 {remaining} more below\n")
-
-        sys.stdout.flush()
-
-    try:
-        tty.setraw(fd)
-        sys.stdout.write("\x1b[?25l")
-        _render()
-        while True:
-            char = sys.stdin.read(1)
-            if char in ("\x03", "q", "Q"):
-                raise KeyboardInterrupt
-            if char in ("\r", "\n"):
-                return sorted(selected)
-            if char == " ":
-                if cursor in selected:
-                    selected.remove(cursor)
-                else:
-                    selected.add(cursor)
-                _render()
-                continue
-            if char == "\x1b":
-                nxt = sys.stdin.read(1)
-                if nxt == "[":
-                    arrow = sys.stdin.read(1)
-                    if arrow == "A":
-                        cursor = (cursor - 1) % len(options)
-                        _render()
-                    elif arrow == "B":
-                        cursor = (cursor + 1) % len(options)
-                        _render()
-            elif char.lower() == "k":
-                cursor = (cursor - 1) % len(options)
-                _render()
-            elif char.lower() == "j":
-                cursor = (cursor + 1) % len(options)
-                _render()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        sys.stdout.write("\x1b[?25h")
-        _tty_write("\n")
-        sys.stdout.flush()
+    A driver entry is considered Docker-compatible when it contains either
+    ``docker_image`` (single container) or ``services`` (multi-container).
+    Twins whose ``metadata.drivers`` dict is missing or contains only
+    non-Docker entries (e.g. ``android``) are not usable on a Docker-based
+    edge device.
+    """
+    metadata = getattr(twin, "metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    drivers = metadata.get("drivers")
+    if not isinstance(drivers, dict):
+        return False
+    return any(
+        isinstance(drv, dict) and ("docker_image" in drv or "services" in drv)
+        for drv in drivers.values()
+    )
 
 
 def _select_connected_twins(client: Any, environment_uuid: str, *, skip_confirm: bool) -> list[str]:
     """List twins in environment and ask user which ones are connected."""
-    twins = client.twins.list(environment_id=environment_uuid)
-    if not twins:
+    all_twins = client.twins.list(environment_id=environment_uuid)
+    if not all_twins:
         console.print("[yellow]No twins found in selected environment.[/yellow]")
+        return []
+
+    twins = [t for t in all_twins if _twin_has_docker_driver(t)]
+    if not twins:
+        console.print(
+            "[yellow]No edge-compatible twins found in selected environment. "
+            "Twins must have Docker-based drivers in their metadata.[/yellow]"
+        )
         return []
 
     if skip_confirm:
         # Keep non-interactive flow deterministic by selecting the first twin.
         return [str(getattr(twins[0], "uuid", ""))] if getattr(twins[0], "uuid", None) else []
 
-    labels = [
-        f"{getattr(twin, 'name', 'Unnamed')} ({str(getattr(twin, 'uuid', ''))[:8]}...)"
-        for twin in twins
-    ]
+    labels: list[str] = []
+    for twin in twins:
+        name = getattr(twin, "name", "Unnamed")
+        uuid_short = str(getattr(twin, "uuid", ""))[:8]
+        if _twin_has_asset(twin):
+            labels.append(f"{name} ({uuid_short}...)")
+        else:
+            # Broken twins are visibly flagged so the user doesn't silently pick
+            # a twin that the edge-core will later fail to spawn a driver for.
+            labels.append(f"{name} ({uuid_short}...)  \u26a0  NO ASSET ATTACHED — fix on dashboard")
+
     base_title = "Which twins are physically connected to your edge?"
     prompt_title = base_title
     while True:
         idxs = _select_multiple_with_arrows(prompt_title, labels)
         selected_uuids: list[str] = []
+        selected_without_asset: list[tuple[str, str]] = []
         for idx in idxs:
-            twin_uuid = str(getattr(twins[idx], "uuid", ""))
-            if twin_uuid:
-                selected_uuids.append(twin_uuid)
+            twin = twins[idx]
+            twin_uuid = str(getattr(twin, "uuid", ""))
+            if not twin_uuid:
+                continue
+            selected_uuids.append(twin_uuid)
+            if not _twin_has_asset(twin):
+                selected_without_asset.append((getattr(twin, "name", "Unnamed"), twin_uuid))
+
         if selected_uuids:
+            if selected_without_asset:
+                console.print()
+                console.print(
+                    "[bold red]\u2717 The following selected twin(s) have no "
+                    "asset attached on the backend:[/bold red]"
+                )
+                for name, twin_uuid in selected_without_asset:
+                    console.print(f"  [red]\u2022 {name} ({twin_uuid[:8]}...)[/red]")
+                console.print(
+                    "[red]The edge-core cannot spawn a driver for these twins. "
+                    "Open each twin on the dashboard, attach an asset, then re-run "
+                    "`cyberwave edge install`.[/red]"
+                )
+                console.print()
             return selected_uuids
 
         prompt_title = (
@@ -791,18 +864,39 @@ def _download_twin_json_files(client: Any, twin_uuids: list[str]) -> int:
                 try:
                     asset = client.assets.get(str(asset_uuid))
                     asset_data = asset.to_dict() if hasattr(asset, "to_dict") else {}
-                except Exception:
-                    pass
+                except Exception as asset_exc:
+                    console.print(
+                        f"[yellow]Failed to fetch asset {str(asset_uuid)[:8]}… "
+                        f"for twin {twin_uuid[:8]}…: {asset_exc}[/yellow]"
+                    )
+            else:
+                # No asset on the twin means edge-core will silently skip
+                # spawning a driver for it. Surface the failure loudly now so
+                # the user can fix it before hitting the cryptic "No twins
+                # with driver images matched this edge" message later.
+                twin_name = getattr(twin, "name", "?")
+                console.print(
+                    f"[bold red]\u2717 Twin '{twin_name}' ({twin_uuid[:8]}...) "
+                    f"has no asset attached on the backend.[/bold red]"
+                )
+                console.print(
+                    "  [red]The edge-core cannot spawn a driver for this twin. "
+                    "Open it on the dashboard, attach an asset, then re-run "
+                    "`cyberwave edge install`.[/red]"
+                )
 
             twin_data["asset"] = asset_data
             twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             with open(twin_json_file, "w") as f:
                 json.dump(twin_data, f, indent=2, default=_json_default)
+            chown_to_sudo_user(CONFIG_DIR, twin_json_file)
             written += 1
         except Exception as exc:
-            console.print(f"[yellow]Failed to download twin JSON for {twin_uuid[:8]}…: {exc}[/yellow]")
-            
+            console.print(
+                f"[yellow]Failed to download twin JSON for {twin_uuid[:8]}…: {exc}[/yellow]"
+            )
+
     return written
 
 
@@ -811,24 +905,23 @@ def _attach_edge_fingerprint_to_twins(
 ) -> tuple[int, int]:
     """Update selected twins metadata with edge_fingerprint.
 
+    The backend's ``twins.update`` merges ``metadata`` on top of the stored
+    copy, so we only need to send the single key we want to write.
+
     Returns:
         (updated_count, failed_count)
     """
     updated = 0
     failed = 0
-
     for twin_uuid in twin_uuids:
         try:
-            twin = client.twins.get(twin_uuid)
-            metadata = getattr(twin, "metadata", {}) or {}
-            if not isinstance(metadata, dict):
-                metadata = {}
-            metadata["edge_fingerprint"] = edge_fingerprint
-            client.twins.update(twin_uuid, metadata=metadata)
+            client.twins.update(twin_uuid, metadata={"edge_fingerprint": edge_fingerprint})
             updated += 1
-        except Exception:
+        except Exception as exc:
+            console.print(
+                f"[yellow]Failed to attach fingerprint to twin {twin_uuid[:8]}…: {exc}[/yellow]"
+            )
             failed += 1
-
     return updated, failed
 
 
@@ -840,6 +933,13 @@ def _detach_edge_fingerprint_from_other_twins(
 ) -> tuple[int, int]:
     """Remove stale edge_fingerprint from twins not selected for this edge.
 
+    The backend treats explicit ``None`` values in ``metadata`` as deletions
+    while merging everything else, so we must send ``{"edge_fingerprint":
+    None}`` to actually clear the key — simply omitting it would keep the
+    stored value intact (which is exactly the bug that caused stale
+    fingerprints from previous installs to pin unwanted drivers to this
+    edge).
+
     Returns:
         (detached_count, failed_count)
     """
@@ -849,7 +949,8 @@ def _detach_edge_fingerprint_from_other_twins(
 
     try:
         twins = client.twins.list(environment_id=environment_uuid)
-    except Exception:
+    except Exception as exc:
+        console.print(f"[yellow]Could not list twins to clear stale fingerprints: {exc}[/yellow]")
         return detached, 1
 
     for twin in twins:
@@ -864,24 +965,129 @@ def _detach_edge_fingerprint_from_other_twins(
         if metadata.get("edge_fingerprint") != edge_fingerprint:
             continue
 
-        updated_metadata = dict(metadata)
-        updated_metadata.pop("edge_fingerprint", None)
         try:
-            client.twins.update(twin_uuid, metadata=updated_metadata)
+            client.twins.update(twin_uuid, metadata={"edge_fingerprint": None})
             detached += 1
-        except Exception:
+        except Exception as exc:
+            console.print(
+                f"[yellow]Failed to detach fingerprint from twin {twin_uuid[:8]}…: {exc}[/yellow]"
+            )
             failed += 1
 
     return detached, failed
 
 
+_NON_TWIN_JSON_FILES = frozenset(
+    {
+        "credentials.json",
+        "environment.json",
+        "cameras.json",
+        "camera_streams.json",
+        "fingerprint.json",
+    }
+)
+
+
+def _detect_existing_edge_configuration() -> tuple[str | None, list[Path]]:
+    """Check CONFIG_DIR for an existing edge environment configuration.
+
+    Returns:
+        (environment_name_or_uuid, list_of_twin_json_paths)
+        *environment_name_or_uuid* is ``None`` when no prior configuration
+        is detected.
+    """
+    twin_json_files = [
+        p for p in sorted(CONFIG_DIR.glob("*.json")) if p.name not in _NON_TWIN_JSON_FILES
+    ]
+    if not twin_json_files:
+        return None, []
+
+    env_label: str | None = None
+    if ENVIRONMENT_FILE.exists():
+        try:
+            data = json.loads(ENVIRONMENT_FILE.read_text(encoding="utf-8"))
+            env_label = data.get("name") or data.get("uuid")
+        except Exception:
+            pass
+
+    return env_label, twin_json_files
+
+
+def _cleanup_existing_edge_configuration(
+    *,
+    twin_json_files: list[Path],
+    creds: Credentials | None = None,
+) -> None:
+    """Remove local twin/environment files and backend edge registrations.
+
+    This mirrors the cleanup performed by ``cyberwave edge uninstall`` but
+    intentionally preserves credentials, fingerprint, the installed
+    package, and the system service so that the subsequent install flow can
+    continue seamlessly.
+    """
+    for path in twin_json_files:
+        try:
+            path.unlink()
+        except OSError:
+            console.print(f"[yellow]Could not remove {path}[/yellow]")
+
+    if ENVIRONMENT_FILE.exists():
+        try:
+            ENVIRONMENT_FILE.unlink()
+        except OSError:
+            console.print(f"[yellow]Could not remove {ENVIRONMENT_FILE}[/yellow]")
+
+    edge_fingerprint = _load_or_generate_edge_fingerprint()
+    token = creds.token if creds else None
+    base_url = str(getattr(creds, "cyberwave_base_url", "") or "") if creds else None
+    workspace_uuid = str(getattr(creds, "workspace_uuid", "") or "") if creds else None
+
+    if token:
+        from .commands.edge import _delete_registered_edges_for_fingerprint
+
+        deleted, failed = _delete_registered_edges_for_fingerprint(
+            fingerprint=edge_fingerprint,
+            token=token,
+            base_url=base_url,
+            workspace_uuid=workspace_uuid,
+        )
+        if deleted:
+            console.print(
+                f"[green]Removed backend edge registration(s): "
+                f"{deleted} (fingerprint: {edge_fingerprint}).[/green]"
+            )
+        if failed:
+            console.print(
+                f"[yellow]Failed to remove {failed} backend edge registration(s).[/yellow]"
+            )
+
+    console.print("[green]Previous edge configuration cleared.[/green]")
+
+
 def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
     """Select workspace + environment and save /etc/cyberwave/environment.json."""
+    from .auth import AuthenticationError
+
     creds = load_credentials()
     if not creds or not creds.token:
         console.print("[red]No credentials found.[/red]")
         console.print("[dim]Run 'cyberwave login' first.[/dim]")
         return False
+
+    if not skip_confirm:
+        env_label, twin_json_files = _detect_existing_edge_configuration()
+        if env_label is not None:
+            display_name = env_label or "an unknown environment"
+            disconnect = Confirm.ask(
+                f"This edge is already connected to [bold]{display_name}[/bold]. "
+                "Do you want to disconnect it first before installing again?",
+                default=True,
+            )
+            if disconnect:
+                _cleanup_existing_edge_configuration(
+                    twin_json_files=twin_json_files,
+                    creds=creds,
+                )
 
     try:
         creds_base_url = creds.cyberwave_base_url
@@ -926,9 +1132,7 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
             edge_fingerprint,
         )
         if detached_count:
-            console.print(
-                f"[dim]Removed stale edge fingerprint from twins: {detached_count}[/dim]"
-            )
+            console.print(f"[dim]Removed stale edge fingerprint from twins: {detached_count}[/dim]")
         if detach_failed_count:
             console.print(
                 f"[yellow]Failed to clear stale edge fingerprint from "
@@ -943,6 +1147,10 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
             console.print(f"[dim]Updated twins with edge fingerprint: {updated_count}[/dim]")
             if failed_count:
                 console.print(f"[yellow]Failed to update {failed_count} twin(s).[/yellow]")
+
+            written = _download_twin_json_files(client, selected_twin_uuids)
+            if written:
+                console.print(f"[dim]Pre-cached twin JSON files: {written}[/dim]")
 
         _save_environment_file(
             workspace_uuid=str(workspace.uuid),
@@ -967,6 +1175,82 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
 # ---- apt-get installation ----------------------------------------------------
 
 
+def _resolve_service_package_name(
+    channel: str = "stable", spec: ServiceSpec = EDGE_CORE_SPEC
+) -> str:
+    """Resolve the Debian package name for the requested channel and service spec."""
+    return spec.package_channels.get(channel.lower(), spec.package_name)
+
+
+def _buildkite_deb_registry_urls(registry_slug: str) -> tuple[str, str]:
+    """Return the apt repo and GPG key URLs for a Buildkite Debian registry."""
+    return (
+        f"https://packages.buildkite.com/{BUILDKITE_ORG_SLUG}/{registry_slug}/any/",
+        f"https://packages.buildkite.com/{BUILDKITE_ORG_SLUG}/{registry_slug}/gpgkey",
+    )
+
+
+def _buildkite_deb_registry_paths(registry_slug: str) -> tuple[Path, Path]:
+    """Return the keyring and sources-list paths for a Buildkite Debian registry."""
+    return (
+        Path(f"/etc/apt/keyrings/cyberwave_{registry_slug}-archive-keyring.gpg"),
+        Path(f"/etc/apt/sources.list.d/buildkite-cyberwave-{registry_slug}.list"),
+    )
+
+
+def _buildkite_deb_registry_auth_conf_path(registry_slug: str) -> Path:
+    """Return the apt auth.conf.d path for a Buildkite Debian registry."""
+    return Path(f"/etc/apt/auth.conf.d/cyberwave_{registry_slug}.conf")
+
+
+def _resolve_deb_registry_slug(spec: ServiceSpec, channel: str = "stable") -> str:
+    """Return the Buildkite Debian registry slug for the selected channel."""
+    normalized_channel = _normalize_service_channel(channel)
+    if normalized_channel == "stable":
+        return spec.public_deb_registry_slug
+    return INTERNAL_DEB_REGISTRY_SLUG
+
+
+def _resolve_deb_registry_urls(spec: ServiceSpec, channel: str = "stable") -> tuple[str, str]:
+    """Return the apt repo and GPG key URLs for the selected service channel."""
+    return _buildkite_deb_registry_urls(_resolve_deb_registry_slug(spec, channel))
+
+
+def _resolve_deb_registry_paths(spec: ServiceSpec, channel: str = "stable") -> tuple[Path, Path]:
+    """Return the keyring and sources-list paths for the selected service channel."""
+    return _buildkite_deb_registry_paths(_resolve_deb_registry_slug(spec, channel))
+
+
+def _resolve_deb_registry_auth_conf_path(spec: ServiceSpec, channel: str = "stable") -> Path:
+    """Return the apt auth.conf.d path for the selected service channel."""
+    return _buildkite_deb_registry_auth_conf_path(_resolve_deb_registry_slug(spec, channel))
+
+
+def _resolve_deb_registry_read_token(channel: str = "stable") -> str | None:
+    """Return the private registry read token required for prerelease channels."""
+    normalized_channel = _normalize_service_channel(channel)
+    if normalized_channel == "stable":
+        return None
+    env_token = os.environ.get(INTERNAL_DEB_READ_TOKEN_ENV)
+    if env_token:
+        return env_token
+    creds = load_credentials()
+    saved_token = getattr(creds, "internal_deb_read_token", None) if creds else None
+    if isinstance(saved_token, str) and saved_token.strip():
+        return saved_token.strip()
+    return None
+
+
+def _resolve_deb_registry_gpg_key_fetch_url(spec: ServiceSpec, channel: str = "stable") -> str:
+    """Return the GPG key URL, embedding auth for private prerelease registries."""
+    registry_slug = _resolve_deb_registry_slug(spec, channel)
+    _, public_gpg_key_url = _buildkite_deb_registry_urls(registry_slug)
+    token = _resolve_deb_registry_read_token(channel)
+    if not token:
+        return public_gpg_key_url
+    return f"https://buildkite:{token}@packages.buildkite.com/{BUILDKITE_ORG_SLUG}/{registry_slug}/gpgkey"
+
+
 def _resolve_edge_core_package_name(channel: str | None) -> str:
     """Resolve the Debian package name for the requested edge-core channel."""
     normalized_channel = (channel or "stable").lower()
@@ -976,9 +1260,9 @@ def _resolve_edge_core_package_name(channel: str | None) -> str:
         raise ValueError(f"Unsupported edge-core channel: {normalized_channel}") from exc
 
 
-def _resolve_installed_edge_core_package_name() -> str:
-    """Best-effort detect which edge-core Debian package is currently installed."""
-    for package_name in EDGE_CORE_PACKAGE_CHANNELS.values():
+def _resolve_installed_service_package_name(spec: ServiceSpec = EDGE_CORE_SPEC) -> str:
+    """Best-effort detect which Debian package for the given service is currently installed."""
+    for package_name in spec.package_channels.values():
         try:
             result = subprocess.run(
                 ["dpkg-query", "-W", "-f=${db:Status-Status}", package_name],
@@ -993,24 +1277,63 @@ def _resolve_installed_edge_core_package_name() -> str:
         if result.returncode == 0 and result.stdout.strip() == "installed":
             return package_name
 
-    return PACKAGE_NAME
+    return spec.package_name
 
 
-def _apt_get_install(*, package_name: str = PACKAGE_NAME, package_version: str | None = None) -> bool:
-    """Install cyberwave-edge-core via apt-get.
+def _resolve_installed_edge_core_package_name() -> str:
+    """Best-effort detect which edge-core Debian package is currently installed."""
+    return _resolve_installed_service_package_name(EDGE_CORE_SPEC)
+
+
+def _apt_get_install(
+    spec: ServiceSpec = EDGE_CORE_SPEC,
+    *,
+    package_name: str | None = None,
+    package_version: str | None = None,
+    channel: str = "stable",
+) -> bool:
+    """Install a service package via apt-get.
 
     Adds the Buildkite package registry GPG key and source if not already
-    configured, then installs (or upgrades) the latest version of the package.
+    configured, then installs (or upgrades) the requested version of the package.
 
     Returns True on success.
     """
-    sources_list = Path("/etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-edge-core.list")
+    resolved_name = package_name or spec.package_name
+    deb_repo_url, gpg_key_url = _resolve_deb_registry_urls(spec, channel)
+    keyring_path, sources_list = _resolve_deb_registry_paths(spec, channel)
+    auth_conf_path = _resolve_deb_registry_auth_conf_path(spec, channel)
+    registry_slug = _resolve_deb_registry_slug(spec, channel)
+    registry_read_token = _resolve_deb_registry_read_token(channel)
+
+    if channel != "stable" and not registry_read_token:
+        console.print(
+            f"[red]{INTERNAL_DEB_READ_TOKEN_ENV} is required for {channel} package installs.[/red]"
+        )
+        return False
+
+    if registry_read_token:
+        try:
+            auth_conf_path.parent.mkdir(parents=True, exist_ok=True)
+            auth_conf_path.write_text(
+                "machine "
+                f"https://packages.buildkite.com/{BUILDKITE_ORG_SLUG}/{registry_slug}/ "
+                f"login buildkite password {registry_read_token}\n",
+                encoding="utf-8",
+            )
+            _run(["chmod", "600", str(auth_conf_path)])
+        except PermissionError:
+            console.print(
+                "[red]Permission denied writing apt auth config.[/red]\n"
+                f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
+            )
+            return False
 
     # Install the GPG signing key if missing
-    if not BUILDKITE_KEYRING_PATH.exists():
+    if not keyring_path.exists():
         console.print("[cyan]Installing Cyberwave package signing key...[/cyan]")
         try:
-            BUILDKITE_KEYRING_PATH.parent.mkdir(parents=True, exist_ok=True)
+            keyring_path.parent.mkdir(parents=True, exist_ok=True)
 
             child_env = clean_subprocess_env()
             ld_library_path = child_env.get("LD_LIBRARY_PATH", "(unset)")
@@ -1018,19 +1341,21 @@ def _apt_get_install(*, package_name: str = PACKAGE_NAME, package_version: str |
 
             # Download the armored GPG key
             curl = subprocess.run(
-                ["curl", "-fsSL", BUILDKITE_GPG_KEY_URL],
+                ["curl", "-fsSL", _resolve_deb_registry_gpg_key_fetch_url(spec, channel)],
                 capture_output=True,
                 check=True,
                 env=child_env,
             )
             if not curl.stdout:
                 console.print("[red]Downloaded GPG key is empty.[/red]")
-                console.print(f"[dim]URL: {BUILDKITE_GPG_KEY_URL}[/dim]")
+                console.print(
+                    f"[dim]URL: {_resolve_deb_registry_gpg_key_fetch_url(spec, channel)}[/dim]"
+                )
                 return False
 
             # Dearmor into the keyring file
             gpg = subprocess.run(
-                ["gpg", "--batch", "--yes", "--dearmor", "-o", str(BUILDKITE_KEYRING_PATH)],
+                ["gpg", "--batch", "--yes", "--dearmor", "-o", str(keyring_path)],
                 input=curl.stdout,
                 capture_output=True,
                 env=child_env,
@@ -1049,7 +1374,9 @@ def _apt_get_install(*, package_name: str = PACKAGE_NAME, package_version: str |
             console.print(f"[red]Failed to download GPG key (exit {exc.returncode}).[/red]")
             if stderr_msg:
                 console.print(f"[dim]{stderr_msg}[/dim]")
-            console.print(f"[dim]URL: {BUILDKITE_GPG_KEY_URL}[/dim]")
+            console.print(
+                f"[dim]URL: {_resolve_deb_registry_gpg_key_fetch_url(spec, channel)}[/dim]"
+            )
             return False
         except FileNotFoundError as exc:
             console.print(f"[red]Required command not found: {exc.filename}[/red]")
@@ -1060,29 +1387,29 @@ def _apt_get_install(*, package_name: str = PACKAGE_NAME, package_version: str |
         except PermissionError:
             console.print(
                 "[red]Permission denied installing GPG key.[/red]\n"
-                "[dim]Re-run with sudo: sudo cyberwave edge install[/dim]"
+                f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
             )
             return False
 
     # Add the repository if missing
     if not sources_list.exists():
         console.print("[cyan]Adding Cyberwave package repository...[/cyan]")
-        signed_by = f"signed-by={BUILDKITE_KEYRING_PATH}"
+        signed_by = f"signed-by={keyring_path}"
         source_lines = (
-            f"deb [{signed_by}] {BUILDKITE_DEB_REPO_URL} any main\n"
-            f"deb-src [{signed_by}] {BUILDKITE_DEB_REPO_URL} any main\n"
+            f"deb [{signed_by}] {deb_repo_url} any main\n"
+            f"deb-src [{signed_by}] {deb_repo_url} any main\n"
         )
         try:
             sources_list.write_text(source_lines)
         except PermissionError:
             console.print(
                 "[red]Permission denied writing apt sources.[/red]\n"
-                "[dim]Re-run with sudo: sudo cyberwave edge install[/dim]"
+                f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
             )
             return False
 
     # Update and install the latest version
-    install_target = f"{package_name}={package_version}" if package_version else package_name
+    install_target = f"{resolved_name}={package_version}" if package_version else resolved_name
     console.print(f"[cyan]Installing {install_target} via apt-get...[/cyan]")
     try:
         # Retry apt-get update to handle transient CDN mirror sync failures.
@@ -1113,34 +1440,169 @@ def _apt_get_install(*, package_name: str = PACKAGE_NAME, package_version: str |
         console.print(f"[red]apt-get failed (exit {exc.returncode}).[/red]")
         return False
 
-    if BINARY_PATH.exists():
-        console.print(f"[green]Installed:[/green] {BINARY_PATH}")
+    if spec.binary_path.exists():
+        console.print(f"[green]Installed:[/green] {spec.binary_path}")
         return True
 
     console.print("[red]Binary not found after installation.[/red]")
     return False
 
 
-def _pip_install(*, package_version: str | None = None, channel: str = "stable") -> bool:
-    """Fallback: install cyberwave-edge-core via pip.
+# Re-exported from pip_registry for backward compat.
+from .pip_registry import (  # noqa: E402
+    INTERNAL_PYTHON_REGISTRY_SLUG,
+    Version,
+    _buildkite_python_registry_index_url,
+    _buildkite_python_registry_slug,
+    _extract_version_from_distribution_filename,
+    _fetch_available_simple_index_versions,
+    _normalize_service_channel,
+    _pip_version_matches_channel,
+    _resolve_buildkite_python_registry_slug,
+    _select_pip_version_for_channel,
+    _validate_pip_channel_version,
+)
+
+INTERNAL_PYTHON_READ_TOKEN_ENV = "CYBERWAVE_INTERNAL_PYTHON_READ_TOKEN"
+
+
+def _describe_pip_install_target(
+    spec: ServiceSpec = EDGE_CORE_SPEC,
+    *,
+    channel: str = "stable",
+    package_version: str | None = None,
+) -> str:
+    """Return the user-facing pip target shown during confirmation prompts."""
+    if package_version:
+        return f"{spec.package_name}=={package_version}"
+    normalized_channel = _normalize_service_channel(channel)
+    if normalized_channel == "stable":
+        return f"{spec.package_name} (latest stable release)"
+    return f"{spec.package_name} (latest {normalized_channel} release)"
+
+
+def _pip_install(
+    spec: ServiceSpec = EDGE_CORE_SPEC,
+    *,
+    package_version: str | None = None,
+    channel: str = "stable",
+) -> bool:
+    """Fallback: install a service package via pip.
 
     Used on non-Debian systems (macOS, other Linux flavors).
     Returns True on success.
     """
-    if channel != "stable":
-        console.print(
-            "[red]Non-stable edge-core channels are only supported via apt-get on Debian/Ubuntu.[/red]"
-        )
-        return False
+    normalized_channel = _normalize_service_channel(channel)
+    pip_command = [sys.executable, "-m", "pip", "install"]
+    buildkite_index_url: str | None = None
+    registry_read_token = os.environ.get(INTERNAL_PYTHON_READ_TOKEN_ENV)
+    if not registry_read_token:
+        creds = load_credentials()
+        saved_token = getattr(creds, "internal_python_read_token", None) if creds else None
+        if isinstance(saved_token, str) and saved_token.strip():
+            registry_read_token = saved_token.strip()
 
-    pip_target = f"{PACKAGE_NAME}=={package_version}" if package_version else PACKAGE_NAME
+    if normalized_channel == "stable" and not package_version:
+        pip_target = spec.package_name
+    else:
+        try:
+            if package_version:
+                validated_version = _validate_pip_channel_version(
+                    spec.package_name,
+                    package_version,
+                    normalized_channel,
+                )
+                pip_target = f"{spec.package_name}=={validated_version}"
+            else:
+                if normalized_channel != "stable" and not registry_read_token:
+                    console.print(
+                        f"[red]{INTERNAL_PYTHON_READ_TOKEN_ENV} is required for {normalized_channel} "
+                        "Python package installs.[/red]"
+                    )
+                    return False
+                if normalized_channel != "stable":
+                    version_lookup_index_url = _buildkite_python_registry_index_url(
+                        _resolve_buildkite_python_registry_slug(
+                            spec.package_name, normalized_channel
+                        )
+                    )
+                else:
+                    version_lookup_index_url = buildkite_index_url
+                available_versions = _fetch_available_simple_index_versions(
+                    version_lookup_index_url,
+                    spec.package_name,
+                    buildkite_read_token=registry_read_token
+                    if normalized_channel != "stable"
+                    else None,
+                )
+                resolved_version = _select_pip_version_for_channel(
+                    available_versions,
+                    package_name=spec.package_name,
+                    channel=normalized_channel,
+                )
+                pip_target = f"{spec.package_name}=={resolved_version}"
+                console.print(
+                    f"[cyan]Resolved {spec.package_name} {normalized_channel} channel to "
+                    f"{resolved_version}.[/cyan]"
+                )
+        except (RuntimeError, ValueError) as exc:
+            console.print(f"[red]{exc}[/red]")
+            return False
+
+        if normalized_channel != "stable":
+            if buildkite_index_url is None:
+                if not registry_read_token:
+                    console.print(
+                        f"[red]{INTERNAL_PYTHON_READ_TOKEN_ENV} is required for {normalized_channel} "
+                        "Python package installs.[/red]"
+                    )
+                    return False
+                buildkite_index_url = _buildkite_python_registry_index_url(
+                    _resolve_buildkite_python_registry_slug(spec.package_name, normalized_channel),
+                    registry_read_token,
+                )
+            assert buildkite_index_url is not None
+            pip_command.extend(
+                [
+                    "--pre",
+                    "--extra-index-url",
+                    buildkite_index_url,
+                ]
+            )
+            console.print(
+                f"[cyan]Using Buildkite Python registry for the "
+                f"{normalized_channel} channel.[/cyan]"
+            )
+
     console.print(f"[cyan]Installing {pip_target} via pip...[/cyan]")
     try:
-        _run([sys.executable, "-m", "pip", "install", pip_target])
+        _run([*pip_command, pip_target])
         return True
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]pip install failed (exit {exc.returncode}).[/red]")
         return False
+
+
+def install_service_package(
+    spec: ServiceSpec = EDGE_CORE_SPEC,
+    *,
+    channel: str = "stable",
+    version: str | None = None,
+) -> bool:
+    """Install the package described by *spec*.
+
+    Prefers apt-get on Debian/Ubuntu, falls back to pip otherwise.
+    Returns True on success.
+    """
+    if _is_linux() and shutil.which("apt-get"):
+        package_name = _resolve_service_package_name(channel, spec)
+        return _apt_get_install(
+            spec,
+            package_name=package_name,
+            package_version=version,
+            channel=channel,
+        )
+    return _pip_install(spec, package_version=version, channel=channel)
 
 
 def install_edge_core(*, channel: str = "stable", version: str | None = None) -> bool:
@@ -1149,10 +1611,7 @@ def install_edge_core(*, channel: str = "stable", version: str | None = None) ->
     Prefers apt-get on Debian/Ubuntu, falls back to pip otherwise.
     Returns True on success.
     """
-    if _is_linux() and shutil.which("apt-get"):
-        package_name = _resolve_edge_core_package_name(channel)
-        return _apt_get_install(package_name=package_name, package_version=version)
-    return _pip_install(package_version=version, channel=channel)
+    return install_service_package(EDGE_CORE_SPEC, channel=channel, version=version)
 
 
 # ---- docker installation -----------------------------------------------------
@@ -1186,6 +1645,59 @@ def _ensure_docker_installed() -> bool:
     return True
 
 
+def _check_docker_macos() -> bool:
+    """Verify that Docker Desktop is installed and running on macOS.
+
+    On macOS we do not auto-install Docker (Docker Desktop is a GUI app
+    that requires interactive setup), so the pre-flight check just
+    surfaces a clear, copy-pasteable hint and aborts the install if
+    Docker is missing or the daemon is not yet running.
+
+    Returns True when ``docker info`` succeeds.
+    """
+    if shutil.which("docker"):
+        try:
+            proc = subprocess.run(
+                ["docker", "info"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                env=clean_subprocess_env(),
+            )
+        except FileNotFoundError:
+            proc = None
+
+        if proc is not None and proc.returncode == 0:
+            return True
+
+        console.print(
+            "[red]Docker is installed, but the daemon is not running.[/red]\n"
+            "[dim]Open Docker Desktop (or Colima) and wait for the daemon to be "
+            "ready, then re-run 'cyberwave edge install'.[/dim]"
+        )
+        return False
+
+    console.print(
+        "[red]Docker Desktop is required for the edge drivers and ML workers, "
+        "but it was not found on this Mac.[/red]"
+    )
+    if shutil.which("brew"):
+        console.print(
+            "[dim]Install with Homebrew:\n"
+            "    brew install --cask docker\n"
+            "Then open Docker Desktop once so the daemon starts, "
+            "and re-run 'cyberwave edge install'.[/dim]"
+        )
+    else:
+        console.print(
+            "[dim]Download Docker Desktop from "
+            "https://docs.docker.com/desktop/install/mac-install/, "
+            "open it once so the daemon starts, then re-run "
+            "'cyberwave edge install'.[/dim]"
+        )
+    return False
+
+
 def _install_docker() -> bool:
     """Install Docker if not present in the edge device."""
     if shutil.which("docker"):
@@ -1199,7 +1711,7 @@ def _install_docker() -> bool:
 
     if os.geteuid() != 0:
         console.print(
-            "[red]Docker installation requires root permissions.[/red]\n"
+            "[red]Docker installation requires root privileges.[/red]\n"
             "[dim]Re-run with sudo: sudo cyberwave edge install[/dim]"
         )
         return False
@@ -1240,8 +1752,204 @@ def _get_docker_installer_script_path() -> Path:
 # ---- systemd service ---------------------------------------------------------
 
 
-def create_systemd_service() -> bool:
-    """Write the systemd unit file for cyberwave-edge-core.
+def _service_override_path(spec: ServiceSpec) -> Path:
+    """Return the path to the drop-in override file for ``spec``."""
+    return spec.unit_path.parent / f"{spec.unit_name}.d" / "override.conf"
+
+
+def _resolve_service_binary(spec: ServiceSpec) -> str:
+    """Resolve the absolute path used to launch the service.
+
+    Resolution order:
+    1. spec.binary_path if it exists (Linux apt install)
+    2. Venv-local bin used by install-local-cli-mac.sh
+    3. Current Python environment bin used by pip installs
+    4. PATH lookup via shutil.which
+    5. spec.binary_path as a fallback (may not exist)
+    """
+    if spec.binary_path.exists():
+        return str(spec.binary_path)
+    venv_bin = Path.home() / ".cyberwave-cli" / "venv-local" / "bin" / spec.package_name
+    if venv_bin.exists():
+        return str(venv_bin)
+    current_env_bin = Path(sys.executable).parent / spec.package_name
+    if current_env_bin.exists():
+        return str(current_env_bin)
+    return shutil.which(spec.package_name) or str(spec.binary_path)
+
+
+def _launchagent_label(spec: ServiceSpec) -> str:
+    """Return the launchd label for a macOS service."""
+    if spec.package_name == CLOUD_NODE_SPEC.package_name:
+        return "com.cyberwave.cloud-node"
+    package_suffix = spec.package_name.removeprefix("cyberwave-").replace("-", ".")
+    return f"com.cyberwave.{package_suffix}"
+
+
+def _launchagent_plist_path(spec: ServiceSpec) -> Path:
+    """Return the LaunchAgent plist path for the current user."""
+    return Path.home() / "Library" / "LaunchAgents" / f"{_launchagent_label(spec)}.plist"
+
+
+def _launchagent_target(spec: ServiceSpec) -> tuple[str, str]:
+    """Return the launchctl domain/label target for a macOS LaunchAgent."""
+    domain = f"gui/{os.getuid()}"
+    return domain, f"{domain}/{_launchagent_label(spec)}"
+
+
+def _launchagent_log_path(spec: ServiceSpec) -> Path:
+    """Return the LaunchAgent log file path for the current user."""
+    return Path.home() / "Library" / "Logs" / "Cyberwave" / f"{_launchagent_label(spec)}.log"
+
+
+def create_launchagent_service(
+    spec: ServiceSpec = CLOUD_NODE_SPEC,
+    *,
+    config_path: str | None = None,
+) -> bool:
+    """Write a LaunchAgent plist for the service on macOS."""
+    program_arguments = [_resolve_service_binary(spec), *spec.launch_command]
+    if config_path:
+        # launchd launches from /, so config paths must be absolute.
+        abs_config = str(Path(config_path).resolve())
+        program_arguments.extend(["--config", abs_config])
+
+    log_dir = _launchagent_log_path(spec).parent
+    log_dir.mkdir(parents=True, exist_ok=True)
+    label = _launchagent_label(spec)
+    plist_data = {
+        "Label": label,
+        "ProgramArguments": program_arguments,
+        "EnvironmentVariables": {
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        },
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(_launchagent_log_path(spec)),
+        "StandardErrorPath": str(_launchagent_log_path(spec)),
+    }
+
+    plist_path = _launchagent_plist_path(spec)
+    try:
+        plist_path.parent.mkdir(parents=True, exist_ok=True)
+        plist_path.write_bytes(plistlib.dumps(plist_data))
+    except PermissionError:
+        console.print(
+            "[red]Permission denied writing LaunchAgent plist.[/red]\n"
+            f"[dim]Run '{spec.install_command_hint}' without sudo on macOS.[/dim]"
+        )
+        return False
+
+    console.print(f"[green]Created:[/green] {plist_path}")
+    return True
+
+
+def load_launchagent_service(spec: ServiceSpec = CLOUD_NODE_SPEC) -> bool:
+    """Load or reload the LaunchAgent for the current macOS user session."""
+    plist_path = _launchagent_plist_path(spec)
+    if not plist_path.exists():
+        console.print("[red]LaunchAgent plist not found — run install first.[/red]")
+        return False
+
+    label = _launchagent_label(spec)
+    domain, _bootout_target = _launchagent_target(spec)
+
+    try:
+        wait_for_launchd_unload(label, legacy_labels=legacy_labels_for_package(spec.package_name))
+        bootstrap_launchd_service(domain, plist_path)
+    except FileNotFoundError:
+        console.print("[red]launchctl not found on this system.[/red]")
+        return False
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]launchctl bootstrap failed (exit {exc.returncode}).[/red]")
+        if exc.returncode == 5:
+            console.print(
+                "[dim]Hint: launchd reports a transient I/O error even after "
+                f"retries. Inspect state with 'launchctl print {domain}/{label}', "
+                "or re-run under sudo for richer launchctl error output.[/dim]"
+            )
+        elif os.getuid() == 0 and not os.getenv("SUDO_USER"):
+            console.print(
+                "[dim]LaunchAgent loading requires an active macOS GUI login "
+                "session and the invoking user's UID (run without sudo, or "
+                "ensure SUDO_USER is set).[/dim]"
+            )
+        return False
+
+    console.print(f"[green]LaunchAgent loaded:[/green] {label}")
+    return True
+
+
+def write_service_override(
+    spec: ServiceSpec,
+    *,
+    config_path: str | None = None,
+) -> bool:
+    """Write a systemd drop-in override that sets --config on ExecStart.
+
+    Creates ``<unit>.d/override.conf`` with a blank ``ExecStart=`` followed by
+    the full command so systemd replaces (not appends) the base ExecStart.
+    Calls ``daemon-reload`` automatically so the change takes effect.
+
+    Returns True on success.  If no config_path is provided, returns True
+    immediately without touching anything.
+    """
+    if not config_path:
+        return True
+
+    extra: list[str] = ["--config", config_path]
+    binary = _resolve_service_binary(spec)
+    exec_start = shlex.join([binary, "start", *extra])
+    contents = textwrap.dedent(f"""\
+        [Service]
+        ExecStart=
+        ExecStart={exec_start}
+    """)
+
+    override_file = _service_override_path(spec)
+    try:
+        override_file.parent.mkdir(parents=True, exist_ok=True)
+        override_file.write_text(contents)
+    except PermissionError:
+        console.print(
+            f"[red]Permission denied writing service override.[/red]\n"
+            f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
+        )
+        return False
+
+    console.print(f"[green]Created:[/green] {override_file}")
+
+    if _has_systemd():
+        try:
+            _run(["systemctl", "daemon-reload"])
+        except subprocess.CalledProcessError:
+            pass
+
+    return True
+
+
+def clear_service_override(spec: ServiceSpec) -> None:
+    """Remove the drop-in override file if it exists."""
+    override_file = _service_override_path(spec)
+    if not override_file.exists():
+        return
+    try:
+        override_file.unlink()
+        override_dir = override_file.parent
+        if override_dir.exists() and not any(override_dir.iterdir()):
+            override_dir.rmdir()
+        console.print(f"[dim]Removed override: {override_file}[/dim]")
+        if _has_systemd():
+            try:
+                _run(["systemctl", "daemon-reload"])
+            except subprocess.CalledProcessError:
+                pass
+    except PermissionError:
+        console.print(f"[yellow]Could not remove override file: {override_file}[/yellow]")
+
+
+def create_systemd_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
+    """Write the systemd unit file described by ``spec``.
 
     Returns True on success.
     """
@@ -1249,178 +1957,688 @@ def create_systemd_service() -> bool:
         console.print("[yellow]systemd not detected — skipping service creation.[/yellow]")
         return False
 
-    binary = (
-        str(BINARY_PATH) if BINARY_PATH.exists() else shutil.which(PACKAGE_NAME) or str(BINARY_PATH)
-    )
-    unit_contents = SYSTEMD_UNIT_TEMPLATE.format(binary_path=binary)
+    binary = _resolve_service_binary(spec)
+    unit_contents = spec.unit_template.format(binary_path=binary, config_dir=CONFIG_DIR)
 
     try:
-        SYSTEMD_UNIT_PATH.write_text(unit_contents)
+        spec.unit_path.write_text(unit_contents)
     except PermissionError:
         console.print(
-            "[red]Permission denied writing systemd unit.[/red]\n"
-            "[dim]Re-run with sudo: sudo cyberwave edge install[/dim]"
+            f"[red]Permission denied writing systemd unit.[/red]\n"
+            f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
         )
         return False
 
-    console.print(f"[green]Created:[/green] {SYSTEMD_UNIT_PATH}")
+    console.print(f"[green]Created:[/green] {spec.unit_path}")
     return True
 
 
-def enable_and_start_service() -> bool:
-    """Enable the service to start on boot, then start it now.
+def enable_and_start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
+    """Enable the service described by ``spec`` to start on boot, then start it now.
+
+    Uses ``restart`` instead of ``start`` so that a re-install picks up
+    the updated ``environment.json`` / twin selection without requiring
+    a manual ``systemctl restart``.  On a fresh install the service is
+    not yet active, so ``restart`` behaves identically to ``start``.
+
+    The restart is issued with ``--no-block`` so the CLI returns
+    immediately instead of waiting for the ``Type=notify`` service to
+    signal ``READY=1`` (which includes Docker image pulls and can take
+    several minutes on slow links).
 
     Returns True on success.
     """
-    if not SYSTEMD_UNIT_PATH.exists():
+    if not spec.unit_path.exists():
         console.print("[red]Service unit not found — run install first.[/red]")
         return False
 
     try:
         _run(["systemctl", "daemon-reload"])
-        _run(["systemctl", "enable", SYSTEMD_UNIT_NAME])
-        _run(["systemctl", "start", SYSTEMD_UNIT_NAME])
+        _run(["systemctl", "enable", spec.unit_name])
+        _run(["systemctl", "restart", "--no-block", spec.unit_name])
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]systemctl command failed (exit {exc.returncode}).[/red]")
         return False
 
-    console.print(f"[green]Service enabled and started:[/green] {SYSTEMD_UNIT_NAME}")
+    console.print(f"[green]Service enabled and (re)starting:[/green] {spec.unit_name}")
+    console.print(
+        f"[dim]The service is booting in the background (driver image pulls, "
+        f"twin sync, etc.).\n"
+        f"Run 'cyberwave edge logs' to follow progress.[/dim]"
+    )
     return True
 
 
-def restart_service() -> bool:
-    """Restart the cyberwave-edge-core systemd service.
+def restart_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
+    """Restart the systemd service described by ``spec``.
 
-    Returns True on success.
+    Requires root privileges.  Returns True on success.
     """
     if not _has_systemd():
         console.print("[yellow]systemd not detected — cannot restart via systemd.[/yellow]")
         return False
 
-    if not SYSTEMD_UNIT_PATH.exists():
-        console.print("[red]Service unit not found — run 'cyberwave edge install' first.[/red]")
+    if not spec.unit_path.exists():
+        console.print(f"[red]Service unit not found — run '{spec.sudo_command_hint}' first.[/red]")
         return False
 
+    require_root(f"sudo {spec.install_command_hint.rsplit(' ', 1)[0]} restart")
+
     try:
-        _run(["systemctl", "restart", SYSTEMD_UNIT_NAME])
+        _run(["systemctl", "restart", spec.unit_name])
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]systemctl restart failed (exit {exc.returncode}).[/red]")
         return False
 
-    console.print(f"[green]Service restarted:[/green] {SYSTEMD_UNIT_NAME}")
+    console.print(f"[green]Service restarted:[/green] {spec.unit_name}")
     return True
 
 
-def stop_service() -> bool:
-    """Stop the cyberwave-edge-core systemd service.
+def stop_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
+    """Stop the systemd service described by ``spec``.
 
-    Returns True on success.
+    Requires root privileges.  Returns True on success.
     """
     if not _has_systemd():
         console.print("[yellow]systemd not detected — cannot stop via systemd.[/yellow]")
         return False
 
-    if not SYSTEMD_UNIT_PATH.exists():
-        console.print("[red]Service unit not found — run 'cyberwave edge install' first.[/red]")
+    if not spec.unit_path.exists():
+        console.print(f"[red]Service unit not found — run '{spec.sudo_command_hint}' first.[/red]")
         return False
 
+    require_root(f"sudo {spec.install_command_hint.rsplit(' ', 1)[0]} stop")
+
     try:
-        _run(["systemctl", "stop", SYSTEMD_UNIT_NAME])
+        _run(["systemctl", "stop", spec.unit_name])
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]systemctl stop failed (exit {exc.returncode}).[/red]")
         return False
 
-    console.print(f"[green]Service stopped:[/green] {SYSTEMD_UNIT_NAME}")
+    console.print(f"[green]Service stopped:[/green] {spec.unit_name}")
     return True
+
+
+def start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
+    """Start the service without re-enabling it (user-initiated start).
+
+    When the service is already active, this is a no-op from systemd's
+    perspective: ``systemctl start`` does not re-execute the unit's
+    ``ExecStart`` (so edge-core's boot-time driver startup does *not*
+    run again).  Surfacing this explicitly avoids the misleading
+    ``✓ Started`` UX when an operator is actually trying to apply
+    config changes — they should use ``cyberwave edge restart`` for
+    that.
+
+    Requires root privileges.  Returns True on success or when the
+    service was already active.
+    """
+    if not _has_systemd():
+        return False
+    if not spec.unit_path.exists():
+        console.print(f"[red]Service unit not found — run '{spec.sudo_command_hint}' first.[/red]")
+        return False
+    if is_service_active(spec):
+        restart_hint = spec.install_command_hint.rsplit(" ", 1)[0] + " restart"
+        console.print(
+            f"[yellow]{spec.unit_name} is already running — `systemctl start` is a no-op.[/yellow]"
+        )
+        console.print(
+            "[dim]To apply config changes (re-run boot-time driver startup, "
+            f"reload twins, etc.) use: sudo {restart_hint}[/dim]"
+        )
+        return True
+
+    require_root(f"sudo {spec.install_command_hint.rsplit(' ', 1)[0]} start")
+
+    result = _run(["systemctl", "start", spec.unit_name], check=False)
+    if result.returncode == 0:
+        console.print(f"[green]✓ Started {spec.unit_name}[/green]")
+        return True
+    console.print(
+        f"[yellow]systemctl start failed (exit {result.returncode}). "
+        f"Check status with: systemctl status {spec.unit_name}[/yellow]"
+    )
+    return False
+
+
+_CAMERA_SENSOR_TYPES = {"camera", "rgb", "depth_camera"}
+
+
+def _load_selected_twin_uuids() -> set[str] | None:
+    """Return the twin UUIDs the user selected in ``environment.json``.
+
+    Returns ``None`` when the file is missing or does not list any twins,
+    signalling callers to fall back to "every cached twin".
+    """
+    if not ENVIRONMENT_FILE.exists():
+        return None
+    try:
+        data = json.loads(ENVIRONMENT_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    twin_uuids = data.get("twin_uuids")
+    if not isinstance(twin_uuids, list):
+        return None
+    selected = {str(u) for u in twin_uuids if u}
+    return selected or None
+
+
+def _list_camera_twins() -> list[tuple[str, str]]:
+    """Return ``(twin_uuid, twin_name)`` for each *selected* twin with a camera sensor.
+
+    Reads the ``{twin_uuid}.json`` files written by
+    :func:`_download_twin_json_files`, filters to assets that declare at
+    least one camera-type sensor, and then restricts the result to the
+    twins listed in ``environment.json`` when that file is present.  This
+    ensures the per-twin camera mapping only walks through the twins the
+    user actually chose in the connected-twin picker, ignoring stale
+    caches from previous installs.
+    """
+    selected_uuids = _load_selected_twin_uuids()
+    results: list[tuple[str, str]] = []
+    for path in sorted(CONFIG_DIR.glob("*.json")):
+        if path.name in (
+            "credentials.json",
+            "environment.json",
+            "cameras.json",
+            "fingerprint.json",
+        ):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        asset = data.get("asset") or {}
+        schema = asset.get("universal_schema") or {}
+        sensors = schema.get("sensors") or []
+        if not any(sensor.get("type") in _CAMERA_SENSOR_TYPES for sensor in sensors):
+            continue
+        twin_uuid = str(data.get("uuid") or path.stem)
+        twin_name = str(data.get("name") or twin_uuid)
+        if not twin_uuid:
+            continue
+        if selected_uuids is not None and twin_uuid not in selected_uuids:
+            continue
+        results.append((twin_uuid, twin_name))
+    return results
+
+
+def _any_twin_has_camera_sensor() -> bool:
+    """Check downloaded twin JSON files for camera-type sensors."""
+    return bool(_list_camera_twins())
+
+
+def _render_camera_menu(
+    cameras: list[Any],
+    *,
+    assignments: dict[int, str] | None = None,
+) -> dict[int, Any]:
+    """Print a numbered camera menu and return the map of valid indices.
+
+    When ``assignments`` is provided, each already-mapped camera is annotated
+    with the twin name it is currently assigned to.
+    """
+    from .device_utils import camera_likelihood_score
+
+    assignments = assignments or {}
+    valid_indices: dict[int, Any] = {}
+    for i, cam in enumerate(cameras):
+        idx = cam.index if cam.index is not None else i
+        valid_indices[idx] = cam
+        score = camera_likelihood_score(cam)
+        assigned_to = assignments.get(idx)
+        suffix = f"  [yellow](assigned to {assigned_to})[/yellow]" if assigned_to else ""
+        if score >= 40:
+            label = (
+                f"  [bold cyan]{idx}[/bold cyan])  {cam.card}  "
+                f"[dim]{cam.primary_path}[/dim]{suffix}"
+            )
+        else:
+            label = (
+                f"  [dim]{idx})  {cam.card}  {cam.primary_path}  "
+                f"(probably not a camera)[/dim]{suffix}"
+            )
+        console.print(label)
+    return valid_indices
+
+
+def _prompt_camera_index(
+    cameras: list[Any],
+    valid_indices: dict[int, Any],
+    *,
+    prompt: str,
+    default_index: int,
+) -> int | None:
+    """Prompt for a single camera index. Returns ``None`` on invalid input."""
+    raw = Prompt.ask(prompt, default=str(default_index))
+    try:
+        chosen = int(raw)
+    except ValueError:
+        console.print("[yellow]Invalid selection — skipping camera config.[/yellow]")
+        return None
+    if chosen not in valid_indices:
+        console.print(f"[yellow]Camera {chosen} not available — skipping.[/yellow]")
+        return None
+    return chosen
+
+
+def _detect_and_select_cameras() -> None:
+    """Discover cameras and prompt the user to map them to camera-bearing twins.
+
+    When a single camera twin is connected, the user is prompted once (matching
+    the historical single-select behaviour).  When multiple camera twins are
+    connected alongside multiple physical cameras, the user is walked through a
+    per-twin mapping so each twin ends up bound to a specific ``/dev/video*``
+    device.
+
+    Best-effort: failures are logged but never block installation.
+    """
+    from .device_utils import discover_usb_cameras, write_cameras_json
+
+    cameras = discover_usb_cameras()
+    if not cameras:
+        console.print(
+            "[dim]No cameras detected. You can add one later: cyberwave edge cameras[/dim]"
+        )
+        return
+
+    camera_twins = _list_camera_twins()
+    default_idx = cameras[0].index if cameras[0].index is not None else 0
+
+    # Single physical camera: auto-assign to every camera twin.
+    if len(cameras) == 1:
+        cam = cameras[0]
+        selected = cam.index if cam.index is not None else 0
+        twin_to_device = {twin_uuid: selected for twin_uuid, _ in camera_twins}
+        console.print(f"\n[cyan]Detected camera:[/cyan] {cam.card} ({cam.primary_path})")
+        if len(camera_twins) > 1:
+            console.print(
+                f"[dim]All {len(camera_twins)} camera twin(s) will share this device.[/dim]"
+            )
+        write_cameras_json(
+            cameras,
+            CONFIG_DIR,
+            selected_index=selected,
+            twin_to_device=twin_to_device or None,
+        )
+        console.print(f"[dim]Saved to {CONFIG_DIR / 'cameras.json'}[/dim]\n")
+        return
+
+    # Single camera twin (or none known) with multiple cameras: keep the legacy
+    # single-select flow so existing scripted installs remain unchanged.
+    if len(camera_twins) <= 1:
+        console.print(f"\n[bold]Detected {len(cameras)} camera(s):[/bold]\n")
+        valid_indices = _render_camera_menu(cameras)
+        console.print()
+        selected = _prompt_camera_index(
+            cameras,
+            valid_indices,
+            prompt="Select camera",
+            default_index=default_idx,
+        )
+        if selected is None:
+            return
+        console.print(f"[green]Selected:[/green] {valid_indices[selected].card}")
+        twin_to_device = {camera_twins[0][0]: selected} if camera_twins else {}
+        write_cameras_json(
+            cameras,
+            CONFIG_DIR,
+            selected_index=selected,
+            twin_to_device=twin_to_device or None,
+        )
+        console.print(f"[dim]Saved to {CONFIG_DIR / 'cameras.json'}[/dim]\n")
+        return
+
+    # Multiple camera twins AND multiple cameras: map each twin to a camera.
+    console.print(
+        f"\n[bold]Detected {len(cameras)} camera(s) and {len(camera_twins)} camera twin(s).[/bold]"
+    )
+    console.print(
+        "[dim]Map each twin to the physical camera it is wired to. "
+        "A device can be assigned to more than one twin if it is shared.[/dim]\n"
+    )
+
+    twin_to_device: dict[str, int] = {}
+    assignments_label: dict[int, str] = {}
+    first_selected: int | None = None
+    remaining_default = default_idx
+
+    for twin_uuid, twin_name in camera_twins:
+        console.print(f"[bold]Twin:[/bold] {twin_name} [dim]({twin_uuid[:8]}...)[/dim]")
+        valid_indices = _render_camera_menu(cameras, assignments=assignments_label)
+        console.print()
+        selected = _prompt_camera_index(
+            cameras,
+            valid_indices,
+            prompt=f"Camera for {twin_name}",
+            default_index=remaining_default,
+        )
+        if selected is None:
+            console.print(
+                "[yellow]Skipping remaining twin mappings; edge will fall back "
+                "to /dev/video0 for unmapped twins.[/yellow]"
+            )
+            break
+        twin_to_device[twin_uuid] = selected
+        assignments_label[selected] = twin_name
+        if first_selected is None:
+            first_selected = selected
+        # Prefer an unassigned device as the next default, but keep the current
+        # choice if every device has been touched.
+        remaining = [idx for idx in valid_indices if idx not in assignments_label]
+        if remaining:
+            remaining_default = remaining[0]
+        console.print(f"[green]Selected:[/green] {valid_indices[selected].card}\n")
+
+    if not twin_to_device:
+        console.print("[yellow]No cameras mapped — skipping camera config.[/yellow]")
+        return
+
+    write_cameras_json(
+        cameras,
+        CONFIG_DIR,
+        selected_index=first_selected,
+        twin_to_device=twin_to_device,
+    )
+    console.print(f"[dim]Saved to {CONFIG_DIR / 'cameras.json'}[/dim]\n")
 
 
 # ---- orchestrator ------------------------------------------------------------
 
 
-def setup_edge_core(
+def setup_service(
+    spec: ServiceSpec,
     *,
     skip_confirm: bool = False,
-    edge_core_channel: str = "stable",
-    edge_core_version: str | None = None,
+    channel: str = "stable",
+    version: str | None = None,
+    config_path: str | None = None,
+    post_install_hook: Any = None,
+    force_reinstall: bool = False,
 ) -> bool:
-    """Full setup: install the package, create the service, enable on boot.
+    """Generic install orchestrator: install package, optionally set up Docker + systemd.
+
+    When *force_reinstall* is True, platform helpers (USB/IP server, camera
+    stream) are torn down and rebuilt from scratch instead of being skipped
+    when already running.
 
     Returns True if everything succeeded.
     """
-    service_setup_supported = _is_linux()
-    if not service_setup_supported:
-        console.print(
-            "[yellow]Edge core service setup is only supported on Linux. "
-            "You will need to start the core manually upon restart[/yellow]"
-        )
-        if edge_core_channel != "stable":
-            console.print(
-                "[red]Non-stable edge-core channels are only supported via apt-get on Debian/Ubuntu.[/red]"
-            )
-            return False
+    _migrate_legacy_config_dir()
 
-    if service_setup_supported and os.geteuid() != 0:
+    linux_service_setup = _is_linux()
+    macos_launchagent_supported = _is_macos() and spec.supports_macos_launchagent
+
+    if linux_service_setup and os.geteuid() != 0:
         console.print(
-            "[red]Root privileges required.[/red]\n"
-            "[dim]Re-run with sudo: sudo cyberwave edge install[/dim]"
+            f"[red]This command requires root privileges.[/red]\n"
+            f"[dim]Re-run with sudo: {spec.sudo_command_hint}[/dim]"
         )
         return False
 
-    # Ensure the user is logged in before starting the installation.
+    if macos_launchagent_supported and os.geteuid() == 0:
+        console.print(
+            "[red]macOS LaunchAgent installs must be run without sudo.[/red]\n"
+            f"[dim]Re-run as your regular user: {spec.install_command_hint}[/dim]"
+        )
+        return False
+
+    if not linux_service_setup and not macos_launchagent_supported:
+        console.print(
+            f"[yellow]{spec.package_name} systemd service setup is only supported on Linux. "
+            "You will need to start it manually upon restart.[/yellow]"
+        )
+        if is_macos() and spec.requires_docker:
+            console.print(
+                "[dim]On macOS, USB devices are shared to Docker containers via USB/IP.[/dim]"
+            )
+
     if not _ensure_credentials(skip_confirm=skip_confirm):
         return False
 
     if not skip_confirm:
-        if service_setup_supported:
-            selected_package = _resolve_edge_core_package_name(edge_core_channel)
-            selected_target = (
-                f"{selected_package}={edge_core_version}" if edge_core_version else selected_package
-            )
+        if linux_service_setup:
+            has_apt = bool(shutil.which("apt-get"))
+            if has_apt:
+                selected_pkg = _resolve_service_package_name(channel, spec)
+                selected_target = f"{selected_pkg}={version}" if version else selected_pkg
+                install_method = f"Install [bold]{selected_target}[/bold] via apt-get"
+            else:
+                pip_target = _describe_pip_install_target(
+                    spec,
+                    channel=channel,
+                    package_version=version,
+                )
+                install_method = f"Install [bold]{pip_target}[/bold] via pip"
             console.print(
                 f"\nThis will:\n"
-                f"  1. Install [bold]{selected_target}[/bold] via apt-get\n"
-                f"  2. Create a systemd service ([bold]{SYSTEMD_UNIT_NAME}[/bold])\n"
+                f"  1. {install_method}\n"
+                f"  2. Create a systemd service ([bold]{spec.unit_name}[/bold])\n"
                 f"  3. Enable it to start on boot\n"
             )
-        else:
-            pip_target = f"{PACKAGE_NAME}=={edge_core_version}" if edge_core_version else PACKAGE_NAME
+        elif macos_launchagent_supported:
+            pip_target = _describe_pip_install_target(
+                spec,
+                channel=channel,
+                package_version=version,
+            )
             console.print(
                 f"\nThis will:\n"
                 f"  1. Install [bold]{pip_target}[/bold] via pip\n"
-                f"  2. Configure edge credentials and environment\n"
+                "  2. Configure service credentials\n"
+                "  3. Create and load a LaunchAgent for your macOS user session\n"
+            )
+        else:
+            pip_target = _describe_pip_install_target(
+                spec,
+                channel=channel,
+                package_version=version,
+            )
+            console.print(
+                f"\nThis will:\n"
+                f"  1. Install [bold]{pip_target}[/bold] via pip\n"
+                f"  2. Configure service credentials\n"
                 f"  3. Skip service setup (manual startup required)\n"
             )
         if not Confirm.ask("Continue?", default=True):
             console.print("[dim]Aborted.[/dim]")
             return False
 
-    # Step 1 — install edge core
-    if not install_edge_core(channel=edge_core_channel, version=edge_core_version):
+    # Pre-flight: on macOS we cannot auto-install Docker Desktop, so check
+    # before pip-installing edge-core. Catches the common "I forgot to open
+    # Docker Desktop" failure mode early instead of leaving the user with a
+    # registered LaunchAgent that crash-loops trying to spawn drivers.
+    if is_macos() and spec.requires_docker:
+        if not _check_docker_macos():
+            return False
+
+    if not install_service_package(spec, channel=channel, version=version):
         return False
 
-    # Linux-only service setup.
-    if service_setup_supported:
+    if linux_service_setup and spec.requires_docker:
         if not _install_docker():
             return False
 
-        if not create_systemd_service():
+    if force_reinstall and not (is_macos() and spec.requires_docker):
+        console.print(
+            "[dim]--force-reinstall has no effect on this platform "
+            "(only applies to macOS platform helpers).[/dim]"
+        )
+
+    if is_macos() and spec.requires_docker:
+        if not setup_usbip_server(force=force_reinstall, skip_confirm=skip_confirm):
+            console.print(
+                "[yellow]USB/IP setup failed. USB devices will not be "
+                "available inside Docker containers.[/yellow]\n"
+                "[dim]You can retry later: cyberwave edge install[/dim]"
+            )
+
+    if post_install_hook is not None:
+        if not post_install_hook():
             return False
 
-    # Step 2 (or 3 on Linux) — pick workspace/environment and persist config
-    if not configure_edge_environment(skip_confirm=skip_confirm):
-        return False
+    # Camera selection runs after twin selection so the interactive prompt
+    # isn't wiped by the twin picker's screen clear.
+    # Only prompt when at least one selected twin has a camera sensor.
+    if spec.requires_docker and _any_twin_has_camera_sensor():
+        if is_macos():
+            if not setup_camera_stream_server(
+                force=force_reinstall,
+                camera_twins=_list_camera_twins(),
+            ):
+                console.print(
+                    "[yellow]Camera stream setup failed. MJPEG fallback will "
+                    "not be available.[/yellow]\n"
+                    "[dim]You can retry later: cyberwave edge install[/dim]"
+                )
+        elif linux_service_setup:
+            _detect_and_select_cameras()
 
-    if service_setup_supported:
-        # Final Linux-only step — enable & start after environment.json is finalized.
-        if not enable_and_start_service():
+    if linux_service_setup:
+        if not create_systemd_service(spec):
             return False
-
-        console.print("\n[green]Edge core is installed and running.[/green]")
-        console.print("[dim]Check status: systemctl status cyberwave-edge-core[/dim]")
-        console.print("[dim]View logs:    cyberwave edge logs -f[/dim]")
+        if not enable_and_start_service(spec):
+            return False
+        console.print(f"\n[green]{spec.package_name} is installed and running.[/green]")
+        console.print(f"[dim]Check status: systemctl status {spec.unit_name}[/dim]")
+    elif macos_launchagent_supported:
+        if not create_launchagent_service(spec, config_path=config_path):
+            return False
+        if not load_launchagent_service(spec):
+            return False
+        console.print(f"\n[green]{spec.package_name} is installed and running.[/green]")
+        console.print(f"[dim]LaunchAgent: {_launchagent_label(spec)}[/dim]")
+        console.print(f"[dim]Plist: {_launchagent_plist_path(spec)}[/dim]")
     else:
-        console.print("\n[green]Edge core is installed.[/green]")
-        console.print("[dim]Start manually: cyberwave-edge-core[/dim]")
-        console.print("[dim]After restart, start the core manually again.[/dim]")
+        console.print(f"\n[green]{spec.package_name} is installed.[/green]")
+        console.print(f"[dim]Start manually: {spec.package_name}[/dim]")
 
     return True
+
+
+def _resolve_worker_image() -> str:
+    """Return the worker Docker image reference, respecting CYBERWAVE_ENVIRONMENT.
+
+    Delegates to the canonical ``resolve_worker_image()`` in
+    ``cyberwave_edge_core.worker_manager`` when available.  Falls back to
+    credentials-based inference when edge-core is not installed (e.g.
+    during initial ``cyberwave edge install``).
+    """
+    try:
+        ensure_edge_core_importable()
+        from cyberwave_edge_core.worker_manager import resolve_worker_image
+
+        return resolve_worker_image()
+    except Exception:
+        pass
+
+    base = "cyberwaveos/edge-ml-worker"
+    creds = load_credentials()
+    env_name = creds.cyberwave_environment if creds and creds.cyberwave_environment else None
+    if env_name and env_name not in ("production",):
+        return f"{base}:{env_name}"
+    return f"{base}:latest"
+
+
+def _docker_image_present(docker_bin: str, image: str) -> bool:
+    """Return True if *image* is already present in the local Docker daemon."""
+    try:
+        proc = subprocess.run(
+            [docker_bin, "image", "inspect", image],
+            capture_output=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return proc.returncode == 0
+
+
+def _pull_worker_image() -> bool:
+    """Pull the ML worker Docker image (best-effort).
+
+    Behavior mirrors ``WorkerManager._ensure_image_pulled`` in
+    ``cyberwave-edge-core``:
+
+    * If the resolved image is already present locally, skip the pull
+      entirely.  This is the contract for the ``:local`` tag and for
+      ``CYBERWAVE_WORKER_IMAGE`` overrides (e.g. ``:local-gpu``) — those
+      tags only exist locally and a registry pull is guaranteed to fail.
+    * Otherwise issue ``docker pull`` to refresh mutable tags
+      (``:dev``, ``:staging``, …).  If that fails and the tag is not
+      ``:latest``, retry with ``:latest`` as a last-ditch fallback for
+      first-time installs.
+
+    Returns True always — a failed pull is non-fatal because
+    ``WorkerManager._run_container()`` will pull implicitly on first
+    start and itself falls back to a locally-present image.
+    """
+    docker_bin = shutil.which("docker")
+    if not docker_bin:
+        console.print("[yellow]Docker not found — skipping worker image pull.[/yellow]")
+        return True
+
+    image = _resolve_worker_image()
+
+    if _docker_image_present(docker_bin, image):
+        console.print(
+            f"[green]Worker image {image} already present locally — skipping pull.[/green]"
+        )
+        return True
+
+    console.print(f"[cyan]Pulling worker image {image}...[/cyan]")
+    try:
+        _run([docker_bin, "pull", image])
+        console.print(f"[green]Worker image {image} pulled successfully.[/green]")
+        return True
+    except subprocess.CalledProcessError:
+        pass
+
+    fallback = image.rsplit(":", 1)[0] + ":latest"
+    if fallback != image:
+        console.print(f"[yellow]Tag not found, trying {fallback}...[/yellow]")
+        try:
+            _run([docker_bin, "pull", fallback])
+            console.print(f"[green]Worker image {fallback} pulled successfully.[/green]")
+            return True
+        except subprocess.CalledProcessError:
+            pass
+
+    console.print("[yellow]Worker image pull failed.[/yellow]")
+    console.print("[dim]Workers will still work — edge-core pulls on first start.[/dim]")
+    return True
+
+
+def setup_edge_core(
+    *,
+    skip_confirm: bool = False,
+    channel: str = "stable",
+    version: str | None = None,
+    force_reinstall: bool = False,
+    pull_worker_image: bool = True,
+) -> bool:
+    """Full setup for edge core: install the package, create the service, enable on boot.
+
+    When *force_reinstall* is True, platform helpers (USB/IP, camera stream)
+    are torn down and rebuilt from scratch.
+
+    When *pull_worker_image* is True (the default), the ML worker Docker
+    image is pulled after installation so workers are ready to run immediately.
+
+    Returns True if everything succeeded.
+    """
+
+    def _post_install() -> bool:
+        ok = configure_edge_environment(skip_confirm=skip_confirm)
+        if ok and pull_worker_image:
+            _pull_worker_image()
+        return ok
+
+    return setup_service(
+        EDGE_CORE_SPEC,
+        skip_confirm=skip_confirm,
+        channel=channel,
+        version=version,
+        post_install_hook=_post_install,
+        force_reinstall=force_reinstall,
+    )

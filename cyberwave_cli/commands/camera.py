@@ -1,5 +1,7 @@
 """Camera edge setup command for the Cyberwave CLI."""
 
+from __future__ import annotations
+
 import shutil
 import subprocess
 import uuid
@@ -527,12 +529,12 @@ def camera(
 
     if local_edge or env_only:
         console.print("\n[bold]Start streaming:[/bold]")
-        console.print(f"  [dim]cd {target_path} && python -m cyberwave_edge.service[/dim]")
+        console.print(f"  [dim]cd {target_path} && cyberwave edge start -f[/dim]")
     else:
         console.print("\n[bold]Next steps:[/bold]")
         console.print(f"  1. [dim]cd {target_path}[/dim]")
         console.print("  2. [dim]pip install -e .[/dim]")
-        console.print("  3. [dim]python -m cyberwave_edge.service[/dim]")
+        console.print("  3. [dim]cyberwave edge start -f[/dim]")
 
     console.print()
     console.print("[dim]Documentation: https://docs.cyberwave.com/edge[/dim]")

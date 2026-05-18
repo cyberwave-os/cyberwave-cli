@@ -1,0 +1,18 @@
+{
+  "device_class": "jetson-orin-nano",
+  "recorded_at": "2026-04-17T00:00:00Z",
+  "cyberwave_cli_version": null,
+  "cyberwave_version": null,
+  "provisional": true,
+  "note": "Provisional baseline for NVIDIA Jetson Orin Nano (8 GB). Extrapolated at ~0.30x the x86-laptop reference. Re-bless on real hardware in MAXN power mode with `cyberwave edge bench --save-baseline jetson-orin-nano.json`.",
+  "metrics": {
+    "header_pack":      {"ops_per_s": 10230,   "ns_per_op": 97773},
+    "decode_zero_copy": {"ops_per_s": 8670,    "ns_per_op": 115340},
+    "decode_with_copy": {"ops_per_s": 4680,    "ns_per_op": 213675},
+    "stats_lockfree":   {"ops_per_s": 2750000, "ns_per_op": 364},
+    "stats_locked":     {"ops_per_s": 994000,  "ns_per_op": 1006},
+    "seq_itertools":    {"ops_per_s": 4170000, "ns_per_op": 240},
+    "seq_locked":       {"ops_per_s": 1207000, "ns_per_op": 828},
+    "decode_mb_s":      7982
+  }
+}

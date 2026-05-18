@@ -1,0 +1,18 @@
+{
+  "device_class": "apple-silicon-m2",
+  "recorded_at": "2026-04-17T00:00:00Z",
+  "cyberwave_cli_version": null,
+  "cyberwave_version": null,
+  "provisional": true,
+  "note": "Provisional baseline for the Apple M2 tier (M2 / M2 Pro / M2 Max / M2 Ultra). Extrapolated at ~1.15x the M1 tier. Re-bless on real M2 hardware with `cyberwave edge bench --save-baseline apple-silicon-m2.json`.",
+  "metrics": {
+    "header_pack":      {"ops_per_s": 45080,    "ns_per_op": 22183},
+    "decode_zero_copy": {"ops_per_s": 38180,    "ns_per_op": 26192},
+    "decode_with_copy": {"ops_per_s": 20585,    "ns_per_op": 48579},
+    "stats_lockfree":   {"ops_per_s": 12123300, "ns_per_op": 82},
+    "stats_locked":     {"ops_per_s": 4380350,  "ns_per_op": 228},
+    "seq_itertools":    {"ops_per_s": 18382750, "ns_per_op": 54},
+    "seq_locked":       {"ops_per_s": 5322200,  "ns_per_op": 188},
+    "decode_mb_s":      35187
+  }
+}

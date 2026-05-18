@@ -1,5 +1,7 @@
 """Config-dir command for the Cyberwave CLI."""
 
+from __future__ import annotations
+
 import click
 
 from ..config import CONFIG_DIR

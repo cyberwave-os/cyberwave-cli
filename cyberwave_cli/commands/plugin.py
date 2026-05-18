@@ -15,6 +15,8 @@ Example usage:
     cyberwave plugin info yolo
 """
 
+from __future__ import annotations
+
 import json
 import subprocess
 import sys
@@ -47,10 +49,14 @@ def load_registry() -> dict:
 
 def save_registry(registry: dict):
     """Save the plugin registry."""
+    from ..config import chown_to_sudo_user
+
     plugins_dir = get_plugins_dir()
     plugins_dir.mkdir(parents=True, exist_ok=True)
-    with open(plugins_dir / "registry.json", "w") as f:
+    registry_file = plugins_dir / "registry.json"
+    with open(registry_file, "w") as f:
         json.dump(registry, f, indent=2)
+    chown_to_sudo_user(plugins_dir, registry_file)
 
 
 @click.group()

@@ -6,6 +6,8 @@ on the edge machine. Currently supports Linux via v4l2-ctl.
 Future: Add support for macOS (AVFoundation), Windows (DirectShow), etc.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import re
@@ -15,10 +17,91 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .config import clean_subprocess_env
+
 logger = logging.getLogger(__name__)
 
-# Raspberry Pi platform devices that v4l2-ctl lists but are not actual cameras
-EXCLUDED_CAMERA_CARDS = frozenset({"pispbe", "rpi-hevc-dec"})
+# Raspberry Pi / Broadcom platform devices that v4l2-ctl lists but are not
+# actual cameras.  These are video codec, ISP, and decoder engines.
+EXCLUDED_CAMERA_CARDS = frozenset({
+    "pispbe",
+    "rpi-hevc-dec",
+    "rpivid",
+    "bcm2835-codec-decode",
+    "bcm2835-codec-encode",
+    "bcm2835-codec-isp",
+    "bcm2835-isp",
+})
+
+# Substrings in card names that indicate a hardware codec/ISP rather than a
+# real capture device.  Checked case-insensitively.
+_NON_CAMERA_SUBSTRINGS = (
+    "codec",
+    "-isp",
+    "rpivid",
+    "hevc",
+    "h264",
+    "h.264",
+    "decoder",
+    "encoder",
+)
+
+# Known USB camera drivers reported by v4l2-ctl --all
+_REAL_CAMERA_DRIVERS = frozenset({"uvcvideo", "v4l2 loopback"})
+
+# Substrings (case-insensitive) in card names that strongly suggest a real camera
+_REAL_CAMERA_KEYWORDS = (
+    "webcam",
+    "camera",
+    "logitech",
+    "c920",
+    "c922",
+    "c930",
+    "c270",
+    "brio",
+    "streamcam",
+    "razer",
+    "elgato",
+    "obsbot",
+    "insta360",
+    "depstech",
+    "arducam",
+    "see3cam",
+    "e-con",
+)
+
+
+def camera_likelihood_score(cam: "CameraDevice") -> int:
+    """Score a CameraDevice by how likely it is to be an actual capture device.
+
+    Higher score = more likely a real camera.  Used to sort the camera list so
+    that the best candidate appears first (and becomes the default selection).
+    """
+    score = 50  # neutral baseline
+
+    card_lower = (cam.card or "").lower()
+    driver_lower = (cam.driver or "").lower()
+    bus_lower = (cam.bus_info or "").lower()
+
+    # Strong positive signals
+    if "usb" in bus_lower:
+        score += 30
+    if driver_lower in _REAL_CAMERA_DRIVERS:
+        score += 25
+    for kw in _REAL_CAMERA_KEYWORDS:
+        if kw in card_lower:
+            score += 20
+            break
+
+    # Strong negative signals
+    for sub in _NON_CAMERA_SUBSTRINGS:
+        if sub in card_lower:
+            score -= 40
+            break
+    if "platform" in bus_lower:
+        score -= 30
+
+    return score
 
 
 @dataclass
@@ -54,6 +137,7 @@ class CameraDevice:
             "index": self.index,
             "driver": self.driver,
             "serial": self.serial,
+            "likelihood_score": camera_likelihood_score(self),
         }
 
 
@@ -115,6 +199,7 @@ def _get_v4l2_device_info(device_path: str) -> dict:
             capture_output=True,
             text=True,
             timeout=5,
+            env=clean_subprocess_env(),
         )
         if result.returncode != 0:
             return {}
@@ -158,7 +243,7 @@ def _ensure_video_device_permissions() -> None:
             if path.is_char_device():
                 os.chmod(path, 0o666)
     except PermissionError:
-        logger.warning(
+        logger.debug(
             "Cannot set permissions on /dev/video* (need root). "
             "Run: sudo chmod 666 /dev/video* to allow camera access."
         )
@@ -185,6 +270,7 @@ def discover_usb_cameras_v4l2() -> list[CameraDevice]:
             capture_output=True,
             text=True,
             timeout=10,
+            env=clean_subprocess_env(),
         )
         if result.returncode != 0 and result.stderr:
             logger.warning(
@@ -196,7 +282,7 @@ def discover_usb_cameras_v4l2() -> list[CameraDevice]:
         # before failing on an inaccessible one (e.g. unplugged /dev/video0)
         devices = _parse_v4l2_list_devices(result.stdout or "")
 
-        # Exclude Raspberry Pi platform devices (pispbe, rpi-hevc-dec) - not actual cameras
+        # Exclude known non-camera platform devices (codecs, ISPs, decoders)
         devices = [
             d
             for d in devices
@@ -222,13 +308,33 @@ def discover_usb_cameras_v4l2() -> list[CameraDevice]:
         return []
 
 
+def _discover_cameras_avfoundation() -> list[CameraDevice]:
+    """Discover cameras on macOS via AVFoundation (ffmpeg probe)."""
+    try:
+        from .macos import _list_avfoundation_devices
+    except ImportError:
+        return []
+
+    cameras: list[CameraDevice] = []
+    for idx, name in _list_avfoundation_devices():
+        cameras.append(
+            CameraDevice(
+                card=name,
+                bus_info=f"avfoundation-{idx}",
+                paths=[str(idx)],
+                driver="avfoundation",
+            )
+        )
+    return cameras
+
+
 def discover_usb_cameras() -> list[CameraDevice]:
-    """Discover USB cameras on the system.
+    """Discover cameras on the system.
 
     Platform-specific:
     - Linux: Uses v4l2-ctl
-    - macOS: Not yet implemented (future: AVFoundation)
-    - Windows: Not yet implemented (future: DirectShow)
+    - macOS: Uses AVFoundation via ffmpeg
+    - Windows: Not yet implemented
 
     Returns:
         List of CameraDevice objects.
@@ -237,16 +343,18 @@ def discover_usb_cameras() -> list[CameraDevice]:
 
     system = platform.system()
     if system == "Linux":
-        return discover_usb_cameras_v4l2()
+        cameras = discover_usb_cameras_v4l2()
     elif system == "Darwin":
-        logger.warning("macOS camera discovery not yet implemented")
-        return []
+        cameras = _discover_cameras_avfoundation()
     elif system == "Windows":
         logger.warning("Windows camera discovery not yet implemented")
         return []
     else:
         logger.warning("Unsupported platform for camera discovery: %s", system)
         return []
+
+    cameras.sort(key=camera_likelihood_score, reverse=True)
+    return cameras
 
 
 def list_serial_ports() -> list[str]:
@@ -280,25 +388,42 @@ def list_serial_ports() -> list[str]:
     return sorted(set(candidates))
 
 
-def write_cameras_json(cameras: list[CameraDevice], config_dir: Path) -> Path:
+def write_cameras_json(
+    cameras: list[CameraDevice],
+    config_dir: Path,
+    *,
+    selected_index: int | None = None,
+    twin_to_device: dict[str, int] | None = None,
+) -> Path:
     """Write discovered cameras to a JSON file in the config directory.
 
     Args:
         cameras: List of discovered CameraDevice objects.
         config_dir: Directory to write the cameras.json file.
+        selected_index: Video device index of the selected camera (stored
+            as ``selected_device`` in the JSON).  Preserved for back-compat;
+            when ``twin_to_device`` is provided this should be the first
+            twin's device so older edge-core builds still work.
+        twin_to_device: Optional ``{twin_uuid: video_index}`` mapping that lets
+            each camera-bearing twin bind to a specific ``/dev/video*``
+            device on the host. Stored under ``twin_to_device`` in the JSON.
 
     Returns:
         Path to the written cameras.json file.
     """
-    import json
+    from .io_utils import atomic_write_json
 
     cameras_file = config_dir / "cameras.json"
-    data = {
+    data: dict = {
         "devices": [cam.to_dict() for cam in cameras],
     }
-    config_dir.mkdir(parents=True, exist_ok=True)
-    with open(cameras_file, "w") as f:
-        json.dump(data, f, indent=2)
+    if selected_index is not None:
+        data["selected_device"] = selected_index
+    if twin_to_device:
+        data["twin_to_device"] = {
+            str(twin_uuid): int(idx) for twin_uuid, idx in twin_to_device.items()
+        }
+    atomic_write_json(cameras_file, data)
     logger.info("Wrote cameras.json to %s (%d devices)", cameras_file, len(cameras))
     return cameras_file
 

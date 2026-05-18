@@ -7,6 +7,8 @@ Supports multiple discovery methods:
 - UPnP/SSDP
 """
 
+from __future__ import annotations
+
 import socket
 import struct
 import threading

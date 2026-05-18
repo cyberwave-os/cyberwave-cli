@@ -1,5 +1,7 @@
 """Network scan command for discovering IP cameras and NVRs."""
 
+from __future__ import annotations
+
 import click
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn

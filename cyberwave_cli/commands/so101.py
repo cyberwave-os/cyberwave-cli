@@ -1,5 +1,7 @@
 """SO-101 bootstrap command for the Cyberwave CLI."""
 
+from __future__ import annotations
+
 import subprocess
 import sys
 from pathlib import Path

@@ -12,6 +12,8 @@ CLI commands are for local/offline configuration:
     cyberwave model show       # Show current config
 """
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
@@ -36,7 +38,7 @@ def fetch_edge_models() -> list[dict]:
         from cyberwave import Cyberwave
         client = Cyberwave(base_url=get_api_url(), token=creds.token)
         # Use raw API call for mlmodels (not a standard resource manager)
-        models = client.api.mlmodels_list()
+        models = client.api.src_app_api_mlmodels_list_mlmodels(edge_compatible=True)
         return [
             {
                 "uuid": str(m.uuid),
@@ -54,7 +56,8 @@ def fetch_edge_models() -> list[dict]:
     except ImportError:
         console.print("[yellow]Cyberwave SDK not installed, using fallback[/yellow]")
         return []
-    except Exception:
+    except Exception as e:
+        console.print(f"[yellow]Could not fetch models from API ({e}), using fallback[/yellow]")
         return []
 
 
@@ -65,7 +68,7 @@ def model():
 
 
 @model.command("list")
-@click.option("--deployment", "-d", type=click.Choice(["all", "edge", "cloud", "hybrid"]), default="edge", help="Filter by deployment type")
+@click.option("--deployment", "-d", type=click.Choice(["all", "edge", "cloud", "hybrid"]), default="all", help="Filter by deployment type")
 def list_models(deployment):
     """List available ML models from the catalog."""
     
@@ -229,7 +232,7 @@ def show_config(env_file):
             try:
                 raw = line.split("=", 1)[1].strip("'\"")
                 models = json.loads(raw)
-            except:
+            except Exception:
                 pass
             break
 
@@ -286,7 +289,7 @@ def remove_model(model_id, env_file):
     try:
         raw = env_content["MODELS"].strip("'\"")
         models = json.loads(raw)
-    except:
+    except Exception:
         console.print("[red]Failed to parse MODELS[/red]")
         return
 

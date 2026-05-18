@@ -5,6 +5,8 @@ These are fallback definitions used when the edge package is not installed.
 The authoritative source is cyberwave_edge.plugins.registry.BUILTIN_PLUGINS.
 """
 
+from __future__ import annotations
+
 # Fallback plugin definitions when edge package is not available
 BUILTIN_PLUGINS_FALLBACK: dict[str, dict] = {
     "yolo": {

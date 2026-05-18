@@ -1,5 +1,7 @@
 """Environment management commands for the Cyberwave CLI."""
 
+from __future__ import annotations
+
 import click
 from rich.console import Console
 from rich.table import Table
