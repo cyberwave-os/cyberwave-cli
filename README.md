@@ -52,10 +52,10 @@ ssh yourhost@your-ip
 Once you are in your edge device, set it up by:
 
 ```bash
-cyberwave edge install
+cyberwave pair
 ```
 
-This command will guide you to your first-time setup of your edge device.
+`cyberwave pair` is the recommended alias for `cyberwave edge install` — both run the same first-time edge setup (workspace, environment, twin selection, package install, and boot service registration).
 
 ## Global Options
 
@@ -78,6 +78,7 @@ cyberwave --version
 | `configure`   | Set API token and URL directly (without login flow)           |
 | `config-dir`  | Print the active configuration directory                      |
 | `completion`  | Generate/install shell autocomplete                           |
+| `pair`        | Pair this device as an edge node (alias for `edge install`)   |
 | `twin`        | Create, pair, list, show, and delete digital twins            |
 | `edge`        | Manage edge node (install, start, stop, drivers, sync, etc.)  |
 | `compute`     | Manage cloud node (install, start, stop, status, logs)        |
@@ -439,6 +440,17 @@ Manage the edge node service lifecycle, configuration, and monitoring.
 | `sync-workflows` | Trigger workflow sync on the edge node                   |
 | `list-models`    | List model bindings loaded on the edge node              |
 | `driver`         | Manage edge driver containers (subgroup — see [below](#cyberwave-edge-driver)) |
+
+## `cyberwave pair`
+
+Top-level alias for [`cyberwave edge install`](#cyberwave-edge-install). Shares the same options and behavior — use whichever reads better in your docs and scripts.
+
+```bash
+sudo cyberwave pair
+sudo cyberwave pair -y
+sudo cyberwave pair --channel dev
+sudo cyberwave pair --reconfigure-camera
+```
 
 ### `cyberwave edge install`
 

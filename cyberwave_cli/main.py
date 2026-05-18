@@ -38,6 +38,7 @@ _LAZY_COMMANDS: dict[str, tuple[str, str]] = {
     "logout": (".commands.logout", "logout"),
     "manifest": (".commands.manifest", "manifest"),
     "model": (".commands.model", "model"),
+    "pair": (".commands.pair", "pair"),
     "plugin": (".commands.plugin", "plugin"),
     "scan": (".commands.scan", "scan"),
     "so101": (".commands.so101", "so101"),
@@ -116,7 +117,8 @@ def cli(ctx: click.Context) -> None:
     Quick Start:
       1. cyberwave login                             # Login to your account
       2. cyberwave twin create <asset> --pair        # Create twin and pair device
-      3. cyberwave edge install                      # Install edge node on device
+      3. cyberwave pair                              # Pair this device as an edge node
+                                                     # (alias for `cyberwave edge install`)
       4. cyberwave edge driver list                  # List available drivers
 
     \b
