@@ -1981,6 +1981,11 @@ def enable_and_start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
     a manual ``systemctl restart``.  On a fresh install the service is
     not yet active, so ``restart`` behaves identically to ``start``.
 
+    The restart is issued with ``--no-block`` so the CLI returns
+    immediately instead of waiting for the ``Type=notify`` service to
+    signal ``READY=1`` (which includes Docker image pulls and can take
+    several minutes on slow links).
+
     Returns True on success.
     """
     if not spec.unit_path.exists():
@@ -1990,12 +1995,17 @@ def enable_and_start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
     try:
         _run(["systemctl", "daemon-reload"])
         _run(["systemctl", "enable", spec.unit_name])
-        _run(["systemctl", "restart", spec.unit_name])
+        _run(["systemctl", "restart", "--no-block", spec.unit_name])
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]systemctl command failed (exit {exc.returncode}).[/red]")
         return False
 
-    console.print(f"[green]Service enabled and started:[/green] {spec.unit_name}")
+    console.print(f"[green]Service enabled and (re)starting:[/green] {spec.unit_name}")
+    console.print(
+        f"[dim]The service is booting in the background (driver image pulls, "
+        f"twin sync, etc.).\n"
+        f"Run 'cyberwave edge logs' to follow progress.[/dim]"
+    )
     return True
 
 
