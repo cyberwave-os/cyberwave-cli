@@ -92,7 +92,37 @@ def test_edge_install_command_uses_channel_flag(monkeypatch):
             "channel": "dev",
             "version": "0.3.1.dev5",
             "force_reinstall": False,
-            "pull_worker_image": True,
+        }
+    ]
+
+
+def test_edge_install_without_workers_flag_is_deprecated_noop(monkeypatch):
+    """``--without-workers`` is accepted for backward compatibility but does not
+    forward ``pull_worker_image`` to ``setup_edge_core``."""
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cyberwave_cli.core",
+        types.SimpleNamespace(
+            setup_edge_core=lambda **kwargs: calls.append(kwargs) or True,
+        ),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        _edge_module.install_edge,
+        ["--without-workers", "--yes"],
+    )
+
+    assert result.exit_code == 0
+    assert "deprecated" in result.output.lower()
+    assert calls == [
+        {
+            "skip_confirm": True,
+            "channel": "stable",
+            "version": None,
+            "force_reinstall": False,
         }
     ]
 

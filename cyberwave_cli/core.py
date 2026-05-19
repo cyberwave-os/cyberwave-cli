@@ -2622,17 +2622,16 @@ def setup_edge_core(
     When *force_reinstall* is True, platform helpers (USB/IP, camera stream)
     are torn down and rebuilt from scratch.
 
-    When *pull_worker_image* is True (the default), the ML worker Docker
-    image is pulled after installation so workers are ready to run immediately.
+    The *pull_worker_image* parameter is **deprecated** and ignored.
+    The ML worker Docker image is now pulled asynchronously by the
+    edge-core service on first startup via ``WorkerManager``, matching the
+    same pattern used for driver images (CYB-2029).
 
     Returns True if everything succeeded.
     """
 
     def _post_install() -> bool:
-        ok = configure_edge_environment(skip_confirm=skip_confirm)
-        if ok and pull_worker_image:
-            _pull_worker_image()
-        return ok
+        return configure_edge_environment(skip_confirm=skip_confirm)
 
     return setup_service(
         EDGE_CORE_SPEC,

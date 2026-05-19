@@ -49,7 +49,6 @@ def test_pair_command_forwards_flags_to_setup_edge_core(monkeypatch) -> None:
             "channel": "dev",
             "version": "0.3.1.dev5",
             "force_reinstall": False,
-            "pull_worker_image": True,
         }
     ]
 

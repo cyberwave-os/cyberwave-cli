@@ -455,14 +455,16 @@ def edge():
     "--without-workers",
     is_flag=True,
     default=False,
-    help="Skip pulling the ML worker Docker image (cyberwaveos/edge-ml-worker)",
+    hidden=True,
+    help="[Deprecated] No-op. Worker images are now pulled by edge-core on startup.",
 )
 def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, without_workers):
     """Install cyberwave-edge-core and register it as a boot service.
 
     Downloads the cyberwave-edge-core package (via apt-get on Debian/Ubuntu,
     pip elsewhere) and creates a systemd service so it starts automatically on boot.
-    By default the ML worker Docker image is also pulled.
+    The ML worker Docker image is pulled asynchronously by edge-core on
+    first startup.
 
     On Linux, this command requires root privileges.
 
@@ -470,7 +472,6 @@ def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, wit
     Examples:
         sudo cyberwave edge install
         sudo cyberwave edge install -y
-        sudo cyberwave edge install --without-workers
         sudo cyberwave edge install --force-reinstall
         sudo cyberwave edge install --reconfigure-camera
         sudo cyberwave edge install --channel dev
@@ -509,6 +510,12 @@ def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, wit
             )
         return
 
+    if without_workers:
+        console.print(
+            "[dim]--without-workers is deprecated and ignored. "
+            "Worker images are now pulled by edge-core on startup.[/dim]"
+        )
+
     from ...core import setup_edge_core
 
     try:
@@ -517,7 +524,6 @@ def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, wit
             channel=channel.lower(),
             version=version,
             force_reinstall=force_reinstall,
-            pull_worker_image=not without_workers,
         ):
             raise SystemExit(1)
     except KeyboardInterrupt:
