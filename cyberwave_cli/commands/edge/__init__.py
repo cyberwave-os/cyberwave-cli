@@ -458,6 +458,12 @@ def edge():
     help="Re-run macOS microphone bridge setup (ffmpeg + audio_streams.json)",
 )
 @click.option(
+    "--microphone-index",
+    type=int,
+    default=None,
+    help="AVFoundation microphone index for --reconfigure-microphone (skips prompt)",
+)
+@click.option(
     "--without-workers",
     is_flag=True,
     default=False,
@@ -471,6 +477,7 @@ def install_edge(
     force_reinstall,
     reconfigure_camera,
     reconfigure_microphone,
+    microphone_index,
     without_workers,
 ):
     """Install cyberwave-edge-core and register it as a boot service.
@@ -503,9 +510,14 @@ def install_edge(
                 stop_edge_core_service,
             )
 
+            if microphone_index is not None and microphone_index < 0:
+                console.print("[red]--microphone-index must be >= 0.[/red]")
+                raise SystemExit(1)
+
             try:
                 if not setup_audio_stream_server(
                     force=True,
+                    device_index=microphone_index,
                     microphone_twins=_list_microphone_twins(),
                 ):
                     raise SystemExit(1)

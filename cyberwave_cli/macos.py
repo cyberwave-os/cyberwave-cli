@@ -1347,6 +1347,66 @@ def warn_on_camera_stream_config_drift() -> list[dict[str, Any]]:
     return orphans
 
 
+def _parse_menu_selection(raw: str) -> str:
+    """Normalize menu input from TTY Enter, CRLF paste, or bracketed paste."""
+    normalized = raw.replace("\r", "\n").strip()
+    if not normalized:
+        return ""
+    return normalized.splitlines()[0].strip()
+
+
+def _read_prompt_line(prompt: str) -> str:
+    """Read one line from stdin, accepting CR or LF as end-of-line.
+
+    Cursor's integrated terminal sends carriage-return only on Enter.  In
+    canonical (cooked) mode the kernel buffers until newline, so ``read(1)``
+    never sees bare ``\\r`` and the UI shows ``^M`` while waiting.  We switch
+    the TTY to raw mode for the duration of the prompt when possible.
+    """
+    if not sys.stdin.isatty():
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        return sys.stdin.readline()
+
+    try:
+        import termios
+        import tty
+    except ImportError:
+        return _parse_menu_selection(input(prompt))
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    buf: list[str] = []
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == "":
+                break
+            if ch in "\r\n":
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                break
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch in ("\x7f", "\b"):
+                if buf:
+                    buf.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if ch == "\x04":  # Ctrl+D
+                break
+            buf.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return "".join(buf)
+
+
 def _prompt_single_camera(
     cameras: list[tuple[int, str]], *, prompt_label: str, default_idx: int
 ) -> Optional[tuple[int, str]]:
@@ -1356,7 +1416,14 @@ def _prompt_single_camera(
     valid_indices = {i for i, _ in cameras}
     for idx, name in cameras:
         console.print(f"  [bold]{idx}[/bold]) {name}")
-    raw = input(f"{prompt_label} [{default_idx}]: ").strip()
+    if not sys.stdin.isatty():
+        console.print(
+            "[yellow]Warning:[/yellow] stdin is not a TTY — type only the menu "
+            "number on one line."
+        )
+    raw = _parse_menu_selection(
+        _read_prompt_line(f"{prompt_label} [{default_idx}]: ")
+    )
     if raw == "":
         chosen_idx = default_idx
     else:
@@ -2313,7 +2380,14 @@ def _prompt_single_microphone(
     valid_indices = {i for i, _ in microphones}
     for idx, name in microphones:
         console.print(f"  [bold]{idx}[/bold]) {name}")
-    raw = input(f"{prompt_label} [{default_idx}]: ").strip()
+    console.print(
+        "[dim]Press Enter for the default, or type a number and Enter. "
+        "In Cursor's terminal you can also use: "
+        "[bold]cyberwave edge install --reconfigure-microphone --microphone-index N[/bold][/dim]"
+    )
+    raw = _parse_menu_selection(
+        _read_prompt_line(f"{prompt_label} [{default_idx}]: ")
+    )
     if raw == "":
         chosen_idx = default_idx
     else:
@@ -2396,14 +2470,11 @@ def setup_audio_stream_server(
     capture_sample_rate, capture_channels = _resolve_microphone_capture_settings(
         microphone_twins
     )
-    if device_index is None:
-        from .device_utils import discover_microphones
+    from .device_utils import discover_microphones
 
-        microphones = [
-            (int(mic.paths[0]), mic.card) for mic in discover_microphones()
-        ]
-    else:
-        microphones = []
+    microphones = [
+        (int(mic.paths[0]), mic.card) for mic in discover_microphones()
+    ]
     multi_mapping = (
         device_index is None
         and len(microphone_twins) >= 2
@@ -2435,7 +2506,12 @@ def setup_audio_stream_server(
             _, device_name = chosen
             console.print(f"[green]Selected:[/green] {device_name}")
     else:
-        device_name = str(device_index)
+        matched_name = next(
+            (name for idx, name in microphones if idx == int(device_index)),
+            None,
+        )
+        device_name = matched_name or f":{int(device_index)}"
+        console.print(f"[green]Selected microphone index {device_index}:[/green] {device_name}")
 
     loaded, _port_open = _bring_up_audio_stream_slot(
         slot=0,
