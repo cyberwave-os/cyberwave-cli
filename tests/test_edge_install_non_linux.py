@@ -82,6 +82,7 @@ def test_setup_edge_core_macos_calls_usbip_setup(monkeypatch):
     monkeypatch.setattr(core, "_check_docker_macos", lambda: True)
     monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
     monkeypatch.setattr(core, "_any_twin_has_camera_sensor", lambda: True)
+    monkeypatch.setattr(core, "_any_twin_has_microphone_sensor", lambda: True)
     monkeypatch.setattr(
         core,
         "install_service_package",
@@ -96,6 +97,11 @@ def test_setup_edge_core_macos_calls_usbip_setup(monkeypatch):
         core,
         "setup_camera_stream_server",
         lambda **kw: calls.append("camera") or True,
+    )
+    monkeypatch.setattr(
+        core,
+        "setup_audio_stream_server",
+        lambda **kw: calls.append("audio") or True,
     )
     monkeypatch.setattr(
         core,
@@ -116,6 +122,7 @@ def test_setup_edge_core_macos_calls_usbip_setup(monkeypatch):
     assert core.setup_edge_core(skip_confirm=True) is True
     assert "usbip" in calls
     assert "camera" in calls
+    assert "audio" in calls
 
 
 def test_setup_edge_core_macos_continues_when_usbip_fails(monkeypatch):
@@ -148,12 +155,14 @@ def test_setup_edge_core_force_reinstall_passes_force_to_helpers(monkeypatch):
 
     usbip_kwargs: list[dict] = []
     camera_kwargs: list[dict] = []
+    audio_kwargs: list[dict] = []
 
     monkeypatch.setattr(core, "_is_linux", lambda: False)
     _mock_is_macos(monkeypatch, core, True)
     monkeypatch.setattr(core, "_check_docker_macos", lambda: True)
     monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
     monkeypatch.setattr(core, "_any_twin_has_camera_sensor", lambda: True)
+    monkeypatch.setattr(core, "_any_twin_has_microphone_sensor", lambda: True)
     monkeypatch.setattr(
         core,
         "install_service_package",
@@ -168,6 +177,11 @@ def test_setup_edge_core_force_reinstall_passes_force_to_helpers(monkeypatch):
         core,
         "setup_camera_stream_server",
         lambda **kw: camera_kwargs.append(kw) or True,
+    )
+    monkeypatch.setattr(
+        core,
+        "setup_audio_stream_server",
+        lambda **kw: audio_kwargs.append(kw) or True,
     )
     monkeypatch.setattr(
         core,
@@ -180,6 +194,7 @@ def test_setup_edge_core_force_reinstall_passes_force_to_helpers(monkeypatch):
     assert core.setup_edge_core(skip_confirm=True, force_reinstall=True) is True
     assert usbip_kwargs == [{"force": True, "skip_confirm": True}]
     assert camera_kwargs == [{"force": True, "camera_twins": []}]
+    assert audio_kwargs == [{"force": True, "microphone_twins": []}]
 
 
 def test_setup_edge_core_default_does_not_force(monkeypatch):
@@ -187,12 +202,14 @@ def test_setup_edge_core_default_does_not_force(monkeypatch):
 
     usbip_kwargs: list[dict] = []
     camera_kwargs: list[dict] = []
+    audio_kwargs: list[dict] = []
 
     monkeypatch.setattr(core, "_is_linux", lambda: False)
     _mock_is_macos(monkeypatch, core, True)
     monkeypatch.setattr(core, "_check_docker_macos", lambda: True)
     monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
     monkeypatch.setattr(core, "_any_twin_has_camera_sensor", lambda: True)
+    monkeypatch.setattr(core, "_any_twin_has_microphone_sensor", lambda: True)
     monkeypatch.setattr(
         core,
         "install_service_package",
@@ -210,6 +227,11 @@ def test_setup_edge_core_default_does_not_force(monkeypatch):
     )
     monkeypatch.setattr(
         core,
+        "setup_audio_stream_server",
+        lambda **kw: audio_kwargs.append(kw) or True,
+    )
+    monkeypatch.setattr(
+        core,
         "configure_edge_environment",
         lambda *, skip_confirm: True,
     )
@@ -219,6 +241,7 @@ def test_setup_edge_core_default_does_not_force(monkeypatch):
     assert core.setup_edge_core(skip_confirm=True) is True
     assert usbip_kwargs == [{"force": False, "skip_confirm": True}]
     assert camera_kwargs == [{"force": False, "camera_twins": []}]
+    assert audio_kwargs == [{"force": False, "microphone_twins": []}]
 
 
 def test_setup_edge_core_macos_rejects_sudo(monkeypatch):

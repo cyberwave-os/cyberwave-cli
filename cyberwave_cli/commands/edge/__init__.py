@@ -452,13 +452,27 @@ def edge():
     help="Re-run camera detection and save to cameras.json",
 )
 @click.option(
+    "--reconfigure-microphone",
+    is_flag=True,
+    default=False,
+    help="Re-run macOS microphone bridge setup (ffmpeg + audio_streams.json)",
+)
+@click.option(
     "--without-workers",
     is_flag=True,
     default=False,
     hidden=True,
     help="[Deprecated] No-op. Worker images are now pulled by edge-core on startup.",
 )
-def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, without_workers):
+def install_edge(
+    yes,
+    channel,
+    version,
+    force_reinstall,
+    reconfigure_camera,
+    reconfigure_microphone,
+    without_workers,
+):
     """Install cyberwave-edge-core and register it as a boot service.
 
     Downloads the cyberwave-edge-core package (via apt-get on Debian/Ubuntu,
@@ -474,9 +488,40 @@ def install_edge(yes, channel, version, force_reinstall, reconfigure_camera, wit
         sudo cyberwave edge install -y
         sudo cyberwave edge install --force-reinstall
         sudo cyberwave edge install --reconfigure-camera
+        sudo cyberwave edge install --reconfigure-microphone
         sudo cyberwave edge install --channel dev
         sudo cyberwave edge install --channel staging --version 0.0.42.595
     """
+    if reconfigure_microphone:
+        from ...macos import is_macos
+
+        if is_macos():
+            from ...core import _list_microphone_twins
+            from ...macos import (
+                setup_audio_stream_server,
+                start_edge_core_service,
+                stop_edge_core_service,
+            )
+
+            try:
+                if not setup_audio_stream_server(
+                    force=True,
+                    microphone_twins=_list_microphone_twins(),
+                ):
+                    raise SystemExit(1)
+                console.print("[cyan]Restarting edge-core so the driver reconnects...[/cyan]")
+                stop_edge_core_service()
+                start_edge_core_service()
+            except KeyboardInterrupt:
+                console.print("\n[dim]Aborted.[/dim]")
+                raise SystemExit(1)
+        else:
+            console.print(
+                "[yellow]--reconfigure-microphone is only supported on macOS.[/yellow]\n"
+                "[dim]On Linux, ensure driver containers mount /dev/snd.[/dim]"
+            )
+        return
+
     if reconfigure_camera:
         from ...macos import is_macos
 
@@ -573,7 +618,7 @@ def uninstall_edge(yes):
 
     if _is_macos():
         from ...config import clean_subprocess_env
-        from ...macos import _teardown_camera_stream_server
+        from ...macos import _teardown_audio_stream_server, _teardown_camera_stream_server
 
         _domain, target = _macos_launchagent_target()
         plist_path = _macos_launchagent_plist_path()
@@ -602,6 +647,13 @@ def uninstall_edge(yes):
         except Exception as exc:
             console.print(
                 f"[yellow]Camera stream teardown encountered an error: {exc}[/yellow]"
+            )
+
+        try:
+            _teardown_audio_stream_server()
+        except Exception as exc:
+            console.print(
+                f"[yellow]Audio stream teardown encountered an error: {exc}[/yellow]"
             )
 
         if plist_path.exists():
@@ -985,6 +1037,13 @@ def restart_edge(env_file):
 
         kickstart_unhealthy_camera_streams()
         warn_on_camera_stream_config_drift()
+        from ...macos import (
+            kickstart_unhealthy_audio_streams,
+            warn_on_audio_stream_config_drift,
+        )
+
+        kickstart_unhealthy_audio_streams()
+        warn_on_audio_stream_config_drift()
         return
 
     # Fallback: stop running process, then start a new one

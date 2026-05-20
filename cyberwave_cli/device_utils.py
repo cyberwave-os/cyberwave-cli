@@ -328,6 +328,59 @@ def _discover_cameras_avfoundation() -> list[CameraDevice]:
     return cameras
 
 
+@dataclass
+class MicrophoneDevice:
+    """A discovered audio input device."""
+
+    card: str
+    bus_info: str
+    paths: list[str] = field(default_factory=list)
+    driver: str = ""
+
+
+def _discover_microphones_avfoundation() -> list[MicrophoneDevice]:
+    """Discover microphones on macOS via AVFoundation (ffmpeg probe)."""
+    try:
+        from .macos import _list_avfoundation_audio_devices
+    except ImportError:
+        return []
+
+    microphones: list[MicrophoneDevice] = []
+    for idx, name in _list_avfoundation_audio_devices():
+        microphones.append(
+            MicrophoneDevice(
+                card=name,
+                bus_info=f"avfoundation-{idx}",
+                paths=[str(idx)],
+                driver="avfoundation",
+            )
+        )
+    return microphones
+
+
+def discover_microphones() -> list[MicrophoneDevice]:
+    """Discover audio input devices on the system.
+
+    Platform-specific:
+    - macOS: Uses AVFoundation via ffmpeg
+    - Linux: Not yet implemented (edge uses ALSA inside the container)
+    - Windows: Not yet implemented
+    """
+    import platform
+
+    system = platform.system()
+    if system == "Darwin":
+        return _discover_microphones_avfoundation()
+    if system == "Linux":
+        logger.debug("Linux microphone discovery is handled by the edge driver")
+        return []
+    if system == "Windows":
+        logger.warning("Windows microphone discovery not yet implemented")
+        return []
+    logger.warning("Unsupported platform for microphone discovery: %s", system)
+    return []
+
+
 def discover_usb_cameras() -> list[CameraDevice]:
     """Discover cameras on the system.
 

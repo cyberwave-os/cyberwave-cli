@@ -450,6 +450,7 @@ sudo cyberwave pair
 sudo cyberwave pair -y
 sudo cyberwave pair --channel dev
 sudo cyberwave pair --reconfigure-camera
+sudo cyberwave pair --reconfigure-microphone
 ```
 
 ### `cyberwave edge install`
@@ -466,17 +467,21 @@ Installs the `cyberwave-edge-core` package (via apt-get on Debian/Ubuntu) and cr
 
 On **macOS**, the installer also sets up an MJPEG camera stream bridge (using `ffmpeg` and AVFoundation) and prompts you to select which camera to use. The selected camera is stored by **device name** (not index) so it persists across USB reconnections and reboots. With multiple camera-bearing twins and multiple AVFoundation devices, the installer walks you through a per-twin mapping and launches one `ffmpeg` MJPEG service per distinct camera (sequential ports starting at `8091`). Assignments are persisted in `~/.cyberwave/camera_streams.json` under `twin_to_stream_url` and honored by edge-core when it wires each driver container.
 
+For **microphone** twins, the installer sets up a PCM audio stream bridge on the same pattern: `ffmpeg` captures from AVFoundation on the host and serves raw PCM over HTTP (ports starting at `8101`). Assignments are persisted in `~/.cyberwave/audio_streams.json` and injected as `CYBERWAVE_METADATA_AUDIO_DEVICE` when edge-core starts each generic-microphone driver container.
+
 On **Linux** with multiple camera-bearing twins, the installer walks you through a per-twin mapping so each twin is bound to a specific `/dev/video*` device. The mapping is persisted in `~/.cyberwave/cameras.json` under `twin_to_device` and honored by edge-core when it launches each driver container. A single-camera host automatically shares the device across every selected camera twin.
 
 ```bash
 sudo cyberwave edge install
 sudo cyberwave edge install -y   # skip prompts
 sudo cyberwave edge install --reconfigure-camera   # re-select camera without full reinstall
+sudo cyberwave edge install --reconfigure-microphone   # re-select microphone without full reinstall
 ```
 
 **Options:**
 
 - `--reconfigure-camera`: Re-run the camera selection prompt and restart the camera stream and edge-core service. Useful when switching between cameras (e.g. laptop webcam to external USB camera).
+- `--reconfigure-microphone`: Re-run the microphone selection prompt and restart the audio stream bridge and edge-core service. Useful when switching microphones or fixing a broken PCM bridge.
 - `--force-reinstall`: Force reinstall of the USB/IP server on macOS. Camera stream and edge-core setup are always forced during install.
 - `-y`: Skip interactive confirmation prompts.
 
@@ -502,6 +507,8 @@ cyberwave edge restart --env-file .env      # process mode
 ```
 
 On **macOS**, `cyberwave edge restart` also self-heals the camera bridge: after reloading the edge-core LaunchAgent it inspects every installed `com.cyberwave.camera-stream*` service and runs `launchctl kickstart -k` on any whose MJPEG port is silent (e.g. ffmpeg crashed, the camera was unplugged and replugged, or launchd's spawn-throttle disabled the slot). Healthy slots are left alone so a working stream isn't briefly interrupted. If `~/.cyberwave/camera_streams.json` still references a port no installed slot serves — typical after adding a camera-bearing twin without re-running camera selection — a one-line warning per orphan twin points at `sudo cyberwave edge install --reconfigure-camera`.
+
+The same restart path self-heals the microphone PCM bridge (`com.cyberwave.audio-stream*`, ports from `8101`) and warns when `~/.cyberwave/audio_streams.json` references a port with no installed slot — recover with `sudo cyberwave edge install --reconfigure-microphone`.
 
 ### `cyberwave edge status`
 

@@ -45,6 +45,7 @@ from .macos import (
     bootstrap_launchd_service,
     is_macos,
     legacy_labels_for_package,
+    setup_audio_stream_server,
     setup_camera_stream_server,
     setup_usbip_server,
     wait_for_launchd_unload,
@@ -2101,6 +2102,7 @@ def start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
 
 
 _CAMERA_SENSOR_TYPES = {"camera", "rgb", "depth_camera"}
+_MICROPHONE_SENSOR_TYPES = {"audio", "audio_mono", "audio_stereo", "microphone"}
 
 
 def _load_selected_twin_uuids() -> set[str] | None:
@@ -2165,6 +2167,48 @@ def _list_camera_twins() -> list[tuple[str, str]]:
 def _any_twin_has_camera_sensor() -> bool:
     """Check downloaded twin JSON files for camera-type sensors."""
     return bool(_list_camera_twins())
+
+
+def _list_microphone_twins() -> list[tuple[str, str]]:
+    """Return ``(twin_uuid, twin_name)`` for each selected twin with a microphone sensor."""
+    selected_uuids = _load_selected_twin_uuids()
+    results: list[tuple[str, str]] = []
+    for path in sorted(CONFIG_DIR.glob("*.json")):
+        if path.name in (
+            "credentials.json",
+            "environment.json",
+            "cameras.json",
+            "camera_streams.json",
+            "audio_streams.json",
+            "fingerprint.json",
+        ):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        asset = data.get("asset") or {}
+        schema = asset.get("universal_schema") or {}
+        sensors = schema.get("sensors") or []
+        if not any(
+            str(sensor.get("type", "")).strip().lower() in _MICROPHONE_SENSOR_TYPES
+            for sensor in sensors
+            if isinstance(sensor, dict)
+        ):
+            continue
+        twin_uuid = str(data.get("uuid") or path.stem)
+        twin_name = str(data.get("name") or twin_uuid)
+        if not twin_uuid:
+            continue
+        if selected_uuids is not None and twin_uuid not in selected_uuids:
+            continue
+        results.append((twin_uuid, twin_name))
+    return results
+
+
+def _any_twin_has_microphone_sensor() -> bool:
+    """Check downloaded twin JSON files for microphone-type sensors."""
+    return bool(_list_microphone_twins())
 
 
 def _render_camera_menu(
@@ -2492,6 +2536,23 @@ def setup_service(
                 )
         elif linux_service_setup:
             _detect_and_select_cameras()
+
+    if spec.requires_docker and _any_twin_has_microphone_sensor():
+        if is_macos():
+            if not setup_audio_stream_server(
+                force=force_reinstall,
+                microphone_twins=_list_microphone_twins(),
+            ):
+                console.print(
+                    "[yellow]Microphone stream setup failed. The generic-microphone "
+                    "driver will not receive a host audio bridge URL.[/yellow]\n"
+                    "[dim]Retry: cyberwave edge install --reconfigure-microphone[/dim]"
+                )
+        else:
+            console.print(
+                "[dim]Linux microphone twins use /dev/snd inside Docker; ensure "
+                "driver params include --device /dev/snd and --group-add audio.[/dim]"
+            )
 
     if linux_service_setup:
         if not create_systemd_service(spec):

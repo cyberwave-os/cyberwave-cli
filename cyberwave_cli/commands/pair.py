@@ -25,6 +25,7 @@ Examples:
     sudo cyberwave pair -y
     sudo cyberwave pair --channel dev
     sudo cyberwave pair --reconfigure-camera
+    sudo cyberwave pair --reconfigure-microphone
 """
 
 

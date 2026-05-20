@@ -1108,3 +1108,101 @@ def test_warn_on_camera_stream_config_drift_flags_orphan_twins(
     assert "twin-served" not in printed, (
         "Healthy twin must not be mentioned"
     )
+
+
+# ---- audio-stream auto-recovery on `edge restart` -----------------------------
+
+
+def _install_audio_stream_plist(tmp_path: Path, slot: int) -> Path:
+    """Materialize a fake audio-stream plist for ``slot`` under tmp_path."""
+    agents_dir = tmp_path / "Library" / "LaunchAgents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    label = (
+        "com.cyberwave.audio-stream"
+        if slot == 0
+        else f"com.cyberwave.audio-stream.{slot}"
+    )
+    plist = agents_dir / f"{label}.plist"
+    plist.write_text("<plist/>", encoding="utf-8")
+    return plist
+
+
+def test_kickstart_unhealthy_audio_streams_only_kickstarts_silent_slots(
+    monkeypatch, tmp_path
+):
+    """Slot 0 listening, slot 1 silent: only slot 1 gets `launchctl kickstart -k`."""
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setattr(macos, "is_macos", lambda: True)
+    monkeypatch.setattr(macos, "_user_home", lambda: tmp_path)
+    _stub_real_user(macos, monkeypatch, uid=501)
+
+    _install_audio_stream_plist(tmp_path, 0)
+    _install_audio_stream_plist(tmp_path, 1)
+
+    listening_ports = {8101}
+
+    def fake_is_port_listening(port):
+        return port in listening_ports
+
+    monkeypatch.setattr(macos, "_is_port_listening", fake_is_port_listening)
+    monkeypatch.setattr(macos.time, "sleep", lambda _s: None)
+
+    kickstarts: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        kickstarts.append(list(cmd))
+        listening_ports.add(8102)
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(macos, "_run", fake_run)
+
+    results = macos.kickstart_unhealthy_audio_streams()
+
+    by_slot = {r["slot"]: r for r in results}
+    assert by_slot[0]["was_listening"] is True
+    assert by_slot[0]["kickstarted"] is False
+
+    assert by_slot[1]["was_listening"] is False
+    assert by_slot[1]["kickstarted"] is True
+    assert by_slot[1]["healthy_after"] is True
+
+    kickstart_targets = [
+        cmd[cmd.index("kickstart") + 2]
+        for cmd in kickstarts
+        if "kickstart" in cmd
+    ]
+    assert kickstart_targets == ["gui/501/com.cyberwave.audio-stream.1"]
+
+
+def test_warn_on_audio_stream_config_drift_flags_orphan_twins(
+    monkeypatch, tmp_path
+):
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setattr(macos, "is_macos", lambda: True)
+    monkeypatch.setattr(macos, "_user_home", lambda: tmp_path)
+
+    _install_audio_stream_plist(tmp_path, 0)
+
+    config_dir = tmp_path / ".cyberwave"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "audio_streams.json").write_text(
+        '{"twin_to_stream_url": {'
+        '"twin-served": "http://host.docker.internal:8101",'
+        '"twin-orphaned": "http://host.docker.internal:8102"'
+        "}}",
+        encoding="utf-8",
+    )
+
+    fake_console = MagicMock()
+    monkeypatch.setattr(macos, "_get_console", lambda: fake_console)
+
+    orphans = macos.warn_on_audio_stream_config_drift()
+
+    assert [o["twin_uuid"] for o in orphans] == ["twin-orphaned"]
+    assert orphans[0]["port"] == 8102
+
+    printed = " ".join(str(c) for c in fake_console.print.call_args_list)
+    assert "twin-orphaned" in printed
+    assert "8102" in printed
+    assert "--reconfigure-microphone" in printed
+    assert "twin-served" not in printed

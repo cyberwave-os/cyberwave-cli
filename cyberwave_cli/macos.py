@@ -1740,6 +1740,946 @@ def _print_multi_camera_summary(
         )
 
 
+# ---- Audio stream server (PCM HTTP bridge) ----------------------------------
+# Docker Desktop on macOS cannot expose CoreAudio inside Linux containers.
+# ffmpeg captures from AVFoundation on the host and serves raw PCM s16le over
+# HTTP (``-listen 1``), which the generic-microphone driver reads inside Docker.
+
+AUDIO_STREAM_LAUNCHD_LABEL = "com.cyberwave.audio-stream"
+AUDIO_STREAM_PORT = 8101
+AUDIO_STREAM_LAUNCHD_LABEL_PREFIX = f"{AUDIO_STREAM_LAUNCHD_LABEL}."
+AUDIO_STREAMS_FILENAME = "audio_streams.json"
+
+_AUDIO_STREAM_WRAPPER_TEMPLATE = textwrap.dedent("""\
+    #!/bin/bash
+    # Cyberwave audio stream — captures from macOS microphone and serves PCM.
+    export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+    DEVICE="${{CYBERWAVE_AUDIO_DEVICE:-:0}}"
+    PORT="${{CYBERWAVE_AUDIO_STREAM_PORT:-{port}}}"
+    SAMPLE_RATE="${{CYBERWAVE_AUDIO_SAMPLE_RATE:-48000}}"
+    CHANNELS="${{CYBERWAVE_AUDIO_CHANNELS:-1}}"
+
+    trap 'exit 0' INT TERM
+
+    logger -t cyberwave-audio-stream \\
+        "Starting PCM server on port $PORT (device=$DEVICE, rate=$SAMPLE_RATE, ch=$CHANNELS)"
+
+    while true; do
+        ffmpeg -hide_banner -loglevel warning \\
+            -fflags nobuffer -flags low_delay \\
+            -f avfoundation -i "$DEVICE" \\
+            -ac "$CHANNELS" -ar "$SAMPLE_RATE" \\
+            -acodec pcm_s16le -f s16le \\
+            -listen 1 \\
+            "http://0.0.0.0:$PORT"
+        ffmpeg_status=$?
+        logger -t cyberwave-audio-stream "ffmpeg exited (status $ffmpeg_status); restarting in 1s"
+        sleep 1
+    done
+""")
+
+_AUDIO_STREAM_PLIST_TEMPLATE = textwrap.dedent("""\
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+      "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>{label}</string>
+        <key>ProgramArguments</key>
+        <array>
+            <string>{wrapper_path}</string>
+        </array>
+        <key>EnvironmentVariables</key>
+        <dict>
+            <key>CYBERWAVE_AUDIO_DEVICE</key>
+            <string>{device_spec}</string>
+            <key>CYBERWAVE_AUDIO_SAMPLE_RATE</key>
+            <string>{sample_rate}</string>
+            <key>CYBERWAVE_AUDIO_CHANNELS</key>
+            <string>{channels}</string>
+        </dict>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>KeepAlive</key>
+        <true/>
+        <key>StandardOutPath</key>
+        <string>{log_path}</string>
+        <key>StandardErrorPath</key>
+        <string>{log_path}</string>
+    </dict>
+    </plist>
+""")
+
+
+def _audio_stream_wrapper_path(slot: Optional[int] = None) -> Path:
+    if slot is None or slot == 0:
+        return _user_home() / ".cyberwave" / "audio_stream.sh"
+    return _user_home() / ".cyberwave" / f"audio_stream.{slot}.sh"
+
+
+def _audio_stream_plist_path(slot: Optional[int] = None) -> Path:
+    label = _audio_stream_launchd_label(slot)
+    return _user_home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+
+def _audio_stream_log_path(slot: Optional[int] = None) -> Path:
+    if slot is None or slot == 0:
+        return _user_home() / ".cyberwave" / "audio_stream.log"
+    return _user_home() / ".cyberwave" / f"audio_stream.{slot}.log"
+
+
+def _audio_stream_launchd_label(slot: Optional[int] = None) -> str:
+    if slot is None or slot == 0:
+        return AUDIO_STREAM_LAUNCHD_LABEL
+    return f"{AUDIO_STREAM_LAUNCHD_LABEL_PREFIX}{slot}"
+
+
+def _audio_stream_port(slot: Optional[int] = None) -> int:
+    if slot is None or slot == 0:
+        return AUDIO_STREAM_PORT
+    return AUDIO_STREAM_PORT + int(slot)
+
+
+def _audio_streams_config_path() -> Path:
+    return _user_home() / ".cyberwave" / AUDIO_STREAMS_FILENAME
+
+
+_MICROPHONE_SENSOR_TYPES = frozenset(
+    {"audio", "audio_mono", "audio_stereo", "microphone", "stereo", "mono"}
+)
+
+
+def _audio_sensor_parameters_from_twin_data(data: dict[str, Any]) -> dict[str, str]:
+    """Return audio sensor ``parameters`` from a pulled twin JSON blob."""
+    sensor_lists: list[list[Any]] = []
+    for path in (
+        ("metadata", "sensors"),
+        ("asset", "universal_schema", "sensors"),
+        ("sensors",),
+    ):
+        obj: Any = data
+        for key in path:
+            if not isinstance(obj, dict):
+                obj = None
+                break
+            obj = obj.get(key)
+        if isinstance(obj, list):
+            sensor_lists.append(obj)
+
+    for sensors in sensor_lists:
+        for sensor in sensors:
+            if not isinstance(sensor, dict):
+                continue
+            sensor_type = str(sensor.get("type", "")).strip().lower()
+            if sensor_type not in _MICROPHONE_SENSOR_TYPES:
+                continue
+            raw_params = sensor.get("parameters")
+            if not isinstance(raw_params, dict):
+                continue
+            return {
+                str(key): str(value)
+                for key, value in raw_params.items()
+                if value is not None
+            }
+    return {}
+
+
+def _resolve_microphone_capture_settings(
+    microphone_twins: list[tuple[str, str]] | None,
+) -> tuple[int, int]:
+    """Resolve host-bridge capture rate/channels from twin JSON (default 48 kHz mono)."""
+    from .config import CONFIG_DIR
+
+    sample_rate = 48_000
+    channels = 1
+    for twin_uuid, _ in microphone_twins or []:
+        twin_path = CONFIG_DIR / f"{twin_uuid}.json"
+        if not twin_path.is_file():
+            continue
+        try:
+            import json
+
+            data = json.loads(twin_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        params = _audio_sensor_parameters_from_twin_data(data)
+        if not params:
+            continue
+        raw_rate = params.get("audio_sample_rate", "").strip()
+        raw_channels = params.get("audio_channels", "").strip()
+        try:
+            if raw_rate:
+                sample_rate = int(raw_rate)
+        except ValueError:
+            pass
+        try:
+            if raw_channels:
+                parsed_channels = int(raw_channels)
+                if parsed_channels in {1, 2}:
+                    channels = parsed_channels
+        except ValueError:
+            pass
+        break
+    return sample_rate, channels
+
+
+def _load_audio_streams_config() -> dict[str, Any]:
+    import json
+
+    path = _audio_streams_config_path()
+    if not path.is_file():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw) if raw.strip() else {}
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_audio_stream_capture_settings() -> tuple[int, int]:
+    """Read persisted bridge capture settings from ``audio_streams.json``."""
+    data = _load_audio_streams_config()
+    sample_rate = 48_000
+    channels = 1
+    try:
+        if data.get("capture_sample_rate") is not None:
+            sample_rate = int(data["capture_sample_rate"])
+    except (TypeError, ValueError):
+        pass
+    try:
+        if data.get("channels") is not None:
+            parsed = int(data["channels"])
+            if parsed in {1, 2}:
+                channels = parsed
+    except (TypeError, ValueError):
+        pass
+    return sample_rate, channels
+
+
+def _list_avfoundation_audio_devices() -> list[tuple[int, str]]:
+    """Return AVFoundation audio devices as ``[(index, name), ...]``."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={
+                **os.environ,
+                "PATH": f"/opt/homebrew/bin:/usr/local/bin:{os.environ.get('PATH', '')}",
+            },
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+    devices: list[tuple[int, str]] = []
+    in_audio_section = False
+    for line in result.stderr.splitlines():
+        if "AVFoundation audio devices:" in line:
+            in_audio_section = True
+            continue
+        if in_audio_section and "AVFoundation video devices:" in line:
+            break
+        if in_audio_section:
+            match = re.search(r"\[(\d+)] (.+)$", line)
+            if match:
+                devices.append((int(match.group(1)), match.group(2).strip()))
+    return devices
+
+
+def _avfoundation_audio_device_spec(device_name: str) -> str:
+    """Build an ffmpeg AVFoundation audio-only input specifier."""
+    name = device_name.strip()
+    if name.startswith("none:") or name.startswith(":"):
+        return name
+    return f"none:{name}"
+
+
+def is_audio_stream_running() -> bool:
+    return _is_port_listening(AUDIO_STREAM_PORT)
+
+
+def _discover_audio_stream_slots() -> list[int]:
+    agents_dir = _user_home() / "Library" / "LaunchAgents"
+    if not agents_dir.is_dir():
+        return [0]
+    slots: set[int] = {0}
+    for entry in agents_dir.iterdir():
+        name = entry.name
+        if not name.startswith(AUDIO_STREAM_LAUNCHD_LABEL_PREFIX):
+            continue
+        if not name.endswith(".plist"):
+            continue
+        suffix = name[len(AUDIO_STREAM_LAUNCHD_LABEL_PREFIX) : -len(".plist")]
+        try:
+            slots.add(int(suffix))
+        except ValueError:
+            continue
+    return sorted(slots)
+
+
+def _teardown_audio_stream_server() -> None:
+    console = _get_console()
+    console.print("[cyan]Tearing down existing audio stream server(s)...[/cyan]")
+
+    slots = _discover_audio_stream_slots()
+    for slot in slots:
+        _bootout_launchd_service(_audio_stream_launchd_label(slot))
+
+    for _ in range(5):
+        result = subprocess.run(
+            ["pgrep", "-f", "ffmpeg.*avfoundation.*s16le"],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            break
+        subprocess.run(
+            ["pkill", "-f", "ffmpeg.*avfoundation"],
+            capture_output=True,
+        )
+        time.sleep(0.5)
+
+    paths_to_remove: list[Path] = []
+    for slot in slots:
+        paths_to_remove.extend(
+            [
+                _audio_stream_plist_path(slot),
+                _audio_stream_wrapper_path(slot),
+                _audio_stream_log_path(slot),
+            ]
+        )
+    paths_to_remove.append(_audio_streams_config_path())
+    for path in paths_to_remove:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            console.print(f"[yellow]Could not remove {path}[/yellow]")
+
+    console.print("[green]Audio stream server teardown complete.[/green]")
+
+
+def _bring_up_audio_stream_slot(
+    *,
+    slot: int,
+    device_name: str,
+    sample_rate: int = 48_000,
+    channels: int = 1,
+) -> tuple[bool, bool]:
+    console = _get_console()
+    wrapper_path = _audio_stream_wrapper_path(slot)
+    plist_path = _audio_stream_plist_path(slot)
+    log_path = _audio_stream_log_path(slot)
+    label = _audio_stream_launchd_label(slot)
+    port = _audio_stream_port(slot)
+    device_spec = _avfoundation_audio_device_spec(device_name)
+
+    wrapper_contents = _AUDIO_STREAM_WRAPPER_TEMPLATE.format(port=port)
+    try:
+        _write_file_as_real_user(wrapper_path, wrapper_contents, mode=0o755)
+    except OSError as exc:
+        console.print(f"[red]Failed to create audio stream script: {exc}[/red]")
+        return False, False
+
+    plist_contents = _AUDIO_STREAM_PLIST_TEMPLATE.format(
+        label=label,
+        wrapper_path=str(wrapper_path),
+        log_path=str(log_path),
+        device_spec=_xml_escape(device_spec),
+        sample_rate=str(sample_rate),
+        channels=str(channels),
+    )
+    try:
+        _write_file_as_real_user(plist_path, plist_contents)
+    except OSError as exc:
+        console.print(f"[red]Failed to write audio stream plist: {exc}[/red]")
+        return False, False
+
+    console.print(f"[green]Created:[/green] {plist_path}")
+
+    _, real_uid, _ = _resolve_real_user()
+    gui_domain = f"gui/{real_uid}" if real_uid is not None else None
+
+    wait_for_launchd_unload(label)
+
+    if gui_domain:
+        try:
+            bootstrap_launchd_service(gui_domain, plist_path)
+        except subprocess.CalledProcessError:
+            console.print(
+                "[yellow]launchctl bootstrap failed, falling back to load...[/yellow]"
+            )
+            try:
+                _run(_launchctl_as_user(["load", str(plist_path)]))
+            except subprocess.CalledProcessError as exc:
+                console.print(
+                    f"[red]Failed to load audio stream service (exit {exc.returncode}).[/red]"
+                )
+                return False, False
+    else:
+        try:
+            _run(_launchctl_as_user(["load", str(plist_path)]))
+        except subprocess.CalledProcessError as exc:
+            console.print(
+                f"[red]Failed to load audio stream service (exit {exc.returncode}).[/red]"
+            )
+            return False, False
+
+    max_wait_secs = 10
+    for _ in range(max_wait_secs * 2):
+        if _is_port_listening(port):
+            console.print(
+                f"[green]Audio stream server running on port {port} ({label}).[/green]"
+            )
+            return True, True
+        time.sleep(0.5)
+
+    console.print(
+        f"[yellow]Audio stream service {label} loaded but port {port} is not "
+        f"listening after {max_wait_secs}s. Check logs at {log_path}[/yellow]"
+    )
+    return True, False
+
+
+def _installed_audio_stream_slots() -> list[int]:
+    return [
+        slot
+        for slot in _discover_audio_stream_slots()
+        if _audio_stream_plist_path(slot).is_file()
+    ]
+
+
+def kickstart_unhealthy_audio_streams(
+    *, wait_secs: int = 5
+) -> list[dict[str, Any]]:
+    """Kickstart any installed audio-stream LaunchAgent whose port is silent.
+
+    Walks every plist under ``~/Library/LaunchAgents`` matching the
+    ``com.cyberwave.audio-stream*`` label, checks whether the matching
+    PCM port is listening, and runs ``launchctl kickstart -k`` on the
+    ones that aren't.  Healthy slots are left alone.
+
+    No-op on non-macOS.  Returns a list of per-slot result dicts so the
+    caller (and tests) can see what happened.  ``edge restart`` calls this
+    right after the edge-core LaunchAgent has been reloaded.
+    """
+    if not is_macos():
+        return []
+
+    slots = _installed_audio_stream_slots()
+    if not slots:
+        return []
+
+    console = _get_console()
+    _, real_uid, _ = _resolve_real_user()
+    uid = real_uid if real_uid is not None else os.getuid()
+
+    results: list[dict[str, Any]] = []
+    for slot in slots:
+        label = _audio_stream_launchd_label(slot)
+        port = _audio_stream_port(slot)
+        was_listening = _is_port_listening(port)
+        result: dict[str, Any] = {
+            "slot": slot,
+            "label": label,
+            "port": port,
+            "was_listening": was_listening,
+            "kickstarted": False,
+            "healthy_after": was_listening,
+        }
+        if was_listening:
+            results.append(result)
+            continue
+
+        console.print(
+            f"[yellow]Audio stream slot {slot} (port {port}) is silent — "
+            f"kickstarting {label}...[/yellow]"
+        )
+        try:
+            _run(
+                _launchctl_as_user(
+                    ["kickstart", "-k", f"gui/{uid}/{label}"]
+                ),
+                check=True,
+            )
+            result["kickstarted"] = True
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            console.print(
+                f"[red]Failed to kickstart {label} (exit "
+                f"{getattr(exc, 'returncode', 'n/a')}). "
+                f"Try: sudo cyberwave edge install --reconfigure-microphone[/red]"
+            )
+            results.append(result)
+            continue
+
+        for _ in range(max(wait_secs, 1) * 2):
+            if _is_port_listening(port):
+                result["healthy_after"] = True
+                break
+            time.sleep(0.5)
+
+        if result["healthy_after"]:
+            console.print(
+                f"[green]Audio stream slot {slot} healthy on port {port}.[/green]"
+            )
+        else:
+            log_path = _audio_stream_log_path(slot)
+            console.print(
+                f"[yellow]Audio stream slot {slot} still not listening on "
+                f"port {port} after kickstart. Check {log_path} (microphone "
+                f"in use by another app, missing TCC permission, or device "
+                f"unavailable).[/yellow]"
+            )
+        results.append(result)
+
+    return results
+
+
+def warn_on_audio_stream_config_drift() -> list[dict[str, Any]]:
+    """Warn when ``audio_streams.json`` references ports no slot serves.
+
+    The mapping file pins each twin to a specific PCM port (e.g.
+    ``http://host.docker.internal:8102``).  If a microphone was unplugged,
+    the install was partial, or the user added a twin without re-running
+    ``--reconfigure-microphone``, the JSON can drift out of sync with what
+    launchd actually has loaded.  ``kickstart_unhealthy_audio_streams``
+    won't help in that case — there's no plist to kickstart — so surface
+    a one-line yellow hint per orphaned twin pointing at the supported
+    recovery command.
+
+    No-op on non-macOS.  Returns the list of orphans so callers/tests
+    can inspect.
+    """
+    if not is_macos():
+        return []
+
+    config_path = _audio_streams_config_path()
+    if not config_path.is_file():
+        return []
+
+    import json
+    from urllib.parse import urlparse
+
+    try:
+        raw = config_path.read_text()
+        data = json.loads(raw) if raw.strip() else {}
+    except (OSError, ValueError):
+        return []
+
+    twin_to_url = data.get("twin_to_stream_url") or {}
+    if not isinstance(twin_to_url, dict) or not twin_to_url:
+        return []
+
+    served_ports = {
+        _audio_stream_port(slot) for slot in _installed_audio_stream_slots()
+    }
+
+    orphans: list[dict[str, Any]] = []
+    for twin_uuid, url in twin_to_url.items():
+        if not isinstance(url, str):
+            continue
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            continue
+        port = parsed.port
+        if port is None or port in served_ports:
+            continue
+        orphans.append({"twin_uuid": twin_uuid, "url": url, "port": port})
+
+    if not orphans:
+        return []
+
+    console = _get_console()
+    for orphan in orphans:
+        console.print(
+            f"[yellow]Twin {orphan['twin_uuid']} expects "
+            f"{orphan['url']} but no audio-stream slot serves port "
+            f"{orphan['port']}.[/yellow]\n"
+            f"[dim]Run: sudo cyberwave edge install --reconfigure-microphone[/dim]"
+        )
+    return orphans
+
+
+def _prompt_single_microphone(
+    microphones: list[tuple[int, str]], *, prompt_label: str, default_idx: int
+) -> Optional[tuple[int, str]]:
+    """Render a menu, read stdin, and return the chosen ``(index, name)`` or ``None``."""
+    console = _get_console()
+    console.print("[cyan]Available microphones:[/cyan]")
+    valid_indices = {i for i, _ in microphones}
+    for idx, name in microphones:
+        console.print(f"  [bold]{idx}[/bold]) {name}")
+    raw = input(f"{prompt_label} [{default_idx}]: ").strip()
+    if raw == "":
+        chosen_idx = default_idx
+    else:
+        try:
+            chosen_idx = int(raw)
+        except ValueError:
+            console.print("[red]Invalid selection.[/red]")
+            return None
+    if chosen_idx not in valid_indices:
+        console.print(f"[red]Microphone index {chosen_idx} is not available.[/red]")
+        return None
+    chosen_name = next(
+        (n for i, n in microphones if i == chosen_idx), str(chosen_idx)
+    )
+    return chosen_idx, chosen_name
+
+
+def _persist_audio_streams_config(
+    *,
+    devices: list[tuple[int, str]],
+    twin_to_stream_url: dict[str, str],
+    capture_sample_rate: int | None = None,
+    channels: int | None = None,
+) -> None:
+    import json
+
+    console = _get_console()
+    path = _audio_streams_config_path()
+    data = {
+        "devices": [{"index": idx, "name": name} for idx, name in devices],
+        "twin_to_stream_url": twin_to_stream_url,
+    }
+    if capture_sample_rate is not None:
+        data["capture_sample_rate"] = int(capture_sample_rate)
+    if channels is not None:
+        data["channels"] = int(channels)
+    try:
+        _write_file_as_real_user(path, json.dumps(data, indent=2))
+        console.print(f"[dim]Saved twin→microphone map to {path}[/dim]")
+    except OSError as exc:
+        console.print(
+            f"[yellow]Could not persist {path}: {exc}[/yellow]\n"
+            f"[dim]Per-twin microphone mapping may not survive reboots.[/dim]"
+        )
+
+
+def setup_audio_stream_server(
+    *,
+    force: bool = False,
+    device_index: Optional[int] = None,
+    microphone_twins: Optional[list[tuple[str, str]]] = None,
+) -> bool:
+    """Install the macOS host PCM audio bridge for Docker microphone drivers."""
+    if not is_macos():
+        return True
+
+    console = _get_console()
+
+    if force:
+        _teardown_audio_stream_server()
+    elif is_audio_stream_running():
+        console.print("[green]Audio stream server is already running.[/green]")
+        return True
+
+    if not _has_ffmpeg():
+        console.print(
+            "[red]ffmpeg is required for the audio stream server.[/red]\n"
+            "[dim]Install with: brew install ffmpeg[/dim]"
+        )
+        return False
+
+    console.print(
+        "\n[bold]Microphone Stream Server Setup[/bold]\n"
+        "This captures your macOS microphone with ffmpeg and serves raw PCM\n"
+        "over HTTP so the generic-microphone driver can run inside Docker.\n"
+        "[dim]Grant microphone permission to Terminal/iTerm when macOS prompts.[/dim]\n"
+    )
+
+    microphone_twins = microphone_twins or []
+    capture_sample_rate, capture_channels = _resolve_microphone_capture_settings(
+        microphone_twins
+    )
+    if device_index is None:
+        from .device_utils import discover_microphones
+
+        microphones = [
+            (int(mic.paths[0]), mic.card) for mic in discover_microphones()
+        ]
+    else:
+        microphones = []
+    multi_mapping = (
+        device_index is None
+        and len(microphone_twins) >= 2
+        and len(microphones) >= 2
+    )
+
+    if multi_mapping:
+        return _setup_audio_stream_server_multi(microphones, microphone_twins)
+
+    device_name: Optional[str] = None
+    if device_index is None:
+        if not microphones:
+            console.print(
+                "[yellow]Could not detect AVFoundation microphones; "
+                "defaulting to device :0.[/yellow]"
+            )
+            device_name = ":0"
+        elif len(microphones) == 1:
+            device_name = microphones[0][1]
+            console.print(f"[cyan]Detected microphone:[/cyan] {device_name}")
+        else:
+            chosen = _prompt_single_microphone(
+                microphones,
+                prompt_label="Enter microphone number",
+                default_idx=microphones[0][0],
+            )
+            if chosen is None:
+                return False
+            _, device_name = chosen
+            console.print(f"[green]Selected:[/green] {device_name}")
+    else:
+        device_name = str(device_index)
+
+    loaded, _port_open = _bring_up_audio_stream_slot(
+        slot=0,
+        device_name=device_name or ":0",
+        sample_rate=capture_sample_rate,
+        channels=capture_channels,
+    )
+    if not loaded:
+        return False
+
+    stream_url = f"http://host.docker.internal:{AUDIO_STREAM_PORT}"
+    try:
+        from .credentials import upsert_runtime_env
+
+        upsert_runtime_env("CYBERWAVE_MACOS_AUDIO_STREAM_URL", stream_url)
+        console.print(
+            f"[green]Saved[/green] CYBERWAVE_MACOS_AUDIO_STREAM_URL={stream_url} "
+            "to credentials.json"
+        )
+    except Exception as exc:
+        console.print(
+            f"[yellow]Could not persist audio stream URL: {exc}[/yellow]\n"
+            f"[dim]Set manually: export CYBERWAVE_MACOS_AUDIO_STREAM_URL={stream_url}[/dim]"
+        )
+
+    if microphone_twins:
+        twin_map = {str(twin_uuid): stream_url for twin_uuid, _ in microphone_twins}
+        _persist_audio_streams_config(
+            devices=microphones or [(0, device_name or ":0")],
+            twin_to_stream_url=twin_map,
+            capture_sample_rate=capture_sample_rate,
+            channels=capture_channels,
+        )
+
+    return True
+
+
+def _setup_audio_stream_server_multi(
+    microphones: list[tuple[int, str]],
+    microphone_twins: list[tuple[str, str]],
+) -> bool:
+    console = _get_console()
+    console.print(
+        f"\n[bold]Detected {len(microphones)} microphone(s) and "
+        f"{len(microphone_twins)} microphone twin(s).[/bold]"
+    )
+
+    twin_assignments: dict[str, tuple[int, str]] = {}
+    mic_to_slot: dict[int, tuple[str, int]] = {}
+    valid_indices = {i for i, _ in microphones}
+    default_idx = microphones[0][0]
+    twin_name_by_uuid = {str(uuid): name for uuid, name in microphone_twins}
+    aborted = False
+
+    for twin_uuid, twin_name in microphone_twins:
+        console.print(f"[bold]Twin:[/bold] {twin_name} [dim]({twin_uuid[:8]}...)[/dim]")
+        for idx, name in microphones:
+            assigned_names = [
+                twin_name_by_uuid.get(other_uuid, other_uuid)
+                for other_uuid, (other_idx, _) in twin_assignments.items()
+                if other_idx == idx
+            ]
+            suffix = (
+                f"  [dim](already assigned to: {', '.join(assigned_names)})[/dim]"
+                if assigned_names
+                else ""
+            )
+            console.print(f"  [bold]{idx}[/bold]) {name}{suffix}")
+        try:
+            raw = input(f"Microphone for {twin_name} [{default_idx}]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print(
+                "\n[yellow]Aborted — keeping mappings made so far; "
+                "remaining twins will fall back to the default stream.[/yellow]"
+            )
+            aborted = True
+            break
+        if raw == "":
+            chosen_idx = default_idx
+        else:
+            try:
+                chosen_idx = int(raw)
+            except ValueError:
+                console.print(
+                    "[yellow]Invalid selection — keeping mappings made so far; "
+                    "remaining twins will fall back to the default stream.[/yellow]"
+                )
+                aborted = True
+                break
+        if chosen_idx not in valid_indices:
+            console.print(
+                f"[yellow]Microphone index {chosen_idx} is not available — "
+                f"keeping mappings made so far; remaining twins will fall back "
+                f"to the default stream.[/yellow]"
+            )
+            aborted = True
+            break
+        chosen_name = next(
+            (n for i, n in microphones if i == chosen_idx), str(chosen_idx)
+        )
+        twin_assignments[twin_uuid] = (chosen_idx, chosen_name)
+        if chosen_idx not in mic_to_slot:
+            mic_to_slot[chosen_idx] = (chosen_name, len(mic_to_slot))
+            remaining = [i for i in valid_indices if i not in mic_to_slot]
+            if remaining:
+                default_idx = remaining[0]
+        console.print(f"[green]Selected:[/green] {chosen_name}\n")
+
+    if not twin_assignments:
+        console.print(
+            "[yellow]No twins mapped — skipping audio stream setup.[/yellow]"
+        )
+        return False
+
+    capture_sample_rate, capture_channels = _resolve_microphone_capture_settings(
+        microphone_twins
+    )
+
+    slot_status: dict[int, tuple[str, bool]] = {}
+    for _mic_idx, (mic_name, slot) in mic_to_slot.items():
+        loaded, port_open = _bring_up_audio_stream_slot(
+            slot=slot,
+            device_name=mic_name,
+            sample_rate=capture_sample_rate,
+            channels=capture_channels,
+        )
+        if not loaded:
+            console.print(
+                f"[red]Failed to register ffmpeg service for {mic_name} "
+                f"(slot {slot}) — skipping.[/red]"
+            )
+            continue
+        slot_status[slot] = (mic_name, port_open)
+
+    twin_to_stream_url: dict[str, str] = {}
+    for twin_uuid, (mic_idx, _) in twin_assignments.items():
+        slot = mic_to_slot[mic_idx][1]
+        if slot not in slot_status:
+            continue
+        port = _audio_stream_port(slot)
+        twin_to_stream_url[str(twin_uuid)] = f"http://host.docker.internal:{port}"
+
+    _persist_audio_streams_config(
+        devices=microphones,
+        twin_to_stream_url=twin_to_stream_url,
+        capture_sample_rate=capture_sample_rate,
+        channels=capture_channels,
+    )
+
+    if twin_to_stream_url:
+        first_mapped_uuid = next(
+            (
+                str(uuid)
+                for uuid, _ in microphone_twins
+                if str(uuid) in twin_to_stream_url
+            ),
+            None,
+        )
+        if first_mapped_uuid is not None:
+            try:
+                from .credentials import upsert_runtime_env
+
+                primary_url = twin_to_stream_url[first_mapped_uuid]
+                upsert_runtime_env("CYBERWAVE_MACOS_AUDIO_STREAM_URL", primary_url)
+                console.print(
+                    f"[green]Saved[/green] CYBERWAVE_MACOS_AUDIO_STREAM_URL={primary_url} "
+                    "to credentials.json (first mapped twin's stream)"
+                )
+            except Exception as exc:
+                console.print(
+                    f"[yellow]Could not persist primary audio stream URL: {exc}[/yellow]"
+                )
+
+    _print_multi_audio_summary(
+        microphone_twins=microphone_twins,
+        twin_assignments=twin_assignments,
+        mic_to_slot=mic_to_slot,
+        slot_status=slot_status,
+        aborted=aborted,
+    )
+
+    return bool(twin_to_stream_url)
+
+
+def _print_multi_audio_summary(
+    *,
+    microphone_twins: list[tuple[str, str]],
+    twin_assignments: dict[str, tuple[int, str]],
+    mic_to_slot: dict[int, tuple[str, int]],
+    slot_status: dict[int, tuple[str, bool]],
+    aborted: bool,
+) -> None:
+    """Render the final per-twin / per-slot result table for microphone setup."""
+    console = _get_console()
+    console.print("\n[bold]Audio stream setup summary[/bold]")
+
+    unmapped_names: list[str] = []
+    for twin_uuid, twin_name in microphone_twins:
+        assignment = twin_assignments.get(twin_uuid)
+        if assignment is None:
+            unmapped_names.append(twin_name)
+            continue
+        _, mic_name = assignment
+        slot = mic_to_slot[assignment[0]][1]
+        status = slot_status.get(slot)
+        if status is None:
+            console.print(
+                f"  [red]✗[/red] {twin_name} → {mic_name} "
+                f"[red](service failed to register)[/red]"
+            )
+        elif status[1]:
+            console.print(
+                f"  [green]✓[/green] {twin_name} → {mic_name} "
+                f"[dim](slot {slot}, port {_audio_stream_port(slot)})[/dim]"
+            )
+        else:
+            console.print(
+                f"  [yellow]○[/yellow] {twin_name} → {mic_name} "
+                f"[yellow](slot {slot}, port {_audio_stream_port(slot)} not "
+                f"yet listening — launchd will retry)[/yellow]"
+            )
+
+    if unmapped_names:
+        console.print(
+            "  [dim]Unmapped twins will use the default stream: "
+            + ", ".join(unmapped_names)
+            + "[/dim]"
+        )
+
+    pending = [s for s, (_, ok) in slot_status.items() if not ok]
+    if pending:
+        console.print(
+            f"[yellow]Note:[/yellow] {len(pending)} stream(s) did not become "
+            f"reachable during setup.  If a twin keeps failing, re-run "
+            f"[bold]cyberwave edge install --reconfigure-microphone[/bold] after "
+            f"checking the ffmpeg logs under ~/.cyberwave/."
+        )
+    if aborted:
+        console.print(
+            "[dim]Mapping was stopped before every twin was walked; "
+            "run the reconfigure flow above to finish it.[/dim]"
+        )
+
+
 # ---- Edge-core launchd service -----------------------------------------------
 # LaunchAgent for cyberwave-edge-core, giving macOS the same
 # start/stop/restart/status/logs experience as systemd on Linux.
