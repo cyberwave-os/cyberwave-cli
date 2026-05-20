@@ -89,7 +89,7 @@ SYSTEMD_UNIT_TEMPLATE = textwrap.dedent("""\
     Restart=always
     RestartSec=5
     WatchdogSec=60
-    TimeoutStartSec=300
+    TimeoutStartSec=900
     Environment=CYBERWAVE_EDGE_CONFIG_DIR={config_dir}
     OOMScoreAdjust=-800
     StandardOutput=journal
@@ -303,8 +303,6 @@ def require_root(hint: str) -> None:
             f"[dim]Re-run with sudo: {hint}[/dim]"
         )
         raise SystemExit(1)
-
-
 
 
 # Re-exported from interactive_select for backward compat.
