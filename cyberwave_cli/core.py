@@ -1410,6 +1410,16 @@ def _apt_get_install(
     # Update and install the latest version
     install_target = f"{resolved_name}={package_version}" if package_version else resolved_name
     console.print(f"[cyan]Installing {install_target} via apt-get...[/cyan]")
+
+    # Prevent debconf interactive prompts that can block headless installs,
+    # and reduce dpkg's fsync overhead which is brutal on SD-card devices
+    # (Raspberry Pi etc.) and can cause the system to appear frozen.
+    apt_env = {
+        **clean_subprocess_env(),
+        "DEBIAN_FRONTEND": "noninteractive",
+    }
+    dpkg_force_unsafe_io = "-o=Dpkg::Options::=--force-unsafe-io"
+
     try:
         # Retry apt-get update to handle transient CDN mirror sync failures.
         # After all attempts, warn and continue — apt will use its cached index
@@ -1418,7 +1428,7 @@ def _apt_get_install(
         apt_update_retry_delay = 8  # seconds
         for attempt in range(1, apt_update_retries + 1):
             try:
-                _run(["apt-get", "update", "-qq"])
+                _run(["apt-get", "update", "-qq"], env=apt_env)
                 break
             except subprocess.CalledProcessError:
                 if attempt < apt_update_retries:
@@ -1434,7 +1444,10 @@ def _apt_get_install(
                         "one or more sources may be temporarily unavailable. "
                         "Proceeding with cached package index...[/yellow]"
                     )
-        _run(["apt-get", "install", "-y", "-qq", install_target])
+        _run(
+            ["apt-get", "install", "-y", "-qq", dpkg_force_unsafe_io, install_target],
+            env=apt_env,
+        )
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]apt-get failed (exit {exc.returncode}).[/red]")
         return False

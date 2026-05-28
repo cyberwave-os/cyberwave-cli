@@ -150,7 +150,7 @@ jobs:
           ARCH="${{ matrix.arch }}"
           PKG_DIR="${PACKAGE_NAME}_${VERSION}_${ARCH}"
 
-          dpkg-deb --build "${PKG_DIR}"
+          dpkg-deb -Zgzip --build "${PKG_DIR}"
           echo "✅ Debian package built"
           ls -la *.deb
 
