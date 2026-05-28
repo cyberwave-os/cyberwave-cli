@@ -491,7 +491,13 @@ Stops the systemd service, removes the unit file, and optionally uninstalls the 
 
 ```bash
 sudo cyberwave edge uninstall
+sudo cyberwave edge uninstall --channel dev   # keep Docker images/containers
 ```
+
+**Options:**
+
+- `--channel {stable,dev,staging}`: When set to `dev` or `staging`, Docker images and containers are preserved so that a subsequent reinstall does not need to re-download them. This speeds up QA and development cycles and avoids unnecessary wear on SD cards.
+- `-y`: Skip interactive confirmation prompts.
 
 ### `cyberwave edge start / stop / restart`
 

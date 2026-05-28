@@ -590,7 +590,17 @@ def install_edge(
 
 @edge.command("uninstall")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
-def uninstall_edge(yes):
+@click.option(
+    "--channel",
+    type=click.Choice(["stable", "dev", "staging"], case_sensitive=False),
+    default=None,
+    help=(
+        "Release channel the edge was installed from. "
+        "When set to 'dev' or 'staging', Docker images and containers "
+        "are preserved to speed up reinstallation during development."
+    ),
+)
+def uninstall_edge(yes, channel):
     """Stop and remove the cyberwave-edge-core service.
 
     On Linux: disables the systemd service, removes the unit file (requires root).
@@ -601,6 +611,7 @@ def uninstall_edge(yes):
     Examples:
         sudo cyberwave edge uninstall
         sudo cyberwave edge uninstall -y
+        sudo cyberwave edge uninstall --channel dev
     """
     from ...config import CONFIG_DIR
     from ...core import (
@@ -618,6 +629,8 @@ def uninstall_edge(yes):
     token = creds.token if creds else None
     workspace_uuid = str(getattr(creds, "workspace_uuid", "") or "") if creds else None
     base_url = str(getattr(creds, "cyberwave_base_url", "") or "") if creds else None
+
+    skip_docker_cleanup = (channel or "").lower() in {"dev", "staging"}
 
     service_label = "edge-core LaunchAgent" if is_macos() else SYSTEMD_UNIT_NAME
 
@@ -690,14 +703,19 @@ def uninstall_edge(yes):
                 f"[green]Stopped {len(stopped_driver_containers)} edge driver container(s).[/green]"
             )
 
-        pruned_containers = _prune_stopped_cyberwave_containers()
-        if pruned_containers:
+        if skip_docker_cleanup:
             console.print(
-                f"[green]Pruned {pruned_containers} stopped cyberwave container(s).[/green]"
+                f"[dim]Skipping Docker container/image cleanup (channel={channel}).[/dim]"
             )
+        else:
+            pruned_containers = _prune_stopped_cyberwave_containers()
+            if pruned_containers:
+                console.print(
+                    f"[green]Pruned {pruned_containers} stopped cyberwave container(s).[/green]"
+                )
 
-        if _prune_unused_docker_images():
-            console.print("[green]Pruned unused Docker images.[/green]")
+            if _prune_unused_docker_images():
+                console.print("[green]Pruned unused Docker images.[/green]")
 
         if _remove_config_dir_reliably(CONFIG_DIR):
             console.print(f"[green]Removed:[/green] {CONFIG_DIR}")
@@ -777,12 +795,19 @@ def uninstall_edge(yes):
             f"[green]Stopped {len(stopped_driver_containers)} edge driver container(s).[/green]"
         )
 
-    pruned_containers = _prune_stopped_cyberwave_containers()
-    if pruned_containers:
-        console.print(f"[green]Pruned {pruned_containers} stopped cyberwave container(s).[/green]")
+    if skip_docker_cleanup:
+        console.print(
+            f"[dim]Skipping Docker container/image cleanup (channel={channel}).[/dim]"
+        )
+    else:
+        pruned_containers = _prune_stopped_cyberwave_containers()
+        if pruned_containers:
+            console.print(
+                f"[green]Pruned {pruned_containers} stopped cyberwave container(s).[/green]"
+            )
 
-    if _prune_unused_docker_images():
-        console.print("[green]Pruned unused Docker images.[/green]")
+        if _prune_unused_docker_images():
+            console.print("[green]Pruned unused Docker images.[/green]")
 
     if _remove_config_dir_reliably(CONFIG_DIR):
         console.print(f"[green]Removed:[/green] {CONFIG_DIR}")

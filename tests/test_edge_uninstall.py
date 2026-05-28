@@ -162,7 +162,7 @@ def test_uninstall_edge_stops_driver_containers(monkeypatch, tmp_path):
     monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", lambda: None)
     monkeypatch.setattr(edge_module.os, "geteuid", lambda: 0)
 
-    edge_module.uninstall_edge.callback(yes=True)
+    edge_module.uninstall_edge.callback(yes=True, channel=None)
 
     assert stop_calls == [True]
     assert ["systemctl", "stop", "cyberwave-edge-core.service"] in run_calls
@@ -228,7 +228,7 @@ def test_uninstall_edge_exits_when_not_root(monkeypatch, tmp_path):
     monkeypatch.setattr(edge_module.os, "geteuid", lambda: 1000)
 
     try:
-        edge_module.uninstall_edge.callback(yes=True)
+        edge_module.uninstall_edge.callback(yes=True, channel=None)
         raise AssertionError("Expected SystemExit(1)")
     except SystemExit as exc:
         assert exc.code == 1
@@ -284,7 +284,7 @@ def test_uninstall_edge_removes_detected_channel_package(monkeypatch, tmp_path):
         lambda prompt, default=False: True,
     )
 
-    edge_module.uninstall_edge.callback(yes=False)
+    edge_module.uninstall_edge.callback(yes=False, channel=None)
 
     assert ["apt-get", "remove", "-y", "cyberwave-edge-core-dev"] in run_calls
 
@@ -320,6 +320,7 @@ def test_uninstall_edge_macos_removes_launchagent_and_uninstalls_package(monkeyp
     fake_macos = ModuleType("cyberwave_cli.macos")
     fake_macos.is_macos = lambda: True
     fake_macos._teardown_camera_stream_server = lambda: camera_teardown_calls.append(True)
+    fake_macos._teardown_audio_stream_server = lambda: None
 
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
@@ -338,7 +339,7 @@ def test_uninstall_edge_macos_removes_launchagent_and_uninstalls_package(monkeyp
 
     monkeypatch.setattr(edge_module.subprocess, "run", _fake_run)
 
-    edge_module.uninstall_edge.callback(yes=True)
+    edge_module.uninstall_edge.callback(yes=True, channel=None)
 
     assert not config_dir.exists()
     assert not plist_path.exists()
@@ -352,6 +353,117 @@ def test_uninstall_edge_macos_removes_launchagent_and_uninstalls_package(monkeyp
         "-y",
         "cyberwave-edge-core",
     ] in calls
+
+
+def _make_linux_uninstall_fixtures(monkeypatch, tmp_path):
+    """Set up common Linux uninstall mocks and return tracking containers."""
+    config_dir = tmp_path / "cyberwave-config"
+    config_dir.mkdir()
+    unit_path = tmp_path / "cyberwave-edge-core.service"
+    unit_path.write_text("[Unit]\nDescription=Test\n", encoding="utf-8")
+
+    run_calls: list[list[str]] = []
+    prune_container_calls: list[bool] = []
+    prune_image_calls: list[bool] = []
+
+    fake_config = ModuleType("cyberwave_cli.config")
+    fake_config.CONFIG_DIR = config_dir
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.PACKAGE_NAME = "cyberwave-edge-core"
+    fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
+    fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
+    fake_core.SYSTEMD_UNIT_PATH = unit_path
+    fake_core._is_macos = lambda: False
+    fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
+    fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
+    fake_core.require_root = lambda hint: None
+
+    def _fake_run(command, *, check=True, **_kwargs):
+        run_calls.append(command)
+        return None
+
+    fake_core._run = _fake_run
+
+    fake_credentials = ModuleType("cyberwave_cli.credentials")
+    fake_credentials.load_credentials = lambda: None
+
+    fake_macos = ModuleType("cyberwave_cli.macos")
+    fake_macos.is_macos = lambda: False
+
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
+    monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", lambda _runner: [])
+    monkeypatch.setattr(
+        edge_module,
+        "_delete_registered_edges_for_fingerprint",
+        lambda **_kwargs: (0, 0),
+    )
+    monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", lambda: None)
+    monkeypatch.setattr(edge_module.os, "geteuid", lambda: 0)
+
+    def _fake_prune_containers():
+        prune_container_calls.append(True)
+        return 1
+
+    def _fake_prune_images():
+        prune_image_calls.append(True)
+        return True
+
+    monkeypatch.setattr(edge_module, "_prune_stopped_cyberwave_containers", _fake_prune_containers)
+    monkeypatch.setattr(edge_module, "_prune_unused_docker_images", _fake_prune_images)
+
+    return run_calls, prune_container_calls, prune_image_calls
+
+
+def test_uninstall_edge_channel_dev_skips_docker_cleanup(monkeypatch, tmp_path):
+    """When --channel=dev, Docker containers and images are preserved."""
+    _, prune_container_calls, prune_image_calls = _make_linux_uninstall_fixtures(
+        monkeypatch, tmp_path
+    )
+
+    edge_module.uninstall_edge.callback(yes=True, channel="dev")
+
+    assert prune_container_calls == []
+    assert prune_image_calls == []
+
+
+def test_uninstall_edge_channel_staging_skips_docker_cleanup(monkeypatch, tmp_path):
+    """When --channel=staging, Docker containers and images are preserved."""
+    _, prune_container_calls, prune_image_calls = _make_linux_uninstall_fixtures(
+        monkeypatch, tmp_path
+    )
+
+    edge_module.uninstall_edge.callback(yes=True, channel="staging")
+
+    assert prune_container_calls == []
+    assert prune_image_calls == []
+
+
+def test_uninstall_edge_channel_stable_runs_docker_cleanup(monkeypatch, tmp_path):
+    """When --channel=stable, Docker containers and images ARE cleaned up."""
+    _, prune_container_calls, prune_image_calls = _make_linux_uninstall_fixtures(
+        monkeypatch, tmp_path
+    )
+
+    edge_module.uninstall_edge.callback(yes=True, channel="stable")
+
+    assert prune_container_calls == [True]
+    assert prune_image_calls == [True]
+
+
+def test_uninstall_edge_no_channel_runs_docker_cleanup(monkeypatch, tmp_path):
+    """When --channel is not specified (None), Docker cleanup runs as before."""
+    _, prune_container_calls, prune_image_calls = _make_linux_uninstall_fixtures(
+        monkeypatch, tmp_path
+    )
+
+    edge_module.uninstall_edge.callback(yes=True, channel=None)
+
+    assert prune_container_calls == [True]
+    assert prune_image_calls == [True]
 
 
 def test_delete_registered_edges_for_fingerprint_deletes_only_matching_workspace(monkeypatch):
