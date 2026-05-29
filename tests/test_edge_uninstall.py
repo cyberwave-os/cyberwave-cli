@@ -234,6 +234,76 @@ def test_uninstall_edge_exits_when_not_root(monkeypatch, tmp_path):
         assert exc.code == 1
 
 
+def test_uninstall_edge_exits_before_confirmation_when_not_root(monkeypatch, tmp_path):
+    """Root check must happen before any interactive prompts (CYB-1976).
+
+    Running without sudo should fail immediately with a clear error, not ask
+    for confirmation first and then prompt for credentials mid-uninstall.
+    """
+    config_dir = tmp_path / "cyberwave-config"
+    config_dir.mkdir()
+
+    confirmation_was_shown: list[bool] = []
+
+    fake_config = ModuleType("cyberwave_cli.config")
+    fake_config.CONFIG_DIR = config_dir
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
+    fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
+    fake_core.SYSTEMD_UNIT_PATH = tmp_path / "nonexistent.service"
+    fake_core._is_macos = lambda: False
+    fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
+    fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
+
+    def _require_root_exits(hint):
+        raise SystemExit(1)
+
+    fake_core.require_root = _require_root_exits
+    fake_core._run = lambda command, **_kw: None
+
+    fake_credentials = ModuleType("cyberwave_cli.credentials")
+    fake_credentials.load_credentials = lambda: None
+
+    fake_macos = ModuleType("cyberwave_cli.macos")
+    fake_macos.is_macos = lambda: False
+
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
+    monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", lambda _runner: [])
+    monkeypatch.setattr(
+        edge_module, "_delete_registered_edges_for_fingerprint", lambda **_kwargs: (0, 0)
+    )
+    monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", lambda: None)
+
+    # Patch Confirm.ask to record if it was ever called
+    original_confirm = edge_module.Confirm
+
+    class _TrackingConfirm:
+        @staticmethod
+        def ask(*args, **kwargs):
+            confirmation_was_shown.append(True)
+            return False
+
+    monkeypatch.setattr(edge_module, "Confirm", _TrackingConfirm)
+
+    try:
+        # Run without --yes so a confirmation would normally be shown
+        edge_module.uninstall_edge.callback(yes=False, channel=None)
+        raise AssertionError("Expected SystemExit(1)")
+    except SystemExit as exc:
+        assert exc.code == 1
+
+    monkeypatch.setattr(edge_module, "Confirm", original_confirm)
+
+    assert confirmation_was_shown == [], (
+        "Confirmation prompt must not be shown before the root check — "
+        "users should get an immediate error, not a false 'are you sure?' followed by a sudo prompt"
+    )
+
+
 def test_uninstall_edge_removes_detected_channel_package(monkeypatch, tmp_path):
     config_dir = tmp_path / "cyberwave-config"
     config_dir.mkdir()

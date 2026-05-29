@@ -624,6 +624,14 @@ def uninstall_edge(yes, channel):
     from ...credentials import load_credentials
     from ...macos import is_macos
 
+    # On Linux, verify root privileges before any interactive prompts so the
+    # user gets a clear upfront error instead of being asked for confirmation
+    # and then hitting a credentials prompt mid-uninstall.
+    if not _is_macos():
+        from ...core import require_root
+
+        require_root("sudo cyberwave edge uninstall")
+
     creds = load_credentials()
     edge_fingerprint = _load_or_generate_edge_fingerprint()
     token = creds.token if creds else None
@@ -764,9 +772,7 @@ def uninstall_edge(yes, channel):
         console.print(f"[green]{EDGE_CORE_SPEC.package_name} service removed.[/green]")
         return
 
-    from ...core import SYSTEMD_UNIT_PATH, _run, require_root
-
-    require_root("sudo cyberwave edge uninstall")
+    from ...core import SYSTEMD_UNIT_PATH, _run
 
     # Stop and disable the service
     try:
