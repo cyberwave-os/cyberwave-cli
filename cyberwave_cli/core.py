@@ -983,6 +983,7 @@ _NON_TWIN_JSON_FILES = frozenset(
         "cameras.json",
         "camera_streams.json",
         "fingerprint.json",
+        "edge.json",
     }
 )
 
@@ -2156,6 +2157,7 @@ def _list_camera_twins() -> list[tuple[str, str]]:
             "environment.json",
             "cameras.json",
             "fingerprint.json",
+            "edge.json",
         ):
             continue
         try:
@@ -2194,6 +2196,7 @@ def _list_microphone_twins() -> list[tuple[str, str]]:
             "camera_streams.json",
             "audio_streams.json",
             "fingerprint.json",
+            "edge.json",
         ):
             continue
         try:
@@ -2278,6 +2281,64 @@ def _prompt_camera_index(
     return chosen
 
 
+def _upload_cameras_to_edge_metadata(cameras_data: dict) -> bool:
+    """Upload camera config to Edge.metadata.cameras and persist edge.json.
+
+    Best-effort: logs a warning and returns False on any failure.
+    """
+    from .credentials import get_token
+    from .io_utils import atomic_write_json
+
+    token = get_token()
+    if not token:
+        return False
+
+    fingerprint_file = CONFIG_DIR / "fingerprint.json"
+    if not fingerprint_file.exists():
+        return False
+    try:
+        fingerprint = json.loads(fingerprint_file.read_text()).get("fingerprint", "")
+    except Exception:
+        return False
+    if not fingerprint:
+        return False
+
+    try:
+        from cyberwave import Cyberwave
+
+        base_url = get_api_url() or "https://api.cyberwave.com"
+        client = Cyberwave(base_url=base_url, api_key=token)
+
+        edge = None
+        for e in client.edges.list():
+            if getattr(e, "fingerprint", None) == fingerprint:
+                edge = e
+                break
+        if edge is None:
+            edge = client.edges.create(fingerprint=fingerprint)
+
+        edge_uuid = str(getattr(edge, "uuid", "") or "")
+        if not edge_uuid:
+            console.print("[dim]Could not resolve edge UUID for camera metadata upload.[/dim]")
+            return False
+
+        updated_edge = client.edges.update(
+            edge_uuid,
+            {"fingerprint": fingerprint, "metadata": {"cameras": cameras_data}},
+        )
+        # Use to_json() → loads() to get a plain serializable dict (handles datetimes).
+        if hasattr(updated_edge, "to_json"):
+            edge_dict = json.loads(updated_edge.to_json())
+        else:
+            edge_dict = dict(updated_edge)
+        atomic_write_json(CONFIG_DIR / "edge.json", edge_dict)
+        console.print(f"[dim]Saved to {CONFIG_DIR / 'edge.json'}[/dim]")
+        return True
+    except Exception as exc:
+        console.print(f"[dim]Camera metadata upload skipped: {exc}[/dim]")
+        return False
+
+
 def _detect_and_select_cameras() -> None:
     """Discover cameras and prompt the user to map them to camera-bearing twins.
 
@@ -2301,6 +2362,24 @@ def _detect_and_select_cameras() -> None:
     camera_twins = _list_camera_twins()
     default_idx = cameras[0].index if cameras[0].index is not None else 0
 
+    def _save_cameras(
+        selected_index: int | None,
+        twin_to_device: dict[str, int] | None,
+    ) -> None:
+        write_cameras_json(
+            cameras,
+            CONFIG_DIR,
+            selected_index=selected_index,
+            twin_to_device=twin_to_device or None,
+        )
+        console.print(f"[dim]Saved to {CONFIG_DIR / 'cameras.json'}[/dim]\n")
+        cameras_data: dict = {"devices": [c.to_dict() for c in cameras]}
+        if selected_index is not None:
+            cameras_data["selected_device"] = selected_index
+        if twin_to_device:
+            cameras_data["twin_to_device"] = {str(k): v for k, v in twin_to_device.items()}
+        _upload_cameras_to_edge_metadata(cameras_data)
+
     # Single physical camera: auto-assign to every camera twin.
     if len(cameras) == 1:
         cam = cameras[0]
@@ -2311,13 +2390,7 @@ def _detect_and_select_cameras() -> None:
             console.print(
                 f"[dim]All {len(camera_twins)} camera twin(s) will share this device.[/dim]"
             )
-        write_cameras_json(
-            cameras,
-            CONFIG_DIR,
-            selected_index=selected,
-            twin_to_device=twin_to_device or None,
-        )
-        console.print(f"[dim]Saved to {CONFIG_DIR / 'cameras.json'}[/dim]\n")
+        _save_cameras(selected, twin_to_device or None)
         return
 
     # Single camera twin (or none known) with multiple cameras: keep the legacy
@@ -2336,13 +2409,7 @@ def _detect_and_select_cameras() -> None:
             return
         console.print(f"[green]Selected:[/green] {valid_indices[selected].card}")
         twin_to_device = {camera_twins[0][0]: selected} if camera_twins else {}
-        write_cameras_json(
-            cameras,
-            CONFIG_DIR,
-            selected_index=selected,
-            twin_to_device=twin_to_device or None,
-        )
-        console.print(f"[dim]Saved to {CONFIG_DIR / 'cameras.json'}[/dim]\n")
+        _save_cameras(selected, twin_to_device or None)
         return
 
     # Multiple camera twins AND multiple cameras: map each twin to a camera.
@@ -2390,13 +2457,7 @@ def _detect_and_select_cameras() -> None:
         console.print("[yellow]No cameras mapped — skipping camera config.[/yellow]")
         return
 
-    write_cameras_json(
-        cameras,
-        CONFIG_DIR,
-        selected_index=first_selected,
-        twin_to_device=twin_to_device,
-    )
-    console.print(f"[dim]Saved to {CONFIG_DIR / 'cameras.json'}[/dim]\n")
+    _save_cameras(first_selected, twin_to_device)
 
 
 # ---- orchestrator ------------------------------------------------------------

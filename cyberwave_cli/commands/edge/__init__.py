@@ -1373,10 +1373,13 @@ def list_cameras(as_json: bool, save: bool):
 
     if save and cameras:
         from ...config import CONFIG_DIR
+        from ...core import _upload_cameras_to_edge_metadata
         from ...device_utils import write_cameras_json
 
         write_cameras_json(cameras, CONFIG_DIR)
         console.print(f"[green]✓[/green] Saved to {CONFIG_DIR / 'cameras.json'}")
+        cameras_data: dict = {"devices": [c.to_dict() for c in cameras]}
+        _upload_cameras_to_edge_metadata(cameras_data)
 
 
 # =============================================================================

@@ -469,7 +469,7 @@ On **macOS**, the installer also sets up an MJPEG camera stream bridge (using `f
 
 For **microphone** twins, the installer sets up a PCM audio stream bridge on the same pattern: `ffmpeg` captures from AVFoundation on the host and serves raw PCM over HTTP (ports starting at `8101`). Assignments are persisted in `~/.cyberwave/audio_streams.json` and injected as `CYBERWAVE_METADATA_AUDIO_DEVICE` when edge-core starts each generic-microphone driver container.
 
-On **Linux** with multiple camera-bearing twins, the installer walks you through a per-twin mapping so each twin is bound to a specific `/dev/video*` device. The mapping is persisted in `~/.cyberwave/cameras.json` under `twin_to_device` and honored by edge-core when it launches each driver container. A single-camera host automatically shares the device across every selected camera twin.
+On **Linux** with multiple camera-bearing twins, the installer walks you through a per-twin mapping so each twin is bound to a specific `/dev/video*` device. The mapping is saved to the backend as `Edge.metadata.cameras` and mirrored locally in `~/.cyberwave/edge.json`. Edge-core reads camera config from `edge.json` at startup; `~/.cyberwave/cameras.json` is kept as a legacy fallback but is deprecated.
 
 ```bash
 sudo cyberwave edge install
@@ -836,6 +836,8 @@ Run `cyberwave config-dir` to see which directory is active.
 - `credentials.json` — API token, workspace info, and runtime env overrides (permissions `600`)
 - `environment.json` — selected workspace, environment, and twin bindings
 - `fingerprint.json` — unique edge device identifier
+- `edge.json` — cached edge device record from the backend, including `metadata.cameras` (device list and twin-to-device mapping); written during install and refreshed by edge-core
+- `cameras.json` — **deprecated**; legacy camera config retained for backward compatibility with older edge-core builds
 
 Other environment variables:
 

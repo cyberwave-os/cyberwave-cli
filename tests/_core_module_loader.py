@@ -81,6 +81,7 @@ def load_core_module(monkeypatch):
     credentials_module.collect_runtime_env_overrides = lambda *args, **kwargs: {}
     credentials_module.load_credentials = lambda: None
     credentials_module.save_credentials = lambda *_args, **_kwargs: None
+    credentials_module.get_token = lambda: None
 
     monkeypatch.setitem(sys.modules, "cyberwave", cyberwave_module)
     monkeypatch.setitem(sys.modules, "cyberwave.config", config_module)
