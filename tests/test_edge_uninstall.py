@@ -100,7 +100,40 @@ def test_stop_edge_driver_containers_stops_matching_containers(monkeypatch):
     assert issued_commands == [["docker", "stop", "cyberwave-driver-123", "cyberwave-driver-456"]]
 
 
-def test_uninstall_edge_stops_driver_containers(monkeypatch, tmp_path):
+def test_stop_edge_worker_containers_returns_empty_when_docker_missing(monkeypatch):
+    monkeypatch.setattr(edge_module.shutil, "which", lambda _: None)
+
+    stopped = edge_module._stop_edge_worker_containers(lambda *_args, **_kwargs: None)
+
+    assert stopped == []
+
+
+def test_stop_edge_worker_containers_stops_matching_containers(monkeypatch):
+    class _Result:
+        stdout = "cyberwave-worker-abc12345\ncyberwave-worker-def67890\n"
+
+    issued_commands: list[list[str]] = []
+
+    def _fake_run(command, **_kwargs):
+        assert command[:3] == ["docker", "ps", "--format"]
+        return _Result()
+
+    def _fake_runner(command, check=False):
+        issued_commands.append(command)
+        assert check is False
+
+    monkeypatch.setattr(edge_module.shutil, "which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr(edge_module.subprocess, "run", _fake_run)
+
+    stopped = edge_module._stop_edge_worker_containers(_fake_runner)
+
+    assert stopped == ["cyberwave-worker-abc12345", "cyberwave-worker-def67890"]
+    assert issued_commands == [
+        ["docker", "stop", "cyberwave-worker-abc12345", "cyberwave-worker-def67890"]
+    ]
+
+
+def test_uninstall_edge_stops_driver_and_worker_containers(monkeypatch, tmp_path):
     config_dir = tmp_path / "cyberwave-config"
     config_dir.mkdir()
     (config_dir / "credentials.json").write_text("{}\n", encoding="utf-8")
@@ -109,7 +142,8 @@ def test_uninstall_edge_stops_driver_containers(monkeypatch, tmp_path):
     unit_path.write_text("[Unit]\nDescription=Test\n", encoding="utf-8")
 
     run_calls: list[list[str]] = []
-    stop_calls: list[bool] = []
+    driver_stop_calls: list[bool] = []
+    worker_stop_calls: list[bool] = []
 
     fake_config = ModuleType("cyberwave_cli.config")
     fake_config.CONFIG_DIR = config_dir
@@ -152,10 +186,15 @@ def test_uninstall_edge_stops_driver_containers(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
 
     def _fake_stop_driver_containers(_runner):
-        stop_calls.append(True)
+        driver_stop_calls.append(True)
         return ["cyberwave-driver-123"]
 
+    def _fake_stop_worker_containers(_runner):
+        worker_stop_calls.append(True)
+        return ["cyberwave-worker-abc12345"]
+
     monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", _fake_stop_driver_containers)
+    monkeypatch.setattr(edge_module, "_stop_edge_worker_containers", _fake_stop_worker_containers)
     monkeypatch.setattr(
         edge_module, "_delete_registered_edges_for_fingerprint", _fake_backend_cleanup
     )
@@ -164,7 +203,8 @@ def test_uninstall_edge_stops_driver_containers(monkeypatch, tmp_path):
 
     edge_module.uninstall_edge.callback(yes=True, channel=None)
 
-    assert stop_calls == [True]
+    assert driver_stop_calls == [True]
+    assert worker_stop_calls == [True]
     assert ["systemctl", "stop", "cyberwave-edge-core.service"] in run_calls
     assert ["systemctl", "disable", "cyberwave-edge-core.service"] in run_calls
     assert ["rm", "-f", str(unit_path)] in run_calls
@@ -219,6 +259,7 @@ def test_uninstall_edge_exits_when_not_root(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
     monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", lambda _runner: [])
+    monkeypatch.setattr(edge_module, "_stop_edge_worker_containers", lambda _runner: [])
     monkeypatch.setattr(
         edge_module,
         "_delete_registered_edges_for_fingerprint",
@@ -273,6 +314,7 @@ def test_uninstall_edge_exits_before_confirmation_when_not_root(monkeypatch, tmp
     monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
     monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", lambda _runner: [])
+    monkeypatch.setattr(edge_module, "_stop_edge_worker_containers", lambda _runner: [])
     monkeypatch.setattr(
         edge_module, "_delete_registered_edges_for_fingerprint", lambda **_kwargs: (0, 0)
     )
@@ -341,6 +383,7 @@ def test_uninstall_edge_removes_detected_channel_package(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
     monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", lambda _runner: [])
+    monkeypatch.setattr(edge_module, "_stop_edge_worker_containers", lambda _runner: [])
     monkeypatch.setattr(
         edge_module,
         "_delete_registered_edges_for_fingerprint",
@@ -398,6 +441,7 @@ def test_uninstall_edge_macos_removes_launchagent_and_uninstalls_package(monkeyp
     monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
     monkeypatch.setattr(edge_module.os, "getuid", lambda: 501)
     monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", lambda _runner: [])
+    monkeypatch.setattr(edge_module, "_stop_edge_worker_containers", lambda _runner: [])
     monkeypatch.setattr(
         edge_module, "_delete_registered_edges_for_fingerprint", lambda **_kwargs: (0, 0)
     )
@@ -466,6 +510,7 @@ def _make_linux_uninstall_fixtures(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
     monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", lambda _runner: [])
+    monkeypatch.setattr(edge_module, "_stop_edge_worker_containers", lambda _runner: [])
     monkeypatch.setattr(
         edge_module,
         "_delete_registered_edges_for_fingerprint",

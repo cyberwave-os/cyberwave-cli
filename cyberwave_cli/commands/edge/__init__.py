@@ -44,6 +44,7 @@ from cyberwave_cli.utils import colorize_log_line
 
 console = Console()
 DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
+WORKER_CONTAINER_PREFIX = "cyberwave-worker-"
 CYBERWAVE_CONTAINER_PREFIX = "cyberwave"
 
 
@@ -172,6 +173,43 @@ def _stop_edge_driver_containers(run_command) -> list[str]:
         run_command(["docker", "stop", *containers], check=False)
     except FileNotFoundError:
         console.print("[yellow]docker not found — skipping driver container cleanup.[/yellow]")
+        return []
+
+    return containers
+
+
+def _stop_edge_worker_containers(run_command) -> list[str]:
+    """Stop running edge worker containers managed by edge-core."""
+    if not shutil.which("docker"):
+        return []
+
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "--format",
+                "{{.Names}}",
+                "--filter",
+                f"name=^{WORKER_CONTAINER_PREFIX}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        console.print(f"[yellow]Could not list edge worker containers: {exc}[/yellow]")
+        return []
+
+    containers = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not containers:
+        return []
+
+    try:
+        run_command(["docker", "stop", *containers], check=False)
+    except FileNotFoundError:
+        console.print("[yellow]docker not found — skipping worker container cleanup.[/yellow]")
         return []
 
     return containers
@@ -699,16 +737,19 @@ def uninstall_edge(yes, channel):
                     "[dim]Run 'cyberwave edge uninstall' as your regular macOS user.[/dim]"
                 )
 
-        stopped_driver_containers = _stop_edge_driver_containers(
-            lambda command, check=False: subprocess.run(
-                command,
-                check=check,
-                env=clean_subprocess_env(),
-            )
-        )
+        def _macos_run(command, check=False):
+            return subprocess.run(command, check=check, env=clean_subprocess_env())
+
+        stopped_driver_containers = _stop_edge_driver_containers(_macos_run)
         if stopped_driver_containers:
             console.print(
                 f"[green]Stopped {len(stopped_driver_containers)} edge driver container(s).[/green]"
+            )
+
+        stopped_worker_containers = _stop_edge_worker_containers(_macos_run)
+        if stopped_worker_containers:
+            console.print(
+                f"[green]Stopped {len(stopped_worker_containers)} edge worker container(s).[/green]"
             )
 
         if skip_docker_cleanup:
@@ -799,6 +840,12 @@ def uninstall_edge(yes, channel):
     if stopped_driver_containers:
         console.print(
             f"[green]Stopped {len(stopped_driver_containers)} edge driver container(s).[/green]"
+        )
+
+    stopped_worker_containers = _stop_edge_worker_containers(_run)
+    if stopped_worker_containers:
+        console.print(
+            f"[green]Stopped {len(stopped_worker_containers)} edge worker container(s).[/green]"
         )
 
     if skip_docker_cleanup:
