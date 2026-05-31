@@ -115,7 +115,8 @@ def test_stop_edge_worker_containers_stops_matching_containers(monkeypatch):
     issued_commands: list[list[str]] = []
 
     def _fake_run(command, **_kwargs):
-        assert command[:3] == ["docker", "ps", "--format"]
+        # Must use docker ps -a to catch stopped/restarting containers too
+        assert command[:4] == ["docker", "ps", "-a", "--format"]
         return _Result()
 
     def _fake_runner(command, check=False):
@@ -128,8 +129,10 @@ def test_stop_edge_worker_containers_stops_matching_containers(monkeypatch):
     stopped = edge_module._stop_edge_worker_containers(_fake_runner)
 
     assert stopped == ["cyberwave-worker-abc12345", "cyberwave-worker-def67890"]
+    # Must use docker rm -f to permanently remove containers and prevent
+    # Docker's --restart unless-stopped from recreating bind-mount directories
     assert issued_commands == [
-        ["docker", "stop", "cyberwave-worker-abc12345", "cyberwave-worker-def67890"]
+        ["docker", "rm", "-f", "cyberwave-worker-abc12345", "cyberwave-worker-def67890"]
     ]
 
 

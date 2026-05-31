@@ -179,7 +179,16 @@ def _stop_edge_driver_containers(run_command) -> list[str]:
 
 
 def _stop_edge_worker_containers(run_command) -> list[str]:
-    """Stop running edge worker containers managed by edge-core."""
+    """Stop and remove edge worker containers managed by edge-core.
+
+    Uses ``docker ps -a`` (all states) and ``docker rm -f`` so that
+    containers which have already exited but still carry the
+    ``--restart unless-stopped`` policy are permanently removed rather
+    than simply stopped.  A stopped-but-not-removed container with an
+    active restart policy can be restarted by the Docker daemon after
+    the config directory is wiped, which would cause Docker to recreate
+    the ``workers/`` bind-mount directory on the host.
+    """
     if not shutil.which("docker"):
         return []
 
@@ -188,6 +197,7 @@ def _stop_edge_worker_containers(run_command) -> list[str]:
             [
                 "docker",
                 "ps",
+                "-a",
                 "--format",
                 "{{.Names}}",
                 "--filter",
@@ -207,7 +217,7 @@ def _stop_edge_worker_containers(run_command) -> list[str]:
         return []
 
     try:
-        run_command(["docker", "stop", *containers], check=False)
+        run_command(["docker", "rm", "-f", *containers], check=False)
     except FileNotFoundError:
         console.print("[yellow]docker not found — skipping worker container cleanup.[/yellow]")
         return []
@@ -862,9 +872,6 @@ def uninstall_edge(yes, channel):
         if _prune_unused_docker_images():
             console.print("[green]Pruned unused Docker images.[/green]")
 
-    if _remove_config_dir_reliably(CONFIG_DIR):
-        console.print(f"[green]Removed:[/green] {CONFIG_DIR}")
-
     if not yes:
         from rich.prompt import Confirm as RichConfirm
 
@@ -905,6 +912,12 @@ def uninstall_edge(yes, channel):
         console.print(
             f"[yellow]Failed to remove {failed_count} backend edge registration(s).[/yellow]"
         )
+
+    # Remove the config directory last so any bind-mount directories that a
+    # Docker restart may have recreated during the backend API call above are
+    # also cleaned up.
+    if _remove_config_dir_reliably(CONFIG_DIR):
+        console.print(f"[green]Removed:[/green] {CONFIG_DIR}")
 
     console.print("[green]Edge core service removed.[/green]")
 
