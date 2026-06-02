@@ -2286,12 +2286,14 @@ def _upload_cameras_to_edge_metadata(cameras_data: dict) -> bool:
 
     Best-effort: logs a warning and returns False on any failure.
     """
-    from .credentials import get_token
+    from .credentials import load_credentials
     from .io_utils import atomic_write_json
+    from .utils import resolve_api_url
 
-    token = get_token()
-    if not token:
+    creds = load_credentials()
+    if not creds or not creds.token:
         return False
+    token = creds.token
 
     fingerprint_file = CONFIG_DIR / "fingerprint.json"
     if not fingerprint_file.exists():
@@ -2306,7 +2308,7 @@ def _upload_cameras_to_edge_metadata(cameras_data: dict) -> bool:
     try:
         from cyberwave import Cyberwave
 
-        base_url = get_api_url() or "https://api.cyberwave.com"
+        base_url = resolve_api_url(creds=creds)
         client = Cyberwave(base_url=base_url, api_key=token)
 
         edge = None
