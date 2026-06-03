@@ -2333,7 +2333,7 @@ def _upload_cameras_to_edge_metadata(cameras_data: dict) -> bool:
             edge_dict = json.loads(updated_edge.to_json())
         else:
             edge_dict = dict(updated_edge)
-        atomic_write_json(CONFIG_DIR / "edge.json", edge_dict)
+        atomic_write_json(CONFIG_DIR / "edge.json", edge_dict, mode=0o644)
         console.print(f"[dim]Saved to {CONFIG_DIR / 'edge.json'}[/dim]")
         return True
     except Exception as exc:

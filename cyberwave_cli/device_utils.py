@@ -476,7 +476,7 @@ def write_cameras_json(
         data["twin_to_device"] = {
             str(twin_uuid): int(idx) for twin_uuid, idx in twin_to_device.items()
         }
-    atomic_write_json(cameras_file, data)
+    atomic_write_json(cameras_file, data, mode=0o644)
     logger.info("Wrote cameras.json to %s (%d devices)", cameras_file, len(cameras))
     return cameras_file
 
