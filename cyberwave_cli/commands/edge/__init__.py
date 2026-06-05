@@ -365,21 +365,24 @@ def _kill_lingering_edge_processes(timeout: float = 5.0) -> None:
         time.sleep(0.2)
 
 
-def _remove_config_dir_reliably(config_dir: Path, *, retries: int = 5, delay: float = 1.0) -> bool:
+def _remove_config_dir_reliably(config_dir: Path, *, retries: int = 8, delay: float = 0.5) -> bool:
     """Remove *config_dir*, retrying if a dying process recreates subdirectories.
 
-    Returns True if the directory no longer exists after all attempts.
+    Returns True if the directory no longer exists after all attempts. On each
+    retry we first kill any lingering edge-core process that could be
+    recreating files under ``config_dir`` so the next ``rmtree`` wins the race.
     """
     for _attempt in range(retries):
         if not config_dir.exists():
             return True
         try:
-            shutil.rmtree(config_dir)
+            _kill_lingering_edge_processes(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(config_dir, ignore_errors=True)
         except PermissionError:
             console.print("[red]Permission denied removing edge config directory.[/red]")
-            return False
-        except OSError as exc:
-            console.print(f"[yellow]Could not fully remove {config_dir}: {exc}[/yellow]")
             return False
         if not config_dir.exists():
             return True
@@ -391,7 +394,11 @@ def _remove_config_dir_reliably(config_dir: Path, *, retries: int = 5, delay: fl
             f"attempting final cleanup.[/yellow]"
         )
         try:
-            shutil.rmtree(config_dir)
+            _kill_lingering_edge_processes(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(config_dir, ignore_errors=True)
         except OSError:
             pass
     return not config_dir.exists()
