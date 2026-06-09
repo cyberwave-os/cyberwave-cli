@@ -2626,8 +2626,9 @@ def setup_service(
                 )
         else:
             console.print(
-                "[dim]Linux microphone twins use /dev/snd inside Docker; ensure "
-                "driver params include --device /dev/snd and --group-add audio.[/dim]"
+                "[dim]Linux microphone twins bind-mount /dev/snd into Docker with "
+                "--group-add audio and ALSA cgroup rule c 116:* rmw (edge-core "
+                "adds this automatically).[/dim]"
             )
 
     if linux_service_setup:
