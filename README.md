@@ -112,14 +112,19 @@ Create a twin from an asset identifier. The ASSET argument can be a registry ID 
 ```bash
 cyberwave twin create camera
 cyberwave twin create go2 --name "My Robot"
+cyberwave twin create go2 -e <env-uuid>                      # target Edge Environment, mic, etc.
+cyberwave twin create go2 --pick-environment                 # interactive environment picker
 cyberwave twin create camera --pair                          # create + pair in one step
 cyberwave twin create camera --pair --source "rtsp://..." --fps 15
 ```
+
+**Environment selection:** without `-e`, the CLI reuses (or creates) a `Quickstart Environment` in your logged-in workspace — the same default as `client.twin()` in the Python SDK. Use `-e` for a specific environment or `--pick-environment` to choose interactively.
 
 **Options:**
 
 - `-n, --name`: Twin name
 - `-e, --environment`: Environment UUID to create the twin in
+- `--pick-environment`: Interactively pick an environment instead of the Quickstart default
 - `--pair`: Also pair this device to the new twin
 - `-d, --target-dir`: Directory to save the `.env` file (when `--pair` is used)
 - `-y, --yes`: Skip confirmation prompts

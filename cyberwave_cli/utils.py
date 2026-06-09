@@ -248,6 +248,10 @@ def get_sdk_client(api_url: Optional[str] = None):
     Returns:
         Cyberwave client if authenticated, None otherwise.
 
+    The logged-in workspace from ``~/.cyberwave/credentials.json`` is passed as
+    ``workspace_id`` so SDK helpers (e.g. quickstart environment reuse) target
+    the same workspace as ``cyberwave login`` / ``cyberwave edge install``.
+
     Example:
         client = get_sdk_client()
         if client:
@@ -260,8 +264,10 @@ def get_sdk_client(api_url: Optional[str] = None):
         from cyberwave import Cyberwave
 
         base_url = resolve_api_url(api_url, creds)
-        mqtt_kwargs = _resolve_mqtt_kwargs(creds, base_url)
-        return Cyberwave(base_url=base_url, token=creds.token, **mqtt_kwargs)
+        client_kwargs = _resolve_mqtt_kwargs(creds, base_url)
+        if creds.workspace_uuid:
+            client_kwargs["workspace_id"] = creds.workspace_uuid
+        return Cyberwave(base_url=base_url, token=creds.token, **client_kwargs)
     except ImportError:
         return None
 

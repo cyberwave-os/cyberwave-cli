@@ -151,42 +151,86 @@ def _prompt_for_schema_fields(
     return config
 
 
+def _environment_workspace_uuid(environment: Any) -> str:
+    """Best-effort workspace UUID for an environment listing row."""
+    workspace_uuid = str(
+        getattr(environment, "workspace_uuid", "")
+        or getattr(environment, "workspace_id", "")
+        or ""
+    )
+    if workspace_uuid:
+        return workspace_uuid
+    settings = getattr(environment, "settings", None) or {}
+    if isinstance(settings, dict):
+        standalone = settings.get("_workspace_uuid")
+        if isinstance(standalone, str) and standalone:
+            return standalone
+    return ""
+
+
 def _select_environment(client: Any, yes: bool) -> str | None:
-    """Prompt user to select an environment."""
+    """Prompt user to select an environment in the active workspace."""
     try:
-        environments = client.environments.list()
+        workspace_id = str(getattr(getattr(client, "config", None), "workspace_id", "") or "")
+        all_environments = client.environments.list()
+        if workspace_id:
+            environments = [
+                env
+                for env in all_environments
+                if not _environment_workspace_uuid(env)
+                or _environment_workspace_uuid(env) == workspace_id
+            ]
+        else:
+            environments = list(all_environments)
 
         if not environments:
             console.print("[yellow]No environments found. Creating one...[/yellow]")
 
-            env_name = "Default Environment" if yes else Prompt.ask("Environment name", default="Default Environment")
+            env_name = (
+                "Default Environment"
+                if yes
+                else Prompt.ask("Environment name", default="Default Environment")
+            )
 
-            # Need to create workspace/project first
             projects = client.projects.list()
-            if not projects:
+            workspace_projects = [
+                p
+                for p in projects
+                if str(
+                    getattr(p, "workspace_uuid", None)
+                    or getattr(p, "workspace_id", None)
+                    or ""
+                )
+                == workspace_id
+            ] if workspace_id else list(projects)
+            project_pool = workspace_projects or list(projects)
+
+            if not project_pool:
                 workspaces = client.workspaces.list()
                 if not workspaces:
                     workspace = client.workspaces.create(name="Default Workspace")
-                    workspace_id = workspace.uuid
+                    resolved_workspace_id = workspace.uuid
                 else:
-                    workspace_id = workspaces[0].uuid
+                    resolved_workspace_id = workspaces[0].uuid
 
-                project = client.projects.create(name="Default Folder", workspace_id=str(workspace_id))
+                project = client.projects.create(
+                    name="Default Folder",
+                    workspace_id=str(resolved_workspace_id),
+                )
                 project_id = project.uuid
             else:
-                project_id = projects[0].uuid
+                project_id = project_pool[0].uuid
 
             env = client.environments.create(name=env_name, project_id=str(project_id))
             return str(env.uuid)
 
         if yes:
-            # Use first environment
             return str(environments[0].uuid)
 
         console.print("\n[bold]Select environment:[/bold]")
         for i, env in enumerate(environments[:10], 1):
-            env_name = getattr(env, 'name', 'Unknown')
-            env_uuid = str(getattr(env, 'uuid', ''))
+            env_name = getattr(env, "name", "Unknown")
+            env_uuid = str(getattr(env, "uuid", ""))
             console.print(f"  {i}. {env_name} [dim]({env_uuid[:8]}...)[/dim]")
         console.print(f"  {len(environments[:10]) + 1}. [Create new environment]")
 
@@ -196,18 +240,29 @@ def _select_environment(client: Any, yes: bool) -> str | None:
             idx = int(choice) - 1
             if idx < len(environments[:10]):
                 return str(environments[idx].uuid)
-            else:
-                # Create new
-                env_name = Prompt.ask("Environment name", default="Default Environment")
-                projects = client.projects.list()
-                project_id = projects[0].uuid if projects else None
 
-                if not project_id:
-                    print_error("No project found to create environment")
-                    return None
+            env_name = Prompt.ask("Environment name", default="Default Environment")
+            projects = client.projects.list()
+            workspace_projects = [
+                p
+                for p in projects
+                if str(
+                    getattr(p, "workspace_uuid", None)
+                    or getattr(p, "workspace_id", None)
+                    or ""
+                )
+                == workspace_id
+            ] if workspace_id else list(projects)
+            project_pool = workspace_projects or list(projects)
+            if not project_pool:
+                print_error("No project found to create environment")
+                return None
 
-                env = client.environments.create(name=env_name, project_id=str(project_id))
-                return str(env.uuid)
+            env = client.environments.create(
+                name=env_name,
+                project_id=str(project_pool[0].uuid),
+            )
+            return str(env.uuid)
         except (ValueError, IndexError):
             print_error("Invalid choice")
             return None
@@ -217,6 +272,38 @@ def _select_environment(client: Any, yes: bool) -> str | None:
         return None
 
 
+def _resolve_quickstart_environment(client: Any) -> str | None:
+    """Resolve the default environment when none was specified.
+
+    Uses the SDK quickstart helper so CLI ``twin create`` matches ``client.twin()``.
+    """
+    get_or_create = getattr(client, "get_or_create_quickstart_environment", None)
+    if not callable(get_or_create):
+        print_error(
+            "Installed cyberwave SDK is too old for quickstart environment reuse.",
+            "Upgrade cyberwave-cli / cyberwave to the latest version.",
+        )
+        return None
+
+    try:
+        env_id, created = get_or_create()
+    except Exception as e:
+        print_error(f"Error resolving quickstart environment: {e}")
+        return None
+
+    if created:
+        console.print(
+            "[cyan]No environment specified — created a new "
+            "'Quickstart Environment'.[/cyan]"
+        )
+    else:
+        console.print(
+            "[cyan]No environment specified — reusing existing "
+            "'Quickstart Environment'.[/cyan]"
+        )
+    return str(env_id)
+
+
 def _find_or_create_twin(
     client: Any,
     asset: dict,
@@ -224,6 +311,8 @@ def _find_or_create_twin(
     environment_uuid: str | None,
     twin_name: str | None,
     yes: bool,
+    *,
+    pick_environment: bool = False,
 ) -> Any | None:
     """Find existing twin for this fingerprint or create a new one."""
     from cyberwave.fingerprint import get_device_info
@@ -260,9 +349,12 @@ def _find_or_create_twin(
     if not yes and not Confirm.ask("Create new twin?", default=True):
         return None
 
-    # Select environment
     if not environment_uuid:
-        environment_uuid = _select_environment(client, yes)
+        if pick_environment:
+            environment_uuid = _select_environment(client, yes)
+        else:
+            # Match SDK client.twin(): reuse/create Quickstart Environment.
+            environment_uuid = _resolve_quickstart_environment(client)
         if not environment_uuid:
             return None
 
@@ -457,6 +549,11 @@ def twin():
 @click.argument("asset")
 @click.option("--name", "-n", help="Twin name")
 @click.option("--environment", "-e", "environment_uuid", help="Environment UUID to create twin in")
+@click.option(
+    "--pick-environment",
+    is_flag=True,
+    help="Interactively pick an environment instead of the default Quickstart Environment",
+)
 @click.option("--pair", "do_pair", is_flag=True, help="Also pair this device to the twin")
 @click.option("--target-dir", "-d", default=".", help="Directory to save .env file (when --pair is used)")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
@@ -466,6 +563,7 @@ def create_twin(
     asset: str,
     name: str | None,
     environment_uuid: str | None,
+    pick_environment: bool,
     do_pair: bool,
     target_dir: str,
     yes: bool,
@@ -485,10 +583,18 @@ def create_twin(
     Configuration options are determined by the asset's edge_config_schema.
     Pass any schema field as --field-name value.
 
+  Without ``-e`` / ``--environment``, the CLI reuses (or creates) a
+  ``Quickstart Environment`` in your logged-in workspace — same as
+  ``client.twin()`` in the Python SDK. Use ``-e <uuid>`` to target a specific
+  environment (e.g. Edge Environment, mic). Use ``--pick-environment`` for the
+  interactive environment picker.
+
     \b
     Examples:
         cyberwave twin create camera
         cyberwave twin create go2 --name "My Robot"
+        cyberwave twin create go2 -e <env-uuid>
+        cyberwave twin create go2 --pick-environment
         cyberwave twin create camera --pair
         cyberwave twin create camera --pair --source "rtsp://..." --fps 15
     """
@@ -546,6 +652,10 @@ def create_twin(
     # 2. Find or create twin
     # Only pass fingerprint when --pair is used; otherwise always create a new twin
     # to ensure deterministic "create" semantics (no silent reuse of existing twins)
+    if pick_environment and environment_uuid:
+        print_error("Use either --environment or --pick-environment, not both.")
+        return
+
     twin_obj = _find_or_create_twin(
         client=client,
         asset=resolved_asset,
@@ -553,6 +663,7 @@ def create_twin(
         environment_uuid=environment_uuid,
         twin_name=name,
         yes=yes,
+        pick_environment=pick_environment,
     )
 
     if twin_obj is None:
