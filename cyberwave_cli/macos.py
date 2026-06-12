@@ -2756,6 +2756,603 @@ def _print_multi_audio_summary(
         )
 
 
+# ---- Audio playback sink (PCM HTTP bridge) ----------------------------------
+# Docker Desktop on macOS cannot expose CoreAudio output inside Linux containers.
+# A small host HTTP server accepts raw PCM POST bodies from the generic-speaker
+# driver and pipes them to the default macOS output device via ffmpeg.
+
+AUDIO_PLAYBACK_LAUNCHD_LABEL = "com.cyberwave.audio-playback"
+AUDIO_PLAYBACK_PORT = 8201
+AUDIO_PLAYBACK_LAUNCHD_LABEL_PREFIX = f"{AUDIO_PLAYBACK_LAUNCHD_LABEL}."
+
+_AUDIO_PLAYBACK_SINK_TEMPLATE = textwrap.dedent("""\
+    #!/usr/bin/env python3
+    import os
+    import subprocess
+    import sys
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    PORT = int(os.environ.get("CYBERWAVE_AUDIO_PLAYBACK_PORT", "{port}"))
+    SAMPLE_RATE = int(os.environ.get("CYBERWAVE_AUDIO_SAMPLE_RATE", "48000"))
+    CHANNELS = int(os.environ.get("CYBERWAVE_AUDIO_CHANNELS", "1"))
+
+
+    class PCMHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            data = self.rfile.read(length) if length else b""
+            if data and ffmpeg_proc.stdin:
+                try:
+                    ffmpeg_proc.stdin.write(data)
+                    ffmpeg_proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+
+    ffmpeg_proc = subprocess.Popen(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "s16le",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-ac",
+            str(CHANNELS),
+            "-i",
+            "pipe:0",
+            "-f",
+            "coreaudio",
+            "default",
+        ],
+        stdin=subprocess.PIPE,
+    )
+
+    try:
+        HTTPServer(("0.0.0.0", PORT), PCMHandler).serve_forever()
+    finally:
+        if ffmpeg_proc.stdin:
+            ffmpeg_proc.stdin.close()
+        ffmpeg_proc.terminate()
+        ffmpeg_proc.wait(timeout=2)
+""")
+
+_AUDIO_PLAYBACK_WRAPPER_TEMPLATE = textwrap.dedent("""\
+    #!/bin/bash
+    # Cyberwave audio playback sink — plays PCM POSTed by the speaker driver.
+    export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+    PORT="${{CYBERWAVE_AUDIO_PLAYBACK_PORT:-{port}}}"
+    SINK_SCRIPT="${{CYBERWAVE_AUDIO_PLAYBACK_SCRIPT:-{sink_script}}}"
+    SAMPLE_RATE="${{CYBERWAVE_AUDIO_SAMPLE_RATE:-48000}}"
+    CHANNELS="${{CYBERWAVE_AUDIO_CHANNELS:-1}}"
+
+    trap 'exit 0' INT TERM
+
+    logger -t cyberwave-audio-playback \\
+        "Starting PCM playback sink on port $PORT (rate=$SAMPLE_RATE, ch=$CHANNELS)"
+
+    while true; do
+        CYBERWAVE_AUDIO_PLAYBACK_PORT="$PORT" \\
+        CYBERWAVE_AUDIO_SAMPLE_RATE="$SAMPLE_RATE" \\
+        CYBERWAVE_AUDIO_CHANNELS="$CHANNELS" \\
+        python3 "$SINK_SCRIPT"
+        sink_status=$?
+        logger -t cyberwave-audio-playback "playback sink exited (status $sink_status); restarting in 1s"
+        sleep 1
+    done
+""")
+
+_AUDIO_PLAYBACK_PLIST_TEMPLATE = textwrap.dedent("""\
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+      "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>{label}</string>
+        <key>ProgramArguments</key>
+        <array>
+            <string>{wrapper_path}</string>
+        </array>
+        <key>EnvironmentVariables</key>
+        <dict>
+            <key>CYBERWAVE_AUDIO_PLAYBACK_SCRIPT</key>
+            <string>{sink_script}</string>
+            <key>CYBERWAVE_AUDIO_SAMPLE_RATE</key>
+            <string>{sample_rate}</string>
+            <key>CYBERWAVE_AUDIO_CHANNELS</key>
+            <string>{channels}</string>
+        </dict>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>KeepAlive</key>
+        <true/>
+        <key>StandardOutPath</key>
+        <string>{log_path}</string>
+        <key>StandardErrorPath</key>
+        <string>{log_path}</string>
+    </dict>
+    </plist>
+""")
+
+
+def _audio_playback_sink_path(slot: Optional[int] = None) -> Path:
+    if slot is None or slot == 0:
+        return _user_home() / ".cyberwave" / "audio_playback_sink.py"
+    return _user_home() / ".cyberwave" / f"audio_playback_sink.{slot}.py"
+
+
+def _audio_playback_wrapper_path(slot: Optional[int] = None) -> Path:
+    if slot is None or slot == 0:
+        return _user_home() / ".cyberwave" / "audio_playback.sh"
+    return _user_home() / ".cyberwave" / f"audio_playback.{slot}.sh"
+
+
+def _audio_playback_plist_path(slot: Optional[int] = None) -> Path:
+    label = _audio_playback_launchd_label(slot)
+    return _user_home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+
+def _audio_playback_log_path(slot: Optional[int] = None) -> Path:
+    if slot is None or slot == 0:
+        return _user_home() / ".cyberwave" / "audio_playback.log"
+    return _user_home() / ".cyberwave" / f"audio_playback.{slot}.log"
+
+
+def _audio_playback_launchd_label(slot: Optional[int] = None) -> str:
+    if slot is None or slot == 0:
+        return AUDIO_PLAYBACK_LAUNCHD_LABEL
+    return f"{AUDIO_PLAYBACK_LAUNCHD_LABEL_PREFIX}{slot}"
+
+
+def _audio_playback_port(slot: Optional[int] = None) -> int:
+    if slot is None or slot == 0:
+        return AUDIO_PLAYBACK_PORT
+    return AUDIO_PLAYBACK_PORT + int(slot)
+
+
+def is_audio_playback_running() -> bool:
+    return _is_port_listening(AUDIO_PLAYBACK_PORT)
+
+
+def _discover_audio_playback_slots() -> list[int]:
+    agents_dir = _user_home() / "Library" / "LaunchAgents"
+    if not agents_dir.is_dir():
+        return [0]
+    slots: set[int] = {0}
+    for entry in agents_dir.iterdir():
+        name = entry.name
+        if not name.startswith(AUDIO_PLAYBACK_LAUNCHD_LABEL_PREFIX):
+            continue
+        if not name.endswith(".plist"):
+            continue
+        suffix = name[len(AUDIO_PLAYBACK_LAUNCHD_LABEL_PREFIX) : -len(".plist")]
+        try:
+            slots.add(int(suffix))
+        except ValueError:
+            continue
+    return sorted(slots)
+
+
+def _teardown_audio_playback_server() -> None:
+    console = _get_console()
+    console.print("[cyan]Tearing down existing audio playback sink(s)...[/cyan]")
+
+    slots = _discover_audio_playback_slots()
+    for slot in slots:
+        _bootout_launchd_service(_audio_playback_launchd_label(slot))
+
+    for _ in range(5):
+        result = subprocess.run(
+            ["pgrep", "-f", "audio_playback_sink"],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            break
+        subprocess.run(
+            ["pkill", "-f", "audio_playback_sink"],
+            capture_output=True,
+        )
+        time.sleep(0.5)
+
+    paths_to_remove: list[Path] = []
+    for slot in slots:
+        paths_to_remove.extend(
+            [
+                _audio_playback_plist_path(slot),
+                _audio_playback_wrapper_path(slot),
+                _audio_playback_sink_path(slot),
+                _audio_playback_log_path(slot),
+            ]
+        )
+    for path in paths_to_remove:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            console.print(f"[yellow]Could not remove {path}[/yellow]")
+
+    console.print("[green]Audio playback sink teardown complete.[/green]")
+
+
+def _merge_audio_streams_config(updates: dict[str, Any]) -> None:
+    import json
+
+    path = _audio_streams_config_path()
+    existing = _load_audio_streams_config()
+    merged = {**existing, **updates}
+    for key in ("twin_to_stream_url", "twin_to_playback_url"):
+        if key in updates and isinstance(updates.get(key), dict):
+            current = existing.get(key)
+            if isinstance(current, dict):
+                merged[key] = {**current, **updates[key]}
+            else:
+                merged[key] = dict(updates[key])
+    try:
+        _write_file_as_real_user(path, json.dumps(merged, indent=2))
+    except OSError as exc:
+        console = _get_console()
+        console.print(
+            f"[yellow]Could not persist {path}: {exc}[/yellow]\n"
+            f"[dim]Per-twin playback mapping may not survive reboots.[/dim]"
+        )
+
+
+def _persist_audio_playback_config(
+    *,
+    twin_to_playback_url: dict[str, str],
+    playback_sample_rate: int | None = None,
+    playback_channels: int | None = None,
+) -> None:
+    updates: dict[str, Any] = {"twin_to_playback_url": twin_to_playback_url}
+    if playback_sample_rate is not None:
+        updates["playback_sample_rate"] = int(playback_sample_rate)
+    if playback_channels is not None:
+        updates["playback_channels"] = int(playback_channels)
+    _merge_audio_streams_config(updates)
+    console = _get_console()
+    console.print(
+        f"[dim]Saved twin→speaker playback map to {_audio_streams_config_path()}[/dim]"
+    )
+
+
+def _resolve_speaker_playback_settings(
+    speaker_twins: list[tuple[str, str]] | None,
+) -> tuple[int, int]:
+    from .config import CONFIG_DIR
+
+    sample_rate = 48_000
+    channels = 1
+    for twin_uuid, _ in speaker_twins or []:
+        twin_path = CONFIG_DIR / f"{twin_uuid}.json"
+        if not twin_path.is_file():
+            continue
+        try:
+            import json
+
+            data = json.loads(twin_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        params = _speaker_sensor_parameters_from_twin_data(data)
+        if not params:
+            continue
+        raw_rate = params.get("audio_sample_rate", "").strip()
+        raw_channels = params.get("audio_channels", "").strip()
+        try:
+            if raw_rate:
+                sample_rate = int(raw_rate)
+        except ValueError:
+            pass
+        try:
+            if raw_channels:
+                parsed_channels = int(raw_channels)
+                if parsed_channels in {1, 2}:
+                    channels = parsed_channels
+        except ValueError:
+            pass
+        break
+    return sample_rate, channels
+
+
+_SPEAKER_SENSOR_TYPES = frozenset(
+    {"speaker", "loudspeaker", "speakerphone", "audio_out"}
+)
+
+
+def _speaker_sensor_parameters_from_twin_data(data: dict[str, Any]) -> dict[str, str]:
+    sensor_lists: list[list[Any]] = []
+    for path in (
+        ("metadata", "sensors"),
+        ("asset", "universal_schema", "sensors"),
+        ("sensors",),
+    ):
+        obj: Any = data
+        for key in path:
+            if not isinstance(obj, dict):
+                obj = None
+                break
+            obj = obj.get(key)
+        if isinstance(obj, list):
+            sensor_lists.append(obj)
+
+    for sensors in sensor_lists:
+        for sensor in sensors:
+            if not isinstance(sensor, dict):
+                continue
+            sensor_type = str(sensor.get("type", "")).strip().lower()
+            if sensor_type not in _SPEAKER_SENSOR_TYPES:
+                continue
+            raw_params = sensor.get("parameters")
+            if not isinstance(raw_params, dict):
+                continue
+            return {
+                str(key): str(value)
+                for key, value in raw_params.items()
+                if value is not None
+            }
+    return {}
+
+
+def _bring_up_audio_playback_slot(
+    *,
+    slot: int,
+    sample_rate: int = 48_000,
+    channels: int = 1,
+) -> tuple[bool, bool]:
+    console = _get_console()
+    sink_path = _audio_playback_sink_path(slot)
+    wrapper_path = _audio_playback_wrapper_path(slot)
+    plist_path = _audio_playback_plist_path(slot)
+    log_path = _audio_playback_log_path(slot)
+    label = _audio_playback_launchd_label(slot)
+    port = _audio_playback_port(slot)
+
+    sink_contents = _AUDIO_PLAYBACK_SINK_TEMPLATE.format(port=port)
+    try:
+        _write_file_as_real_user(sink_path, sink_contents, mode=0o755)
+    except OSError as exc:
+        console.print(f"[red]Failed to create audio playback sink script: {exc}[/red]")
+        return False, False
+
+    wrapper_contents = _AUDIO_PLAYBACK_WRAPPER_TEMPLATE.format(
+        port=port,
+        sink_script=str(sink_path),
+    )
+    try:
+        _write_file_as_real_user(wrapper_path, wrapper_contents, mode=0o755)
+    except OSError as exc:
+        console.print(f"[red]Failed to create audio playback wrapper: {exc}[/red]")
+        return False, False
+
+    plist_contents = _AUDIO_PLAYBACK_PLIST_TEMPLATE.format(
+        label=label,
+        wrapper_path=str(wrapper_path),
+        sink_script=str(sink_path),
+        log_path=str(log_path),
+        sample_rate=str(sample_rate),
+        channels=str(channels),
+    )
+    try:
+        _write_file_as_real_user(plist_path, plist_contents)
+    except OSError as exc:
+        console.print(f"[red]Failed to write audio playback plist: {exc}[/red]")
+        return False, False
+
+    console.print(f"[green]Created:[/green] {plist_path}")
+
+    _, real_uid, _ = _resolve_real_user()
+    gui_domain = f"gui/{real_uid}" if real_uid is not None else None
+
+    wait_for_launchd_unload(label)
+
+    if gui_domain:
+        try:
+            bootstrap_launchd_service(gui_domain, plist_path)
+        except subprocess.CalledProcessError:
+            console.print(
+                "[yellow]launchctl bootstrap failed, falling back to load...[/yellow]"
+            )
+            try:
+                _run(_launchctl_as_user(["load", str(plist_path)]))
+            except subprocess.CalledProcessError as exc:
+                console.print(
+                    f"[red]Failed to load audio playback service (exit {exc.returncode}).[/red]"
+                )
+                return False, False
+    else:
+        try:
+            _run(_launchctl_as_user(["load", str(plist_path)]))
+        except subprocess.CalledProcessError as exc:
+            console.print(
+                f"[red]Failed to load audio playback service (exit {exc.returncode}).[/red]"
+            )
+            return False, False
+
+    max_wait_secs = 10
+    for _ in range(max_wait_secs * 2):
+        if _is_port_listening(port):
+            console.print(
+                f"[green]Audio playback sink running on port {port} ({label}).[/green]"
+            )
+            return True, True
+        time.sleep(0.5)
+
+    console.print(
+        f"[yellow]Audio playback service {label} loaded but port {port} is not "
+        f"listening after {max_wait_secs}s. Check logs at {log_path}[/yellow]"
+    )
+    return True, False
+
+
+def _installed_audio_playback_slots() -> list[int]:
+    return [
+        slot
+        for slot in _discover_audio_playback_slots()
+        if _audio_playback_plist_path(slot).is_file()
+    ]
+
+
+def kickstart_unhealthy_audio_playback_streams(
+    *, wait_secs: int = 5
+) -> list[dict[str, Any]]:
+    """Kickstart any installed audio-playback LaunchAgent whose port is silent."""
+    if not is_macos():
+        return []
+
+    slots = _installed_audio_playback_slots()
+    if not slots:
+        return []
+
+    console = _get_console()
+    _, real_uid, _ = _resolve_real_user()
+    uid = real_uid if real_uid is not None else os.getuid()
+
+    results: list[dict[str, Any]] = []
+    for slot in slots:
+        label = _audio_playback_launchd_label(slot)
+        port = _audio_playback_port(slot)
+        was_listening = _is_port_listening(port)
+        result: dict[str, Any] = {
+            "slot": slot,
+            "label": label,
+            "port": port,
+            "was_listening": was_listening,
+            "kickstarted": False,
+            "healthy_after": was_listening,
+        }
+        if was_listening:
+            results.append(result)
+            continue
+
+        console.print(
+            f"[yellow]Audio playback slot {slot} (port {port}) is silent — "
+            f"kickstarting {label}...[/yellow]"
+        )
+        try:
+            _run(
+                _launchctl_as_user(["kickstart", "-k", f"gui/{uid}/{label}"]),
+                check=True,
+            )
+            result["kickstarted"] = True
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            console.print(
+                f"[red]Failed to kickstart {label} (exit "
+                f"{getattr(exc, 'returncode', 'n/a')}). "
+                f"Try: sudo cyberwave edge install --reconfigure-speaker[/red]"
+            )
+            results.append(result)
+            continue
+
+        for _ in range(max(wait_secs, 1) * 2):
+            if _is_port_listening(port):
+                result["healthy_after"] = True
+                break
+            time.sleep(0.5)
+
+        if result["healthy_after"]:
+            console.print(
+                f"[green]Audio playback slot {slot} healthy on port {port}.[/green]"
+            )
+        else:
+            console.print(
+                f"[yellow]Audio playback slot {slot} still silent on port {port} "
+                f"after kickstart.[/yellow]"
+            )
+        results.append(result)
+    return results
+
+
+def setup_audio_playback_server(
+    *,
+    force: bool = False,
+    speaker_twins: Optional[list[tuple[str, str]]] = None,
+) -> bool:
+    """Install the macOS host PCM playback sink for Docker speaker drivers."""
+    if not is_macos():
+        return True
+
+    console = _get_console()
+
+    if force:
+        _teardown_audio_playback_server()
+    elif is_audio_playback_running():
+        console.print("[green]Audio playback sink is already running.[/green]")
+        if speaker_twins:
+            playback_rate, playback_channels = _resolve_speaker_playback_settings(
+                speaker_twins
+            )
+            twin_map = {
+                str(twin_uuid): f"http://host.docker.internal:{AUDIO_PLAYBACK_PORT}"
+                for twin_uuid, _ in speaker_twins
+            }
+            _persist_audio_playback_config(
+                twin_to_playback_url=twin_map,
+                playback_sample_rate=playback_rate,
+                playback_channels=playback_channels,
+            )
+        return True
+
+    if not _has_ffmpeg():
+        console.print(
+            "[red]ffmpeg is required for the audio playback sink.[/red]\n"
+            "[dim]Install with: brew install ffmpeg[/dim]"
+        )
+        return False
+
+    console.print(
+        "\n[bold]Speaker Playback Sink Setup[/bold]\n"
+        "This starts a host HTTP server that accepts raw PCM from the "
+        "generic-speaker driver inside Docker and plays it through macOS "
+        "CoreAudio.\n"
+    )
+
+    speaker_twins = speaker_twins or []
+    playback_rate, playback_channels = _resolve_speaker_playback_settings(
+        speaker_twins
+    )
+
+    loaded, _port_open = _bring_up_audio_playback_slot(
+        slot=0,
+        sample_rate=playback_rate,
+        channels=playback_channels,
+    )
+    if not loaded:
+        return False
+
+    playback_url = f"http://host.docker.internal:{AUDIO_PLAYBACK_PORT}"
+    try:
+        from .credentials import upsert_runtime_env
+
+        upsert_runtime_env("CYBERWAVE_MACOS_AUDIO_PLAYBACK_URL", playback_url)
+        console.print(
+            f"[green]Saved[/green] CYBERWAVE_MACOS_AUDIO_PLAYBACK_URL={playback_url} "
+            "to credentials.json"
+        )
+    except Exception as exc:
+        console.print(
+            f"[yellow]Could not persist audio playback URL: {exc}[/yellow]\n"
+            f"[dim]Set manually: export CYBERWAVE_MACOS_AUDIO_PLAYBACK_URL={playback_url}[/dim]"
+        )
+
+    if speaker_twins:
+        twin_map = {str(twin_uuid): playback_url for twin_uuid, _ in speaker_twins}
+        _persist_audio_playback_config(
+            twin_to_playback_url=twin_map,
+            playback_sample_rate=playback_rate,
+            playback_channels=playback_channels,
+        )
+
+    return True
+
+
 # ---- Edge-core launchd service -----------------------------------------------
 # LaunchAgent for cyberwave-edge-core, giving macOS the same
 # start/stop/restart/status/logs experience as systemd on Linux.

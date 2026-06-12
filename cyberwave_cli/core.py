@@ -45,6 +45,7 @@ from .macos import (
     bootstrap_launchd_service,
     is_macos,
     legacy_labels_for_package,
+    setup_audio_playback_server,
     setup_audio_stream_server,
     setup_camera_stream_server,
     setup_usbip_server,
@@ -2117,6 +2118,22 @@ def start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
 
 _CAMERA_SENSOR_TYPES = {"camera", "rgb", "depth_camera"}
 _MICROPHONE_SENSOR_TYPES = {"audio", "audio_mono", "audio_stereo", "microphone"}
+_SPEAKER_SENSOR_TYPES = {"speaker", "loudspeaker", "speakerphone", "audio_out"}
+
+
+def _collect_twin_sensors(data: dict) -> list[dict]:
+    """Gather sensor dicts from every catalog/twin JSON location we sync."""
+    asset = data.get("asset") or {}
+    schema = asset.get("universal_schema") or {}
+    sensors: list[dict] = []
+    for bucket in (
+        schema.get("sensors"),
+        (asset.get("metadata") or {}).get("sensors"),
+        (data.get("metadata") or {}).get("sensors"),
+    ):
+        if isinstance(bucket, list):
+            sensors.extend(sensor for sensor in bucket if isinstance(sensor, dict))
+    return sensors
 
 
 def _load_selected_twin_uuids() -> set[str] | None:
@@ -2203,13 +2220,10 @@ def _list_microphone_twins() -> list[tuple[str, str]]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        asset = data.get("asset") or {}
-        schema = asset.get("universal_schema") or {}
-        sensors = schema.get("sensors") or []
+        sensors = _collect_twin_sensors(data)
         if not any(
             str(sensor.get("type", "")).strip().lower() in _MICROPHONE_SENSOR_TYPES
             for sensor in sensors
-            if isinstance(sensor, dict)
         ):
             continue
         twin_uuid = str(data.get("uuid") or path.stem)
@@ -2225,6 +2239,46 @@ def _list_microphone_twins() -> list[tuple[str, str]]:
 def _any_twin_has_microphone_sensor() -> bool:
     """Check downloaded twin JSON files for microphone-type sensors."""
     return bool(_list_microphone_twins())
+
+
+def _list_speaker_twins() -> list[tuple[str, str]]:
+    """Return ``(twin_uuid, twin_name)`` for each selected twin with a speaker sensor."""
+    selected_uuids = _load_selected_twin_uuids()
+    results: list[tuple[str, str]] = []
+    for path in sorted(CONFIG_DIR.glob("*.json")):
+        if path.name in (
+            "credentials.json",
+            "environment.json",
+            "cameras.json",
+            "camera_streams.json",
+            "audio_streams.json",
+            "fingerprint.json",
+            "edge.json",
+        ):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        sensors = _collect_twin_sensors(data)
+        if not any(
+            str(sensor.get("type", "")).strip().lower() in _SPEAKER_SENSOR_TYPES
+            for sensor in sensors
+        ):
+            continue
+        twin_uuid = str(data.get("uuid") or path.stem)
+        twin_name = str(data.get("name") or twin_uuid)
+        if not twin_uuid:
+            continue
+        if selected_uuids is not None and twin_uuid not in selected_uuids:
+            continue
+        results.append((twin_uuid, twin_name))
+    return results
+
+
+def _any_twin_has_speaker_sensor() -> bool:
+    """Check downloaded twin JSON files for speaker-type sensors."""
+    return bool(_list_speaker_twins())
 
 
 def _render_camera_menu(
@@ -2627,6 +2681,24 @@ def setup_service(
         else:
             console.print(
                 "[dim]Linux microphone twins bind-mount /dev/snd into Docker with "
+                "--group-add audio and ALSA cgroup rule c 116:* rmw (edge-core "
+                "adds this automatically).[/dim]"
+            )
+
+    if spec.requires_docker and _any_twin_has_speaker_sensor():
+        if is_macos():
+            if not setup_audio_playback_server(
+                force=force_reinstall,
+                speaker_twins=_list_speaker_twins(),
+            ):
+                console.print(
+                    "[yellow]Speaker playback setup failed. The generic-speaker "
+                    "driver will not receive a host playback sink URL.[/yellow]\n"
+                    "[dim]Retry: cyberwave edge install --reconfigure-speaker[/dim]"
+                )
+        else:
+            console.print(
+                "[dim]Linux speaker twins bind-mount /dev/snd into Docker with "
                 "--group-add audio and ALSA cgroup rule c 116:* rmw (edge-core "
                 "adds this automatically).[/dim]"
             )

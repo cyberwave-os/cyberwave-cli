@@ -513,6 +513,12 @@ def edge():
     help="Re-run macOS microphone bridge setup (ffmpeg + audio_streams.json)",
 )
 @click.option(
+    "--reconfigure-speaker",
+    is_flag=True,
+    default=False,
+    help="Re-run macOS speaker playback sink setup (HTTP PCM + audio_streams.json)",
+)
+@click.option(
     "--microphone-index",
     type=int,
     default=None,
@@ -532,6 +538,7 @@ def install_edge(
     force_reinstall,
     reconfigure_camera,
     reconfigure_microphone,
+    reconfigure_speaker,
     microphone_index,
     without_workers,
 ):
@@ -551,6 +558,7 @@ def install_edge(
         sudo cyberwave edge install --force-reinstall
         sudo cyberwave edge install --reconfigure-camera
         sudo cyberwave edge install --reconfigure-microphone
+        sudo cyberwave edge install --reconfigure-speaker
         sudo cyberwave edge install --channel dev
         sudo cyberwave edge install --channel staging --version 0.0.42.595
     """
@@ -585,6 +593,36 @@ def install_edge(
         else:
             console.print(
                 "[yellow]--reconfigure-microphone is only supported on macOS.[/yellow]\n"
+                "[dim]On Linux, ensure driver containers mount /dev/snd.[/dim]"
+            )
+        return
+
+    if reconfigure_speaker:
+        from ...macos import is_macos
+
+        if is_macos():
+            from ...core import _list_speaker_twins
+            from ...macos import (
+                setup_audio_playback_server,
+                start_edge_core_service,
+                stop_edge_core_service,
+            )
+
+            try:
+                if not setup_audio_playback_server(
+                    force=True,
+                    speaker_twins=_list_speaker_twins(),
+                ):
+                    raise SystemExit(1)
+                console.print("[cyan]Restarting edge-core so the driver reconnects...[/cyan]")
+                stop_edge_core_service()
+                start_edge_core_service()
+            except KeyboardInterrupt:
+                console.print("\n[dim]Aborted.[/dim]")
+                raise SystemExit(1)
+        else:
+            console.print(
+                "[yellow]--reconfigure-speaker is only supported on macOS.[/yellow]\n"
                 "[dim]On Linux, ensure driver containers mount /dev/snd.[/dim]"
             )
         return
@@ -1154,6 +1192,9 @@ def restart_edge(env_file):
 
         kickstart_unhealthy_audio_streams()
         warn_on_audio_stream_config_drift()
+        from ...macos import kickstart_unhealthy_audio_playback_streams
+
+        kickstart_unhealthy_audio_playback_streams()
         return
 
     # Fallback: stop running process, then start a new one
