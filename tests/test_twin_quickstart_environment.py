@@ -1,13 +1,10 @@
 """CLI twin create must reuse SDK quickstart environment resolution."""
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
-
 import importlib.util
 import sys
 from pathlib import Path
-
-import pytest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 
 def _load_twin_commands(monkeypatch):
