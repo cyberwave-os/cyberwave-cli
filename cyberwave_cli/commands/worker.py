@@ -543,18 +543,33 @@ def worker_status(container: str | None) -> None:
     "-c",
     help="Explicit container name (auto-detected if omitted)",
 )
-def worker_monitor(update: float, container: str | None) -> None:
+@click.option(
+    "--all-hosts",
+    "-a",
+    is_flag=True,
+    default=False,
+    help=(
+        "Show Zenoh stats from every worker discovered on the network "
+        "instead of filtering to the local container only."
+    ),
+)
+def worker_monitor(update: float, container: str | None, all_hosts: bool) -> None:
     """Live dashboard showing worker resource usage and Zenoh throughput.
 
     Displays CPU, memory, temperature, power consumption, GPU
     (Linux/NVIDIA only), per-channel Zenoh message rates, hook frame
     counts, and ML inference latency.
 
+    With --all-hosts, shows a compact Zenoh-only panel for every worker
+    reachable on the local Zenoh mesh (Docker/thermal metrics are not
+    available for remote workers).
+
     \b
     Examples:
         cyberwave worker monitor
         cyberwave worker monitor --update 1
         cyberwave worker monitor -c cyberwave-worker-abc12345
+        cyberwave worker monitor --all-hosts
     """
     import platform as _platform
 
@@ -566,15 +581,17 @@ def worker_monitor(update: float, container: str | None) -> None:
         WorkerSnapshot,
         ZenohStatsReader,
         build_dashboard,
+        build_network_dashboard,
         collect_host_metrics,
         get_container_cpu_quota,
+        get_container_hostname,
         parse_hook_stats,
         parse_model_stats,
     )
 
     container_name = container or _find_worker_container()
 
-    if not container_name:
+    if not container_name and not all_hosts:
         stopped = _find_worker_container(include_stopped=True)
         if stopped:
             console.print(f"[red]✗[/red] Worker container '{stopped}' exists but is not running.")
@@ -587,6 +604,53 @@ def worker_monitor(update: float, container: str | None) -> None:
             console.print("[dim]Start the worker container with: cyberwave worker start[/dim]")
         raise click.Abort()
 
+    if all_hosts:
+        # ------------------------------------------------------------------ #
+        # Network-wide view: one panel per discovered Zenoh worker host.      #
+        # Docker/thermal metrics are omitted — they are not remotely          #
+        # accessible.  The local container (if any) is just another entry.   #
+        # ------------------------------------------------------------------ #
+        if container_name:
+            console.print(
+                f"[dim]Connecting via container [bold]{container_name}[/bold] "
+                f"— showing all hosts (refresh every {update}s)[/dim]\n"
+            )
+        else:
+            console.print(
+                f"[dim]Connecting to local Zenoh bus "
+                f"— showing all hosts (refresh every {update}s)[/dim]\n"
+            )
+
+        zenoh_reader = ZenohStatsReader()
+        zenoh_ok = zenoh_reader.start(container_name=container_name, all_hosts=True)
+        if not zenoh_ok:
+            console.print(
+                "[red]✗[/red] Zenoh connection failed. "
+                "Is a worker container running and exposing port 7447?"
+            )
+            raise click.Abort()
+
+        per_host_trackers: dict[str, RateTracker] = {}
+        try:
+            with Live(console=console, refresh_per_second=1, screen=False) as live:
+                while True:
+                    live.update(
+                        build_network_dashboard(
+                            zenoh_reader.all_latest(),
+                            per_host_trackers,
+                        )
+                    )
+                    time.sleep(update)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            zenoh_reader.stop()
+            console.print("\n[dim]Monitor stopped.[/dim]")
+        return
+
+    # ---------------------------------------------------------------------- #
+    # Default: single-container view with Docker + thermal + Zenoh stats.    #
+    # ---------------------------------------------------------------------- #
     console.print(
         f"[dim]Monitoring container: [bold]{container_name}[/bold]  "
         f"(refresh every {update}s)[/dim]\n"
@@ -595,8 +659,12 @@ def worker_monitor(update: float, container: str | None) -> None:
     cpu_cores = get_container_cpu_quota(container_name)
     rate_tracker = RateTracker()
 
+    container_hostname = get_container_hostname(container_name)
     zenoh_reader = ZenohStatsReader()
-    zenoh_ok = zenoh_reader.start(container_name=container_name)
+    zenoh_ok = zenoh_reader.start(
+        container_name=container_name,
+        target_hostname=container_hostname,
+    )
     if not zenoh_ok:
         console.print(
             "[dim]Zenoh connection failed — showing Docker metrics only. "

@@ -26,9 +26,16 @@ from rich.table import Table
 from rich.text import Text
 
 try:
-    from cyberwave.workers.constants import MONITOR_STATS_KEY
+    from cyberwave.workers.constants import (
+        MONITOR_STATS_WILDCARD,
+        build_monitor_stats_key,
+    )
 except ImportError:
-    MONITOR_STATS_KEY = "cw/_monitor/worker_stats"
+
+    def build_monitor_stats_key(hostname: str) -> str:  # type: ignore[misc]
+        return f"cw/_monitor/{hostname}/worker_stats"
+
+    MONITOR_STATS_WILDCARD = "cw/_monitor/*/worker_stats"
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +340,41 @@ def get_container_ip(container_name: str) -> str | None:
             ip = result.stdout.strip()
             if ip and _is_valid_ip(ip):
                 return ip
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return None
+
+
+def get_container_hostname(container_name: str) -> str | None:
+    """Return the hostname configured inside a Docker container, or ``None``.
+
+    Reads ``{{.Config.Hostname}}`` via ``docker inspect``.  This always matches
+    what the worker runtime publishes as the ``hostname`` field in its Zenoh
+    stats snapshot (which comes from ``/etc/hostname`` inside the container —
+    the same value Docker sets in ``.Config.Hostname``), even under
+    ``--network host`` where ``socket.gethostname()`` might return the host
+    machine's name instead.
+
+    Returns ``None`` when ``docker`` is not on PATH, the container is unknown,
+    or the call times out — callers should treat ``None`` as "filter disabled".
+    """
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{.Config.Hostname}}",
+                container_name,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            hostname = result.stdout.strip()
+            if hostname:
+                return hostname
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return None
@@ -683,6 +725,109 @@ def build_dashboard(snap: WorkerSnapshot) -> RenderGroup:
     return RenderGroup(*parts)
 
 
+def build_network_dashboard(
+    snapshots: dict[str, dict[str, Any]],
+    rate_trackers: dict[str, "RateTracker"],
+) -> RenderGroup:
+    """Build a Rich renderable showing Zenoh stats for every discovered host.
+
+    *snapshots* maps hostname → raw Zenoh snapshot dict (as published by the
+    worker runtime).  *rate_trackers* is a per-hostname :class:`RateTracker`
+    dict; missing entries are created lazily so callers may pass a plain ``{}``.
+
+    Only Zenoh-sourced data (channels, hooks, models) is shown — Docker and
+    thermal metrics are unavailable for remote workers.
+    """
+    parts: list[Any] = []
+
+    header = Text()
+    header.append("Cyberwave Worker Monitor", style="bold cyan")
+    header.append("  — network view (all hosts)", style="dim")
+    parts.append(header)
+    parts.append(Text("Press Ctrl+C to stop.\n", style="dim"))
+
+    if not snapshots:
+        parts.append(
+            Panel(
+                Text("No worker snapshots received yet.", style="dim"),
+                border_style="dim",
+            )
+        )
+        return RenderGroup(*parts)
+
+    for hostname in sorted(snapshots):
+        data = snapshots[hostname]
+        tracker = rate_trackers.setdefault(hostname, RateTracker())
+        host_parts: list[Any] = []
+
+        # Zenoh throughput
+        channels = tracker.update(data.get("transport", {}), snapshot_ts=data.get("ts"))
+        visible = [ch for ch in channels if "_monitor/" not in ch.channel]
+        if visible:
+            zen_table = Table(title="Zenoh Throughput", expand=True, show_edge=False)
+            zen_table.add_column("Channel", style="cyan")
+            zen_table.add_column("msgs/s", justify="right")
+            zen_table.add_column("Throughput", justify="right")
+            zen_table.add_column("Total", justify="right", style="dim")
+            for ch in visible:
+                zen_table.add_row(
+                    ch.channel,
+                    f"{ch.msgs_per_sec:.1f}",
+                    _format_bytes_rate(ch.bytes_per_sec),
+                    f"{ch.total:,}",
+                )
+            host_parts.append(zen_table)
+
+        # Hooks
+        hooks = parse_hook_stats(data.get("hooks", {}))
+        if hooks:
+            hook_table = Table(title="Worker Hooks", expand=True, show_edge=False)
+            hook_table.add_column("Hook", style="cyan")
+            hook_table.add_column("Frames", justify="right")
+            hook_table.add_column("Drops", justify="right", style="yellow")
+            for h in hooks:
+                hook_table.add_row(
+                    h.name,
+                    f"{h.frames:,}",
+                    f"{h.drops:,}" if h.drops > 0 else "[dim]0[/dim]",
+                )
+            host_parts.append(hook_table)
+
+        # Models
+        models = parse_model_stats(data.get("models", []))
+        if models:
+            model_table = Table(title="Model Inference", expand=True, show_edge=False)
+            model_table.add_column("Model", style="cyan")
+            model_table.add_column("Device", style="dim")
+            model_table.add_column("Inferences", justify="right")
+            model_table.add_column("Avg ms", justify="right")
+            model_table.add_column("P95 ms", justify="right")
+            model_table.add_column("P99 ms", justify="right")
+            for m in models:
+                model_table.add_row(
+                    m.name,
+                    m.device,
+                    f"{m.count:,}",
+                    f"{m.avg_ms:.1f}" if m.avg_ms else "-",
+                    f"{m.p95_ms:.1f}" if m.p95_ms else "-",
+                    f"{m.p99_ms:.1f}" if m.p99_ms else "-",
+                )
+            host_parts.append(model_table)
+
+        if not host_parts:
+            host_parts.append(Text("No data yet.", style="dim"))
+
+        parts.append(
+            Panel(
+                RenderGroup(*host_parts),
+                title=f"[bold]{hostname}[/bold]",
+                border_style="cyan",
+            )
+        )
+
+    return RenderGroup(*parts)
+
+
 # ---------------------------------------------------------------------------
 # Thermal / power readers
 # ---------------------------------------------------------------------------
@@ -969,16 +1114,28 @@ class LinuxThermalReader:
 
 
 class ZenohStatsReader:
-    """Subscribe to the worker's ``cw/_monitor/worker_stats`` Zenoh key.
+    """Subscribe to worker stats published on host-scoped Zenoh keys.
 
-    The worker runtime publishes a JSON stats snapshot periodically on a
-    raw Zenoh key (bypassing DataBus validation).  This reader connects
-    to the container's Zenoh TCP listener and picks up the latest snapshot.
-    Falls back to empty data when Zenoh is unavailable.
+    The worker runtime publishes a JSON snapshot to
+    ``cw/_monitor/{hostname}/worker_stats``.  Embedding the host in the key
+    lets Zenoh filter at the routing layer — the subscriber only receives
+    messages for the keys it declared interest in, with no post-decode
+    comparison required.
+
+    Default mode (single container):
+        Subscribes to the exact key ``cw/_monitor/{hostname}/worker_stats``
+        for the target container.  :meth:`latest` returns the most recent
+        snapshot from that container.
+
+    ``--all-hosts`` mode:
+        Subscribes to the wildcard ``cw/_monitor/*/worker_stats``.  The
+        hostname is extracted from each sample's key expression rather than
+        the JSON payload.  :meth:`all_latest` returns a per-hostname dict.
     """
 
     def __init__(self) -> None:
         self._latest: dict[str, Any] = {}
+        self._all_latest: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._session: Any = None
         self._subscription: Any = None
@@ -988,13 +1145,23 @@ class ZenohStatsReader:
         *,
         connect: list[str] | None = None,
         container_name: str | None = None,
+        target_hostname: str | None = None,
+        all_hosts: bool = False,
     ) -> bool:
         """Attempt to open a Zenoh session and subscribe.  Returns False on failure.
 
         When *container_name* is given and *connect* is not, the container's
-        bridge-network IP is discovered automatically and used as a TCP
-        connect endpoint.  This is required on macOS where multicast
-        discovery between the host and Docker Desktop's Linux VM doesn't work.
+        bridge-network IP is discovered automatically and used as a TCP connect
+        endpoint (required on macOS where Docker Desktop's VM breaks multicast).
+
+        *target_hostname* — the hostname of the container to monitor (from
+        ``get_container_hostname()``).  Used to build the exact subscription key
+        ``cw/_monitor/{target_hostname}/worker_stats``.  Ignored when
+        *all_hosts* is ``True``.
+
+        *all_hosts* — when ``True``, subscribes to the wildcard
+        ``cw/_monitor/*/worker_stats``; the hostname is extracted from each
+        sample's key expression.  :meth:`all_latest` returns data per host.
         """
         try:
             import zenoh
@@ -1019,6 +1186,14 @@ class ZenohStatsReader:
 
             self._session = zenoh.open(cfg)
 
+            if all_hosts:
+                subscribe_key = MONITOR_STATS_WILDCARD
+            elif target_hostname:
+                subscribe_key = build_monitor_stats_key(target_hostname)
+            else:
+                # No hostname available — fall back to wildcard and accept all.
+                subscribe_key = MONITOR_STATS_WILDCARD
+
             def _on_sample(sample: Any) -> None:
                 try:
                     raw = bytes(sample.payload)
@@ -1029,13 +1204,23 @@ class ZenohStatsReader:
                         return
                 try:
                     data = json.loads(raw)
-                    with self._lock:
-                        self._latest = data
                 except (json.JSONDecodeError, UnicodeDecodeError):
-                    pass
+                    return
+                # Extract hostname from the key expression rather than the
+                # payload — this is the authoritative identity source.
+                # Key format: cw/_monitor/{hostname}/worker_stats
+                key_parts = str(sample.key_expr).split("/")
+                hostname = (
+                    key_parts[2]
+                    if len(key_parts) >= 4
+                    else data.get("hostname", "unknown")
+                )
+                with self._lock:
+                    self._latest = data
+                    self._all_latest[hostname] = data
 
             self._subscription = self._session.declare_subscriber(
-                MONITOR_STATS_KEY,
+                subscribe_key,
                 _on_sample,
             )
             return True
@@ -1045,6 +1230,15 @@ class ZenohStatsReader:
     def latest(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._latest)
+
+    def all_latest(self) -> dict[str, dict[str, Any]]:
+        """Return the most recent snapshot per hostname seen since the session opened.
+
+        Hostnames are extracted from the Zenoh key expression of each sample,
+        not from the JSON payload.
+        """
+        with self._lock:
+            return {h: dict(d) for h, d in self._all_latest.items()}
 
     def stop(self) -> None:
         if self._subscription is not None:
