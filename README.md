@@ -509,12 +509,11 @@ sudo cyberwave edge uninstall --channel dev   # keep Docker images/containers
 ```bash
 cyberwave edge start                        # background
 cyberwave edge start -f                     # foreground
-cyberwave edge start --env-file ./my/.env   # custom config
 
 cyberwave edge stop
 
 sudo cyberwave edge restart                 # systemd
-cyberwave edge restart --env-file .env      # process mode
+cyberwave edge restart                      # process mode fallback
 ```
 
 On **macOS**, `cyberwave edge restart` also self-heals the camera bridge: after reloading the edge-core LaunchAgent it inspects every installed `com.cyberwave.camera-stream*` service and runs `launchctl kickstart -k` on any whose MJPEG port is silent (e.g. ffmpeg crashed, the camera was unplugged and replugged, or launchd's spawn-throttle disabled the slot). Healthy slots are left alone so a working stream isn't briefly interrupted. If `~/.cyberwave/camera_streams.json` still references a port no installed slot serves — typical after adding a camera-bearing twin without re-running camera selection — a one-line warning per orphan twin points at `sudo cyberwave edge install --reconfigure-camera`.

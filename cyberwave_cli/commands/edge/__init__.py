@@ -5,9 +5,6 @@ Example usage:
     # Start the edge node
     cyberwave edge start
 
-    # Start with specific config
-    cyberwave edge start --env-file /path/to/.env
-
     # Check status
     cyberwave edge status
 
@@ -968,9 +965,8 @@ def uninstall_edge(yes, channel):
 
 
 @edge.command("start")
-@click.option("--env-file", type=click.Path(), default=None, help="Path to .env file")
 @click.option("--foreground", "-f", is_flag=True, help="Run in foreground (don't daemonize)")
-def start_edge(env_file, foreground):
+def start_edge(foreground):
     """Start the edge node service.
 
     When the service is already running, ``systemctl start`` is a no-op
@@ -1022,21 +1018,9 @@ def start_edge(env_file, foreground):
             console.print("[red]launchctl not found on this system.[/red]")
             raise SystemExit(1)
 
-    env_path = Path(env_file).resolve() if env_file else Path(".env").resolve()
-
-    if not env_path.exists():
-        console.print(f"[red]Error: .env file not found at {env_path}[/red]")
-        console.print("[dim]Run 'cyberwave edge install' first to configure the edge node[/dim]")
-        return
-
-    console.print(f"[cyan]Starting edge node with config: {env_path}[/cyan]")
-
-    work_dir = env_path.parent
-
     from ...config import clean_subprocess_env
 
     env = clean_subprocess_env()
-    env["DOTENV_PATH"] = str(env_path)
     binary = _find_edge_core_binary()
     if not binary:
         console.print("[red]Error: cyberwave-edge-core binary not found[/red]")
@@ -1048,14 +1032,12 @@ def start_edge(env_file, foreground):
             console.print("[green]Running edge node in foreground (Ctrl+C to stop)...[/green]")
             subprocess.run(
                 [binary],
-                cwd=work_dir,
                 env=env,
             )
         else:
             console.print("[green]Starting edge node in background...[/green]")
             process = subprocess.Popen(
                 [binary],
-                cwd=work_dir,
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -1135,13 +1117,7 @@ def stop_edge():
 
 
 @edge.command("restart")
-@click.option(
-    "--env-file",
-    type=click.Path(exists=True),
-    default=None,
-    help="Path to .env file (for process mode)",
-)
-def restart_edge(env_file):
+def restart_edge():
     """Restart the edge node service.
 
     If the edge was installed as a systemd service, restarts it via systemctl
@@ -1151,7 +1127,6 @@ def restart_edge(env_file):
     \b
     Examples:
         sudo cyberwave edge restart
-        cyberwave edge restart --env-file /path/to/.env
     """
     from ...core import (
         EDGE_CORE_SPEC,
@@ -1214,16 +1189,9 @@ def restart_edge(env_file):
     except Exception as exc:
         console.print(f"[yellow]Could not stop existing process: {exc}[/yellow]")
 
-    env_path = Path(env_file).resolve() if env_file else Path(".env").resolve()
-    if not env_path.exists():
-        console.print(f"[red]Error: .env file not found at {env_path}[/red]")
-        console.print("[dim]Pass --env-file or run from the directory containing .env[/dim]")
-        return
-
     from ...config import clean_subprocess_env
 
     env = clean_subprocess_env()
-    env["DOTENV_PATH"] = str(env_path)
     binary = _find_edge_core_binary()
     if not binary:
         console.print("[red]Error: cyberwave-edge-core binary not found[/red]")
@@ -1233,7 +1201,6 @@ def restart_edge(env_file):
     try:
         process = subprocess.Popen(
             [binary],
-            cwd=env_path.parent,
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

@@ -40,6 +40,11 @@ def _install_fake_modules(
 ):
     fake_config = ModuleType("cyberwave_cli.config")
     fake_config.clean_subprocess_env = lambda: dict(env or {})
+    fake_config.get_api_url = lambda: "https://api.example.com"
+    fake_config.CONFIG_DIR = Path("/tmp/.cyberwave")
+    fake_config.CREDENTIALS_FILE = Path("/tmp/.cyberwave/credentials.json")
+    fake_config.chown_to_sudo_user = lambda *_args, **_kwargs: None
+    fake_config._resolve_sudo_user_home = lambda: Path("/tmp")
 
     fake_core = ModuleType("cyberwave_cli.core")
     fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
@@ -69,10 +74,8 @@ def _install_fake_modules(
     monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
 
 
-def test_start_edge_foreground_uses_resolved_edge_core_binary(monkeypatch, tmp_path):
-    env_file = tmp_path / ".env"
-    env_file.write_text("EDGE=1\n", encoding="utf-8")
-    invoked: list[tuple[list[str], str, dict[str, str]]] = []
+def test_start_edge_foreground_uses_resolved_edge_core_binary(monkeypatch):
+    invoked: list[tuple[list[str], dict[str, str]]] = []
 
     _install_fake_modules(
         monkeypatch,
@@ -84,21 +87,16 @@ def test_start_edge_foreground_uses_resolved_edge_core_binary(monkeypatch, tmp_p
     monkeypatch.setattr(
         edge_module.subprocess,
         "run",
-        lambda command, **kwargs: invoked.append(
-            (command, kwargs["cwd"], kwargs["env"])
-        ) or SimpleNamespace(returncode=0),
+        lambda command, **kwargs: invoked.append((command, kwargs["env"]))
+        or SimpleNamespace(returncode=0),
     )
 
-    edge_module.start_edge.callback(env_file=str(env_file), foreground=True)
+    edge_module.start_edge.callback(foreground=True)
 
     assert invoked == [
         (
             ["/Users/test/.cyberwave-cli/venv-local/bin/cyberwave-edge-core"],
-                env_file.parent,
-            {
-                "BASE": "1",
-                "DOTENV_PATH": str(env_file),
-            },
+            {"BASE": "1"},
         )
     ]
 
@@ -123,13 +121,11 @@ def test_stop_edge_process_mode_matches_edge_core_binary(monkeypatch):
     assert killed == [(12345, signal.SIGTERM)]
 
 
-def test_restart_edge_process_mode_uses_resolved_binary_and_process_match(monkeypatch, tmp_path):
-    env_file = tmp_path / ".env"
-    env_file.write_text("EDGE=1\n", encoding="utf-8")
+def test_restart_edge_process_mode_uses_resolved_binary_and_process_match(monkeypatch):
     resolved_binary = "/Users/test/.cyberwave-cli/venv-local/bin/cyberwave-edge-core"
     pgrep_commands: list[list[str]] = []
     killed: list[tuple[int, int]] = []
-    spawned: list[tuple[list[str], str, dict[str, str]]] = []
+    spawned: list[tuple[list[str], dict[str, str]]] = []
 
     _install_fake_modules(
         monkeypatch,
@@ -151,32 +147,24 @@ def test_restart_edge_process_mode_uses_resolved_binary_and_process_match(monkey
     monkeypatch.setattr(
         edge_module.subprocess,
         "Popen",
-        lambda command, **kwargs: spawned.append(
-            (command, kwargs["cwd"], kwargs["env"])
-        ) or _Proc(),
+        lambda command, **kwargs: spawned.append((command, kwargs["env"])) or _Proc(),
     )
     monkeypatch.setattr(edge_module.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     monkeypatch.setattr(edge_module.time, "sleep", lambda _seconds: None)
 
-    edge_module.restart_edge.callback(env_file=str(env_file))
+    edge_module.restart_edge.callback()
 
     assert pgrep_commands == [["pgrep", "-f", "cyberwave-edge-core"]]
     assert killed == [(222, signal.SIGTERM)]
     assert spawned == [
         (
             [resolved_binary],
-            env_file.parent,
-            {
-                "BASE": "1",
-                "DOTENV_PATH": str(env_file),
-            },
+            {"BASE": "1"},
         )
     ]
 
 
-def test_start_edge_background_on_macos_does_not_suggest_edge_logs(monkeypatch, tmp_path):
-    env_file = tmp_path / ".env"
-    env_file.write_text("EDGE=1\n", encoding="utf-8")
+def test_start_edge_background_on_macos_does_not_suggest_edge_logs(monkeypatch):
     printed: list[str] = []
 
     _install_fake_modules(monkeypatch, resolved_binary="/tmp/cyberwave-edge-core")
@@ -190,7 +178,7 @@ def test_start_edge_background_on_macos_does_not_suggest_edge_logs(monkeypatch, 
     monkeypatch.setattr(edge_module.console, "print", lambda message="", *a, **kw: printed.append(str(message)))
     monkeypatch.setattr(edge_module.sys, "platform", "darwin")
 
-    edge_module.start_edge.callback(env_file=str(env_file), foreground=False)
+    edge_module.start_edge.callback(foreground=False)
 
     output = "\n".join(printed)
     assert "cyberwave edge logs" not in output
@@ -202,6 +190,11 @@ def test_show_logs_on_macos_shows_missing_launchagent_log_message(monkeypatch):
 
     fake_config = ModuleType("cyberwave_cli.config")
     fake_config.clean_subprocess_env = lambda: {}
+    fake_config.get_api_url = lambda: "https://api.example.com"
+    fake_config.CONFIG_DIR = Path("/tmp/.cyberwave")
+    fake_config.CREDENTIALS_FILE = Path("/tmp/.cyberwave/credentials.json")
+    fake_config.chown_to_sudo_user = lambda *_args, **_kwargs: None
+    fake_config._resolve_sudo_user_home = lambda: Path("/tmp")
 
     fake_core = ModuleType("cyberwave_cli.core")
     fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
@@ -237,7 +230,7 @@ def test_start_edge_macos_uses_launchagent_when_installed(monkeypatch, tmp_path)
         lambda command, **_kwargs: run_calls.append(command) or SimpleNamespace(returncode=0),
     )
 
-    edge_module.start_edge.callback(env_file=None, foreground=False)
+    edge_module.start_edge.callback(foreground=False)
 
     assert run_calls == [["launchctl", "kickstart", "-k", "gui/501/com.cyberwave.edge.core"]]
 
