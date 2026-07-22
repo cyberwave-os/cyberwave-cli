@@ -90,6 +90,17 @@ def is_usbip_server_running() -> bool:
 
 USBIP_REPO_URL = "https://github.com/jiegec/usbip.git"
 
+# Pinned to a specific tag rather than tracking the default branch: earlier
+# versions (through v0.8.0) panic ("unimplemented: control out"/"control in")
+# on any non-Device-recipient control transfer, which crashes the host server
+# and empties its exportable-device list until the launchd service is
+# restarted. This hits USB hubs (every Mac exports at least one) and, more
+# importantly, the SO-101 arm's own WCH CH34x/CH9102 serial chip, which uses
+# non-Device-recipient control transfers to configure line state on every
+# connection. v0.9.0 (jiegec/usbip#64) fixes both. See
+# https://github.com/jiegec/usbip/commit/d674714 for the upstream fix.
+USBIP_PINNED_REF = "v0.9.0"
+
 _USBIP_LAUNCHD_PLIST_TEMPLATE = textwrap.dedent("""\
     <?xml version="1.0" encoding="UTF-8"?>
     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -564,12 +575,88 @@ def _strip_xattrs(path: Path) -> None:
 # ---- USB/IP server -----------------------------------------------------------
 
 
+def _git_in(install_dir: Path, *args: str) -> list[str]:
+    """Build a ``git`` command scoped to *install_dir*.
+
+    ``-c safe.directory=<dir>`` is set because ``cyberwave edge install`` often
+    runs under ``sudo`` (euid 0) while the usbip repo is owned by the real user
+    (a previous run's ``_chown_to_real_user`` handed it back). Without this,
+    git 2.35.2+ refuses with "detected dubious ownership in repository", which
+    would silently skip the version check / auto-upgrade on the very installs
+    it targets.
+    """
+    return ["git", "-C", str(install_dir), "-c", f"safe.directory={install_dir}", *args]
+
+
+def _usbip_checked_out_commit(install_dir: Path) -> Optional[str]:
+    """Return the commit SHA currently checked out in *install_dir*, or None."""
+    try:
+        result = subprocess.run(
+            _git_in(install_dir, "rev-parse", "HEAD"),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=clean_subprocess_env(),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _usbip_resolve_pinned_commit(install_dir: Path) -> Optional[str]:
+    """Resolve USBIP_PINNED_REF to a commit SHA, fetching tags if needed.
+
+    Older installs (cloned before pinning was introduced) may predate the
+    pinned tag entirely, so a plain local ``rev-parse`` can miss it; this
+    fetches tags from origin and retries once before giving up.
+
+    ``clean_subprocess_env()`` is used for every git call: under a PyInstaller
+    bundle the inherited ``LD_LIBRARY_PATH`` points at the extraction dir and
+    would make ``git`` load the wrong shared libraries (see its docstring).
+    """
+
+    def _rev_parse() -> Optional[str]:
+        try:
+            result = subprocess.run(
+                _git_in(install_dir, "rev-parse", f"{USBIP_PINNED_REF}^{{commit}}"),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=clean_subprocess_env(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    commit = _rev_parse()
+    if commit is not None:
+        return commit
+
+    try:
+        subprocess.run(
+            _git_in(install_dir, "fetch", "--tags", "origin"),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=clean_subprocess_env(),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return _rev_parse()
+
+
 def _install_usbip_server(*, skip_confirm: bool = False) -> bool:
-    """Build the jiegec/usbip host server from source using cargo.
+    """Build the jiegec/usbip host server from source using cargo, pinned to
+    USBIP_PINNED_REF.
 
     When the Rust toolchain is missing, attempts to install it via rustup
     (with confirmation unless *skip_confirm* is True) instead of bailing
     out with a hint.
+
+    An existing install on an older commit is checked out to the pinned ref
+    and rebuilt automatically: otherwise bumping USBIP_PINNED_REF here would
+    never reach machines that already have a binary built, since a plain
+    ``binary_path.is_file()`` check would keep short-circuiting the rebuild.
 
     Returns True on success.
     """
@@ -590,20 +677,47 @@ def _install_usbip_server(*, skip_confirm: bool = False) -> bool:
             return False
 
     binary_path = _usbip_binary_path()
-    if binary_path.is_file():
-        console.print("[green]USB/IP server binary already built.[/green]")
-        return True
-
     install_dir = _usbip_install_dir()
-    console.print("[cyan]Building USB/IP server from source...[/cyan]")
-    install_dir.parent.mkdir(parents=True, exist_ok=True)
 
     if not install_dir.exists():
+        install_dir.parent.mkdir(parents=True, exist_ok=True)
+        console.print("[cyan]Building USB/IP server from source...[/cyan]")
         try:
             _run(["git", "clone", USBIP_REPO_URL, str(install_dir)])
         except subprocess.CalledProcessError as exc:
             console.print(f"[red]Failed to clone usbip repo (exit {exc.returncode}).[/red]")
             return False
+        try:
+            _run(_git_in(install_dir, "checkout", USBIP_PINNED_REF))
+        except subprocess.CalledProcessError as exc:
+            console.print(
+                f"[red]Failed to check out usbip {USBIP_PINNED_REF} (exit {exc.returncode}).[/red]"
+            )
+            return False
+    else:
+        pinned_commit = _usbip_resolve_pinned_commit(install_dir)
+        current_commit = _usbip_checked_out_commit(install_dir)
+        if pinned_commit is not None and current_commit != pinned_commit:
+            console.print(
+                f"[cyan]Updating USB/IP server to {USBIP_PINNED_REF} "
+                "(fixes host-passthrough control-transfer crashes)...[/cyan]"
+            )
+            try:
+                _run(_git_in(install_dir, "checkout", USBIP_PINNED_REF))
+            except subprocess.CalledProcessError as exc:
+                console.print(
+                    f"[red]Failed to check out usbip {USBIP_PINNED_REF} "
+                    f"(exit {exc.returncode}).[/red]"
+                )
+                return False
+            # A stale binary from the old checkout must not short-circuit the
+            # build below via the binary_path.is_file() check further down.
+            binary_path.unlink(missing_ok=True)
+        elif binary_path.is_file():
+            console.print("[green]USB/IP server binary already built.[/green]")
+            return True
+        else:
+            console.print("[cyan]Building USB/IP server from source...[/cyan]")
 
     # Preserve PATH (so cargo is findable) and HOME (so ~/.cargo works).
     build_env = clean_subprocess_env()
@@ -844,6 +958,16 @@ _CAMERA_STREAM_WRAPPER_TEMPLATE = textwrap.dedent("""\
     RESOLUTION="${{CYBERWAVE_CAMERA_STREAM_RESOLUTION:-1280x720}}"
     FPS="${{CYBERWAVE_CAMERA_STREAM_FPS:-30}}"
 
+    # launchd redirects this wrapper's (and ffmpeg's) stdout+stderr to
+    # LOG_FILE.  ffmpeg re-emits its warning banner on every consumer
+    # connection, so with reconnect churn the file grows without bound over
+    # days (observed: ~850 MB).  Cap it in the loop below: launchd holds the
+    # path open in append mode, so truncating in place just resets the write
+    # offset on the next append — moving/rotating the file would orphan
+    # launchd's open fd and silently drop all future output.
+    LOG_FILE="{log_path}"
+    MAX_LOG_BYTES="${{CYBERWAVE_CAMERA_STREAM_MAX_LOG_BYTES:-10485760}}"
+
     # ffmpeg's ``-listen 1`` HTTP server is single-shot: when the consumer
     # disconnects, ffmpeg exits.  Looping in bash here keeps the stream alive
     # across reconnects and prevents launchd's spawn-throttle from disabling
@@ -864,6 +988,11 @@ _CAMERA_STREAM_WRAPPER_TEMPLATE = textwrap.dedent("""\
     # port-in-use / device-busy, etc.).  Wrapping with ``|| true`` would
     # always collapse it to 0 and hide the cause.
     while true; do
+        # Keep the launchd-managed log bounded (see LOG_FILE note above).
+        if [ -f "$LOG_FILE" ]; then
+            _log_bytes=$(stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+            [ "$_log_bytes" -gt "$MAX_LOG_BYTES" ] 2>/dev/null && : > "$LOG_FILE"
+        fi
         # Capture at the camera's native rate (AVFoundation on macOS only
         # reliably accepts the device's advertised primary fps, e.g. 30 — it
         # rejects "15" even when the format string lists it).  We rate-control
@@ -1091,7 +1220,9 @@ def _bring_up_camera_stream_slot(
     label = _camera_stream_launchd_label(slot)
     port = _camera_stream_port(slot)
 
-    wrapper_contents = _CAMERA_STREAM_WRAPPER_TEMPLATE.format(port=port)
+    wrapper_contents = _CAMERA_STREAM_WRAPPER_TEMPLATE.format(
+        port=port, log_path=str(log_path)
+    )
     try:
         _write_file_as_real_user(wrapper_path, wrapper_contents, mode=0o755)
     except OSError as exc:
@@ -1174,6 +1305,34 @@ def _installed_camera_stream_slots() -> list[int]:
         for slot in _discover_camera_stream_slots()
         if _camera_stream_plist_path(slot).is_file()
     ]
+
+
+def _camera_stream_slot_is_loaded(slot: int) -> bool:
+    """Return True when *slot*'s launchd job is actually registered.
+
+    A plist file existing on disk does **not** mean launchd has the job
+    loaded: an install can leave a stale plist for a slot that was never
+    bootstrapped (or was booted out), so port ``8091`` can look "served" on
+    disk while nothing answers on it. ``launchctl list <label>`` exits 0 only
+    when the label is loaded.
+
+    We deliberately do not use ``_is_port_listening`` as the signal here: the
+    ffmpeg ``-listen 1`` server is single-shot and exits between consumers, so
+    a loaded, healthy slot legitimately has no listener at the instant we look.
+    Loaded-in-launchd (backed by ``KeepAlive``) is the stable signal.
+    """
+    label = _camera_stream_launchd_label(slot)
+    try:
+        result = subprocess.run(
+            _launchctl_as_user(["list", label]),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=clean_subprocess_env(),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return result.returncode == 0
 
 
 def kickstart_unhealthy_camera_streams(
@@ -1290,6 +1449,10 @@ def warn_on_camera_stream_config_drift() -> list[dict[str, Any]]:
     a one-line yellow hint per orphaned twin pointing at the supported
     recovery command.
 
+    "Served" means the slot's launchd job is loaded (see
+    ``_camera_stream_slot_is_loaded``), not merely that a plist file exists —
+    a leftover plist for an unloaded slot must not mask an orphaned twin.
+
     No-op on non-macOS.  Returns the list of orphans so callers/tests
     can inspect.
     """
@@ -1316,8 +1479,14 @@ def warn_on_camera_stream_config_drift() -> list[dict[str, Any]]:
     if not isinstance(twin_to_url, dict) or not twin_to_url:
         return []
 
+    # A port only counts as served when its slot is actually loaded in
+    # launchd — not merely when a plist exists on disk. Otherwise a stale
+    # plist for an unloaded slot makes its port look healthy and the orphaned
+    # twin pointing at it is never flagged (the exact drift this warns about).
     served_ports = {
-        _camera_stream_port(slot) for slot in _installed_camera_stream_slots()
+        _camera_stream_port(slot)
+        for slot in _installed_camera_stream_slots()
+        if _camera_stream_slot_is_loaded(slot)
     }
 
     orphans: list[dict[str, Any]] = []

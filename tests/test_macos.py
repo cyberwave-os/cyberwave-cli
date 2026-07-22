@@ -69,9 +69,96 @@ def test_install_skips_when_already_built(monkeypatch):
     monkeypatch.setattr(macos, "_has_git", lambda: True)
     monkeypatch.setattr(macos, "_has_cargo", lambda: True)
     monkeypatch.setattr(macos, "_usbip_binary_path", lambda: Path("/fake/host"))
+    monkeypatch.setattr(macos, "_usbip_install_dir", lambda: Path("/fake/install"))
+    monkeypatch.setattr(Path, "exists", lambda self: True)
     monkeypatch.setattr(Path, "is_file", lambda self: True)
+    # Simulate "couldn't determine the pinned commit" (e.g. offline): the
+    # version check must degrade to the old already-built shortcut rather
+    # than forcing a rebuild whenever git/network info is unavailable.
+    monkeypatch.setattr(macos, "_usbip_resolve_pinned_commit", lambda _install_dir: None)
 
     assert macos._install_usbip_server() is True
+
+
+def test_install_upgrades_stale_checkout_to_pinned_ref(monkeypatch, tmp_path):
+    """An existing install pinned to an older commit must be checked out to
+    USBIP_PINNED_REF and rebuilt.
+
+    Regression: USBIP_PINNED_REF was introduced to fix a real host-server
+    crash (see its docstring), but a plain ``binary_path.is_file()`` shortcut
+    would keep skipping the rebuild forever on machines that already had a
+    binary built from an older, unpinned checkout.
+    """
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setattr(macos, "_has_git", lambda: True)
+    monkeypatch.setattr(macos, "_has_cargo", lambda: True)
+
+    install_dir = tmp_path / "usbip"
+    install_dir.mkdir()
+    binary_path = tmp_path / "host"
+    binary_path.write_text("stale binary")
+
+    monkeypatch.setattr(macos, "_usbip_install_dir", lambda: install_dir)
+    monkeypatch.setattr(macos, "_usbip_binary_path", lambda: binary_path)
+    monkeypatch.setattr(macos, "_usbip_resolve_pinned_commit", lambda _install_dir: "PINNEDSHA")
+    monkeypatch.setattr(macos, "_usbip_checked_out_commit", lambda _install_dir: "OLDSHA")
+
+    run_calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        run_calls.append(list(cmd))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(macos, "_run", fake_run)
+
+    def fake_cargo_build(cmd, **_kwargs):
+        binary_path.write_text("fresh binary")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(macos.subprocess, "run", fake_cargo_build)
+    monkeypatch.setattr(macos, "_strip_xattrs", lambda _p: None)
+    monkeypatch.setattr(macos, "_chown_to_real_user", lambda *_a, **_kw: None)
+
+    assert macos._install_usbip_server() is True
+    checkout_calls = [
+        cmd
+        for cmd in run_calls
+        if "checkout" in cmd and macos.USBIP_PINNED_REF in cmd
+    ]
+    assert checkout_calls, "expected a git checkout of the pinned ref"
+    # Must scope the repo via safe.directory so a sudo (euid 0) run isn't
+    # refused by git's dubious-ownership check on the user-owned repo.
+    checkout_cmd = checkout_calls[0]
+    assert f"safe.directory={install_dir}" in checkout_cmd
+    assert binary_path.read_text() == "fresh binary"
+
+
+def test_install_skips_rebuild_when_checked_out_commit_matches_pinned(monkeypatch, tmp_path):
+    """A checkout already on the pinned commit must not be touched or rebuilt."""
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setattr(macos, "_has_git", lambda: True)
+    monkeypatch.setattr(macos, "_has_cargo", lambda: True)
+
+    install_dir = tmp_path / "usbip"
+    install_dir.mkdir()
+    binary_path = tmp_path / "host"
+    binary_path.write_text("current binary")
+
+    monkeypatch.setattr(macos, "_usbip_install_dir", lambda: install_dir)
+    monkeypatch.setattr(macos, "_usbip_binary_path", lambda: binary_path)
+    monkeypatch.setattr(macos, "_usbip_resolve_pinned_commit", lambda _install_dir: "SAMESHA")
+    monkeypatch.setattr(macos, "_usbip_checked_out_commit", lambda _install_dir: "SAMESHA")
+
+    run_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        macos,
+        "_run",
+        lambda cmd, **_kwargs: run_calls.append(list(cmd)),
+    )
+
+    assert macos._install_usbip_server() is True
+    assert run_calls == []
+    assert binary_path.read_text() == "current binary"
 
 
 def test_install_fails_without_git(monkeypatch):
@@ -730,7 +817,9 @@ def test_camera_stream_wrapper_template_uses_persistent_loop(monkeypatch):
     by design, so without an outer loop the agent gets removed after a
     short burst of consumer reconnects."""
     macos = _load_macos(monkeypatch)
-    rendered = macos._CAMERA_STREAM_WRAPPER_TEMPLATE.format(port=8091)
+    rendered = macos._CAMERA_STREAM_WRAPPER_TEMPLATE.format(
+        port=8091, log_path="/tmp/camera_stream.log"
+    )
     code_only = "\n".join(_executable_lines(rendered))
 
     assert "while true; do" in code_only
@@ -767,7 +856,9 @@ def test_camera_stream_wrapper_logs_restarts_via_unified_log(monkeypatch):
     user can diagnose a hung restart loop without digging into the
     StandardError file."""
     macos = _load_macos(monkeypatch)
-    rendered = macos._CAMERA_STREAM_WRAPPER_TEMPLATE.format(port=8091)
+    rendered = macos._CAMERA_STREAM_WRAPPER_TEMPLATE.format(
+        port=8091, log_path="/tmp/camera_stream.log"
+    )
 
     assert "logger -t cyberwave-camera-stream" in rendered, (
         "Restarts must be visible via 'log show ... cyberwave-camera-stream'"
@@ -781,6 +872,57 @@ def test_camera_stream_wrapper_logs_restarts_via_unified_log(monkeypatch):
     assert "ffmpeg exited" in rendered, (
         "Restart line should mention ffmpeg + its captured exit status"
     )
+
+
+def test_camera_stream_wrapper_caps_log_size(monkeypatch):
+    """The wrapper must bound its launchd log in-loop.
+
+    Regression: with no cap, ffmpeg's per-connection warning banner grew the
+    StandardOutPath file without bound (observed ~850 MB). The cap must live
+    inside the ``while`` loop, reference the concrete log path, and truncate
+    in place (``: >``) rather than move/rotate — moving would orphan launchd's
+    open fd and silently drop all subsequent output.
+    """
+    macos = _load_macos(monkeypatch)
+    rendered = macos._CAMERA_STREAM_WRAPPER_TEMPLATE.format(
+        port=8091, log_path="/tmp/camera_stream.1.log"
+    )
+    code_only = "\n".join(_executable_lines(rendered))
+
+    assert 'LOG_FILE="/tmp/camera_stream.1.log"' in code_only, (
+        "Wrapper must know the concrete log path to cap it"
+    )
+    assert "MAX_LOG_BYTES=" in code_only
+    # Truncate in place; never mv/rotate (would break launchd's open fd).
+    assert ': > "$LOG_FILE"' in code_only
+    assert "mv " not in code_only
+
+    # The cap check must be inside the loop, not a one-shot before it.
+    loop_body = code_only.split("while true; do", 1)[1]
+    assert 'stat -f%z "$LOG_FILE"' in loop_body, (
+        "Log-size check must run each iteration, inside the loop"
+    )
+
+
+def test_camera_stream_slot_is_loaded_uses_launchctl_list(monkeypatch):
+    """Loaded-state must be driven by ``launchctl list <label>`` returncode,
+    not plist-file existence (the drift detector depends on this)."""
+    macos = _load_macos(monkeypatch)
+    _stub_real_user(macos, monkeypatch, uid=501)
+
+    seen: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        seen.append(list(cmd))
+        # Slot 1 label loaded (rc 0); anything else not loaded (rc 113).
+        loaded = "com.cyberwave.camera-stream.1" in cmd
+        return SimpleNamespace(returncode=0 if loaded else 113, stdout="", stderr="")
+
+    monkeypatch.setattr(macos.subprocess, "run", fake_run)
+
+    assert macos._camera_stream_slot_is_loaded(1) is True
+    assert macos._camera_stream_slot_is_loaded(0) is False
+    assert any("list" in cmd for cmd in seen)
 
 
 def test_wait_for_launchd_unload_polls_until_label_disappears(monkeypatch):
@@ -1082,6 +1224,8 @@ def test_warn_on_camera_stream_config_drift_flags_orphan_twins(
     monkeypatch.setattr(macos, "_user_home", lambda: tmp_path)
 
     _install_camera_stream_plist(tmp_path, 0)
+    # Slot 0 is loaded (serves 8091); slot 1 is not installed at all.
+    monkeypatch.setattr(macos, "_camera_stream_slot_is_loaded", lambda slot: slot == 0)
 
     config_dir = tmp_path / ".cyberwave"
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -1108,6 +1252,45 @@ def test_warn_on_camera_stream_config_drift_flags_orphan_twins(
     assert "twin-served" not in printed, (
         "Healthy twin must not be mentioned"
     )
+
+
+def test_warn_on_camera_stream_config_drift_flags_unloaded_slot(
+    monkeypatch, tmp_path
+):
+    """A twin pointing at a slot whose plist exists but is NOT loaded in
+    launchd must be flagged.
+
+    Regression: ``served_ports`` used to be derived from plist-file existence
+    alone, so a leftover plist for an unloaded slot made its port look served
+    and silently masked the orphaned twin — nothing actually answers on that
+    port, so the driver just retries forever.
+    """
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setattr(macos, "is_macos", lambda: True)
+    monkeypatch.setattr(macos, "_user_home", lambda: tmp_path)
+
+    # Both plists exist on disk, but only slot 1 (8092) is actually loaded.
+    _install_camera_stream_plist(tmp_path, 0)
+    _install_camera_stream_plist(tmp_path, 1)
+    monkeypatch.setattr(macos, "_camera_stream_slot_is_loaded", lambda slot: slot == 1)
+
+    config_dir = tmp_path / ".cyberwave"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "camera_streams.json").write_text(
+        '{"twin_to_stream_url": {'
+        '"twin-on-loaded": "http://host.docker.internal:8092",'
+        '"twin-on-unloaded": "http://host.docker.internal:8091"'
+        "}}",
+        encoding="utf-8",
+    )
+
+    fake_console = MagicMock()
+    monkeypatch.setattr(macos, "_get_console", lambda: fake_console)
+
+    orphans = macos.warn_on_camera_stream_config_drift()
+
+    assert [o["twin_uuid"] for o in orphans] == ["twin-on-unloaded"]
+    assert orphans[0]["port"] == 8091
 
 
 # ---- audio-stream auto-recovery on `edge restart` -----------------------------
