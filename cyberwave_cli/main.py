@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 from typing import Any
 
 import click
@@ -11,6 +12,11 @@ from rich.console import Console
 from . import __version__
 
 console = Console()
+
+# Mirrors ``cyberwave.client.CLIENT_USER_AGENT_ENV``. Duplicated as a literal
+# rather than imported so CLI startup never depends on the SDK being installed
+# (``utils.get_sdk_client`` tolerates its absence).
+_CLIENT_USER_AGENT_ENV = "CYBERWAVE_CLIENT_USER_AGENT"
 
 
 BANNER = """
@@ -159,8 +165,22 @@ def selfcheck_sdk() -> None:
     raise click.exceptions.Exit(run_sdk_selfcheck())
 
 
+def _announce_cli_identity() -> None:
+    """Tell the SDK which tool is calling, for backend request attribution.
+
+    The SDK stamps ``User-Agent`` / ``X-Cyberwave-SDK-Version`` on every REST
+    call, but without this every caller looks like a plain ``cyberwave-python``
+    script. Set once here rather than passing ``user_agent=`` at each of the
+    CLI's ``Cyberwave(...)`` construction sites, so sites added later are
+    covered too. An explicit outer value wins, so a wrapper around the CLI can
+    still identify itself.
+    """
+    os.environ.setdefault(_CLIENT_USER_AGENT_ENV, f"cyberwave-cli/{__version__}")
+
+
 def main() -> None:
     """Main entry point."""
+    _announce_cli_identity()
     cli()
 
 

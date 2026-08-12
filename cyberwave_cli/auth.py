@@ -7,7 +7,7 @@ The login endpoint is not part of the SDK, so we implement it here directly.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from .config import get_api_url
 
@@ -27,6 +27,27 @@ class AuthenticationError(Exception):
     def __init__(self, message: str, details: Optional[dict] = None):
         super().__init__(message)
         self.details = details
+
+
+# Enough of the body to carry a DRF ``detail`` or a proxy's explanation, without
+# dumping an HTML error page into the terminal.
+_ERROR_BODY_MAX_LENGTH = 200
+
+
+def _http_error_message(response: Any) -> str:
+    """Describe an HTTP failure including the server's reason.
+
+    The status code alone is not actionable: a bare ``HTTP error: 403`` from CI
+    is indistinguishable between a rate limit, a CSRF rejection, and a blocked
+    account. The body usually says which.
+
+    The ``HTTP error: <code>`` prefix is preserved verbatim because callers
+    (notably the CLI test harness's retry classifier) substring-match on it.
+    """
+    body = (response.text or "").strip().replace("\n", " ")
+    if not body:
+        return f"HTTP error: {response.status_code}"
+    return f"HTTP error: {response.status_code}: {body[:_ERROR_BODY_MAX_LENGTH]}"
 
 
 @dataclass
@@ -180,7 +201,7 @@ class AuthClient:
             response.raise_for_status()
 
         except httpx.HTTPStatusError as e:
-            raise AuthenticationError(f"HTTP error: {e.response.status_code}") from e
+            raise AuthenticationError(_http_error_message(e.response)) from e
         except httpx.RequestError as e:
             raise AuthenticationError(f"Connection error: {e}") from e
 
@@ -215,7 +236,7 @@ class AuthClient:
             return User.from_dict(response.json())
 
         except httpx.HTTPStatusError as e:
-            raise AuthenticationError(f"HTTP error: {e.response.status_code}") from e
+            raise AuthenticationError(_http_error_message(e.response)) from e
         except httpx.RequestError as e:
             raise AuthenticationError(f"Connection error: {e}") from e
 
@@ -251,7 +272,7 @@ class AuthClient:
             response.raise_for_status()
 
         except httpx.HTTPStatusError as e:
-            raise AuthenticationError(f"HTTP error: {e.response.status_code}") from e
+            raise AuthenticationError(_http_error_message(e.response)) from e
         except httpx.RequestError as e:
             raise AuthenticationError(f"Connection error: {e}") from e
 
@@ -292,7 +313,7 @@ class AuthClient:
             response.raise_for_status()
 
         except httpx.HTTPStatusError as e:
-            raise AuthenticationError(f"HTTP error: {e.response.status_code}") from e
+            raise AuthenticationError(_http_error_message(e.response)) from e
         except httpx.RequestError as e:
             raise AuthenticationError(f"Connection error: {e}") from e
 
@@ -347,7 +368,7 @@ class AuthClient:
             response.raise_for_status()
 
         except httpx.HTTPStatusError as e:
-            raise AuthenticationError(f"HTTP error: {e.response.status_code}") from e
+            raise AuthenticationError(_http_error_message(e.response)) from e
         except httpx.RequestError as e:
             raise AuthenticationError(f"Connection error: {e}") from e
 
