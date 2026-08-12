@@ -24,9 +24,18 @@ API_TOKEN_CONTEXT_ENDPOINT = "/api/v1/users/@me/apitoken/"
 class AuthenticationError(Exception):
     """Raised when authentication fails."""
 
-    def __init__(self, message: str, details: Optional[dict] = None):
+    def __init__(
+        self,
+        message: str,
+        details: Optional[dict] = None,
+        status_code: Optional[int] = None,
+    ):
         super().__init__(message)
         self.details = details
+        # HTTP status the server answered with, or None when we never got an
+        # answer (connection error, timeout). Callers use this to tell "the
+        # server said no" apart from "we could not reach the server".
+        self.status_code = status_code
 
 
 # Enough of the body to carry a DRF ``detail`` or a proxy's explanation, without
@@ -303,17 +312,21 @@ class AuthClient:
                 return APITokenContext.from_dict(response.json())
 
             if response.status_code == 401:
-                raise AuthenticationError("Invalid or expired token")
+                raise AuthenticationError("Invalid or expired token", status_code=401)
 
             if response.status_code == 403:
                 data = response.json()
                 detail = data.get("detail") if isinstance(data, dict) else None
-                raise AuthenticationError(detail or "API token context unavailable", details=data)
+                raise AuthenticationError(
+                    detail or "API token context unavailable", details=data, status_code=403
+                )
 
             response.raise_for_status()
 
         except httpx.HTTPStatusError as e:
-            raise AuthenticationError(_http_error_message(e.response)) from e
+            raise AuthenticationError(
+                _http_error_message(e.response), status_code=e.response.status_code
+            ) from e
         except httpx.RequestError as e:
             raise AuthenticationError(f"Connection error: {e}") from e
 

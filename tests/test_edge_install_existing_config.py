@@ -1,7 +1,9 @@
 """Tests for the existing-configuration detection and cleanup during edge install."""
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 from tests._core_module_loader import load_core_module
 
@@ -262,3 +264,56 @@ def test_configure_edge_environment_skips_prompt_with_skip_confirm(
 
     assert result is True
     assert not any("already connected" in p for p in confirm_prompts)
+
+
+def test_cleanup_runs_with_the_workspace_corrected_from_the_token(monkeypatch, tmp_path):
+    """Regression: ``_cleanup_existing_edge_configuration`` filters which edge
+    registrations get deleted by ``creds.workspace_uuid``. Repairing that value
+    only *after* the cleanup meant the run that detected the mismatch still
+    deleted nothing and stranded this device's registrations in the backend.
+    """
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(core, "ENVIRONMENT_FILE", tmp_path / "environment.json")
+    monkeypatch.setattr(core, "FINGERPRINT_FILE", tmp_path / "fingerprint.json")
+    (tmp_path / "environment.json").write_text(json.dumps({"name": "Env1", "uuid": "env-1"}))
+    (tmp_path / "twin-uuid-123.json").write_text(json.dumps({"uuid": "twin-uuid-123"}))
+
+    monkeypatch.setattr(core.Confirm, "ask", staticmethod(lambda *a, **kw: True))
+
+    @dataclass
+    class _Creds:
+        token: str = "cw_test"
+        cyberwave_base_url: str | None = None
+        workspace_uuid: str | None = "ws-stale"
+        workspace_name: str | None = "Stale WS"
+
+    monkeypatch.setattr(core, "load_credentials", lambda: _Creds())
+    monkeypatch.setattr(core, "save_credentials", lambda creds: None)
+    monkeypatch.setattr(
+        core,
+        "_api_token_workspace",
+        lambda token, base_url=None: core._TokenWorkspace(uuid="ws-token", name="Token WS"),
+    )
+
+    cleanup_workspaces: list[str | None] = []
+    monkeypatch.setattr(
+        core,
+        "_cleanup_existing_edge_configuration",
+        lambda *, twin_json_files, creds: cleanup_workspaces.append(creds.workspace_uuid),
+    )
+
+    workspace = SimpleNamespace(uuid="ws-token", name="Token WS", slug="token")
+    monkeypatch.setattr(core, "_get_sdk_client", lambda *a, **kw: SimpleNamespace())
+    monkeypatch.setattr(core, "_resolve_workspace_from_credentials", lambda *a, **kw: workspace)
+    monkeypatch.setattr(
+        core,
+        "_select_or_create_environment",
+        lambda *a, **kw: SimpleNamespace(uuid="env-1", name="Env1"),
+    )
+    monkeypatch.setattr(core, "_select_connected_twins", lambda *a, **kw: [])
+    monkeypatch.setattr(core, "_detach_edge_fingerprint_from_other_twins", lambda *a, **kw: (0, 0))
+    monkeypatch.setattr(core, "_save_environment_file", lambda **kw: None)
+
+    assert core.configure_edge_environment(skip_confirm=False) is True
+    assert cleanup_workspaces == ["ws-token"]

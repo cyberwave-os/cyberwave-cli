@@ -462,6 +462,10 @@ sudo cyberwave pair --reconfigure-microphone
 
 Installs the `cyberwave-edge-core` package (via apt-get on Debian/Ubuntu) and creates a systemd service so it starts on boot. Guides you through workspace, environment, and twin selection.
 
+**Workspace:** API tokens are bound to a single workspace, so the installer uses that workspace rather than asking you to pick one. If `CYBERWAVE_WORKSPACE_SLUG` names a different workspace, a first-time install stops and tells you to create a token for that workspace instead; a device that is already paired warns that the slug is being ignored and continues with the token's workspace. Previously either case continued against the wrong workspace and reported that no environments existed.
+
+If the workspace cannot be determined — the API is unreachable, or returns an error — the install now says so and stops rather than picking a workspace at random and creating an empty environment in it.
+
 **Prerequisites — Linux:** Docker is auto-installed via `apt-get` when missing (Ubuntu / Debian / Raspbian, amd64 / arm64). No manual setup required.
 
 **Prerequisites — macOS:**

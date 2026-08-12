@@ -10,7 +10,15 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from cyberwave_cli.auth import _ERROR_BODY_MAX_LENGTH, _http_error_message
+import httpx
+import pytest
+
+from cyberwave_cli.auth import (
+    _ERROR_BODY_MAX_LENGTH,
+    AuthClient,
+    AuthenticationError,
+    _http_error_message,
+)
 
 
 def _response(status_code: int, text: str) -> SimpleNamespace:
@@ -52,3 +60,26 @@ def test_collapses_newlines() -> None:
 def test_omits_the_separator_for_an_empty_body() -> None:
     assert _http_error_message(_response(404, "")) == "HTTP error: 404"
     assert _http_error_message(_response(404, "   \n ")) == "HTTP error: 404"
+
+
+def test_token_context_reports_both_the_reason_and_the_status() -> None:
+    """A 5xx from the token-context endpoint must carry body *and* status code.
+
+    Two independent needs meet on this one raise: the message has to explain
+    what went wrong, and ``status_code`` has to stay set so
+    ``core._workspace_from_token`` can tell a backend hiccup (report it) from
+    a token with no workspace context (401/403 — fall back to selection
+    silently). Dropping either half degrades a different code path.
+    """
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(502, text="upstream connect error")
+    )
+
+    with AuthClient(base_url="http://testserver") as client:
+        client._client = httpx.Client(base_url="http://testserver", transport=transport)
+        with pytest.raises(AuthenticationError) as excinfo:
+            client.get_api_token_context("token-123")
+
+    assert "502" in str(excinfo.value)
+    assert "upstream connect error" in str(excinfo.value)
+    assert excinfo.value.status_code == 502

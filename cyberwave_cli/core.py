@@ -447,6 +447,8 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
                 workspace = _select_workspace_from_env_or_default(
                     sdk_client,
                     skip_confirm=skip_confirm,
+                    token=env_token,
+                    base_url=runtime_overrides.get("CYBERWAVE_BASE_URL") or None,
                 )
 
             save_credentials(
@@ -465,6 +467,11 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
             console.print(f"[dim]Workspace: {workspace.name}[/dim]")
             console.print(f"[dim]Credentials saved to {CONFIG_DIR}/[/dim]\n")
             return True
+        except WorkspaceConflictError as e:
+            # Not a credentials problem, so prompting for a password below would
+            # only pair the device against a workspace the operator ruled out.
+            console.print(f"[red]{e}[/red]")
+            return False
         except Exception as e:
             console.print("[yellow]CYBERWAVE_API_KEY is invalid or incomplete.[/yellow]")
             console.print(e)
@@ -529,22 +536,157 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
         return False
 
 
-def _select_workspace_from_env_or_default(client: Any, *, skip_confirm: bool) -> Any:
-    """Pick a workspace, honoring ``CYBERWAVE_WORKSPACE_SLUG`` when provided."""
+class WorkspaceConflictError(RuntimeError):
+    """The requested workspace contradicts the one the API token is bound to.
+
+    Distinct from a bad token: no other credential can resolve it, so callers
+    must abort rather than fall through to an interactive login.
+    """
+
+
+@dataclass
+class _TokenWorkspace:
+    """Minimal workspace stand-in built from an API token's own context."""
+
+    uuid: str
+    name: str
+    slug: str = ""
+
+
+def _api_token_workspace(token: str, *, base_url: str | None = None) -> _TokenWorkspace | None:
+    """Return the workspace an API token is bound to, or ``None``.
+
+    API tokens are minted for exactly one workspace and the backend scopes
+    every list endpoint to it, but ``workspaces.list()`` still returns every
+    workspace the user can reach. Picking from that list (``workspaces[0]``,
+    or a slug that names a different workspace) yields a workspace the token
+    cannot see any environments in, so the install reports "no environments"
+    even though the token works fine. Ask the backend which workspace the
+    token is actually bound to instead of guessing.
+
+    Returns ``None`` for tokens without workspace context, which the backend
+    signals with 401/403 (Knox session tokens land here), so callers can fall
+    back to selecting from the list. Every other failure — a 5xx, a backend too
+    old to expose the endpoint, a dropped connection — is reported first,
+    because falling back silently means guessing again.
+    """
+    from .auth import AuthClient, AuthenticationError
+
+    def _report(exc: Exception) -> None:
+        console.print(
+            f"[yellow]Could not resolve the workspace bound to this token:[/yellow] {exc}"
+        )
+        console.print("[dim]Falling back to workspace selection.[/dim]")
+
+    try:
+        with AuthClient(base_url=base_url) as auth_client:
+            context = auth_client.get_api_token_context(token)
+    except AuthenticationError as exc:
+        # Only 401/403 mean "this token has no workspace context". AuthClient
+        # funnels transport errors and every non-2xx into this same type, so
+        # without the status check a backend hiccup silently reverts to the
+        # guessing this function exists to prevent.
+        if getattr(exc, "status_code", None) not in (401, 403):
+            _report(exc)
+        return None
+    except Exception as exc:
+        _report(exc)
+        return None
+
+    workspace_uuid = str(getattr(context, "workspace_uuid", "") or "").strip()
+    if not workspace_uuid:
+        return None
+    return _TokenWorkspace(
+        uuid=workspace_uuid,
+        name=str(getattr(context, "workspace_name", "") or "") or workspace_uuid,
+    )
+
+
+def _persist_corrected_workspace(creds: Any, workspace: Any) -> Any:
+    """Rewrite the stored workspace so later runs stop using the stale one.
+
+    ``creds.workspace_uuid`` is not only used to pick a workspace: it also
+    filters which edge registrations the cleanup path deletes, so leaving a
+    mismatched value on disk keeps that path broken.
+    """
+    from dataclasses import replace
+
+    corrected = replace(
+        creds,
+        workspace_uuid=str(getattr(workspace, "uuid", "") or ""),
+        workspace_name=str(getattr(workspace, "name", "") or ""),
+    )
+    try:
+        save_credentials(corrected)
+    except Exception as exc:
+        console.print(f"[yellow]Could not update stored workspace:[/yellow] {exc}")
+        return creds
+    return corrected
+
+
+def _select_workspace_from_env_or_default(
+    client: Any,
+    *,
+    skip_confirm: bool,
+    token: str | None = None,
+    base_url: str | None = None,
+) -> Any:
+    """Pick a workspace, honoring ``CYBERWAVE_WORKSPACE_SLUG`` when provided.
+
+    When ``token`` is an API token the workspace it is bound to always wins:
+    it is the only workspace whose environments and twins the token can list.
+    """
     workspaces = client.workspaces.list()
     if not workspaces:
         raise RuntimeError("No workspaces available for this account.")
 
+    token_workspace = _api_token_workspace(token, base_url=base_url) if token else None
     workspace_slug = os.getenv("CYBERWAVE_WORKSPACE_SLUG", "").strip().lower()
+    requested = None
     if workspace_slug:
-        for workspace in workspaces:
-            candidate_slug = str(getattr(workspace, "slug", "") or "").strip().lower()
-            if candidate_slug == workspace_slug:
-                console.print(f"[green]Workspace:[/green] {workspace.name}")
-                return workspace
-        raise RuntimeError(
-            f"Workspace slug '{workspace_slug}' was not found for the provided token."
+        requested = next(
+            (
+                workspace
+                for workspace in workspaces
+                if str(getattr(workspace, "slug", "") or "").strip().lower() == workspace_slug
+            ),
+            None,
         )
+        if requested is None:
+            raise RuntimeError(
+                f"Workspace slug '{workspace_slug}' was not found for the provided token."
+            )
+
+    if token_workspace is not None:
+        # Prefer the full workspace object from the listing so callers keep
+        # access to slug/metadata, falling back to the token context itself
+        # when the listing does not include it.
+        bound = next(
+            (
+                workspace
+                for workspace in workspaces
+                if str(getattr(workspace, "uuid", "") or "").strip().lower()
+                == token_workspace.uuid.lower()
+            ),
+            token_workspace,
+        )
+        # Compare UUIDs rather than slugs: the token context carries no slug, so
+        # a slug-to-slug check would silently pass whenever the bound workspace
+        # is missing from the listing.
+        if requested is not None and str(requested.uuid).strip().lower() != (
+            token_workspace.uuid.lower()
+        ):
+            raise WorkspaceConflictError(
+                f"CYBERWAVE_WORKSPACE_SLUG is '{workspace_slug}' but the provided API "
+                f"token is bound to workspace '{bound.name}'. Create a token for "
+                f"'{workspace_slug}' or drop CYBERWAVE_WORKSPACE_SLUG."
+            )
+        console.print(f"[green]Workspace:[/green] {bound.name} [dim](from API token)[/dim]")
+        return bound
+
+    if requested is not None:
+        console.print(f"[green]Workspace:[/green] {requested.name}")
+        return requested
 
     if len(workspaces) == 1:
         workspace = workspaces[0]
@@ -561,9 +703,17 @@ def _select_workspace_from_env_or_default(client: Any, *, skip_confirm: bool) ->
     return workspaces[idx]
 
 
-def _select_workspace(client: Any, *, skip_confirm: bool) -> Any:
+def _select_workspace(
+    client: Any,
+    *,
+    skip_confirm: bool,
+    token: str | None = None,
+    base_url: str | None = None,
+) -> Any:
     """Get workspaces via SDK and let user select one."""
-    return _select_workspace_from_env_or_default(client, skip_confirm=skip_confirm)
+    return _select_workspace_from_env_or_default(
+        client, skip_confirm=skip_confirm, token=token, base_url=base_url
+    )
 
 
 def _resolve_workspace_from_credentials(client: Any, workspace_uuid: str) -> Any | None:
@@ -639,11 +789,18 @@ def _workspace_environments(client: Any, workspace_uuid: str) -> list[Any]:
     # Primary: fetch all environments visible to the user. The backend already
     # scopes results to the caller's workspaces/ownership, so this includes
     # both project-scoped and standalone environments.
+    listing_error: Exception | None = None
     try:
         all_environments = client.environments.list()
-    except Exception:
+    except Exception as exc:
+        # Never fail silently here: an empty list is indistinguishable from
+        # "this workspace has no environments" and sends the caller straight
+        # into the create-a-new-one branch.
+        console.print(f"[yellow]Could not list environments:[/yellow] {exc}")
+        listing_error = exc
         all_environments = []
 
+    dropped_workspaces: set[str] = set()
     for env in all_environments:
         env_ws = _environment_workspace_uuid(env)
         # Include the environment when it belongs to the selected workspace OR
@@ -652,6 +809,7 @@ def _workspace_environments(client: Any, workspace_uuid: str) -> list[Any]:
         # the listing to environments the user has access to, so unresolved
         # environments are safe to show.
         if env_ws and env_ws != workspace_uuid:
+            dropped_workspaces.add(env_ws)
             continue
         env_uuid = str(getattr(env, "uuid", ""))
         if env_uuid and env_uuid not in seen_uuids:
@@ -671,6 +829,26 @@ def _workspace_environments(client: Any, workspace_uuid: str) -> list[Any]:
             if env_uuid and env_uuid not in seen_uuids:
                 environments.append(env)
                 seen_uuids.add(env_uuid)
+
+    if not environments and dropped_workspaces:
+        # The backend returned environments the caller can see, but all of them
+        # belong to other workspaces. Say so instead of implying the account
+        # has no environments at all.
+        console.print(
+            f"[yellow]The API returned {len(all_environments)} environment(s), but none "
+            f"belong to workspace {workspace_uuid}.[/yellow]"
+        )
+        seen = ", ".join(sorted(dropped_workspaces))
+        console.print(f"[dim]Workspaces seen instead: {seen}[/dim]")
+
+    if not environments and listing_error is not None:
+        # The project-scoped pass above found nothing either, so we genuinely do
+        # not know whether this workspace is empty. Returning [] here is what
+        # makes the caller create a stray environment on a failed API call.
+        raise RuntimeError(
+            f"Could not determine the environments in this workspace: {listing_error}. "
+            "Re-run the install once the API is reachable."
+        )
 
     return environments
 
@@ -1075,6 +1253,28 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
         console.print("[dim]Run 'cyberwave login' first.[/dim]")
         return False
 
+    creds_base_url = creds.cyberwave_base_url
+    # The token's own workspace wins over the stored one: it is the only
+    # workspace whose environments the token can list, and an install that
+    # persisted a different workspace would otherwise keep reporting "no
+    # environments" forever.
+    #
+    # Resolve and repair it *before* the cleanup below. `creds.workspace_uuid`
+    # filters which edge registrations the cleanup deletes, so running it
+    # against a stale value silently deletes nothing and strands this device's
+    # registrations in the backend.
+    token_workspace = _api_token_workspace(creds.token, base_url=creds_base_url)
+    workspace_corrected = False
+    if token_workspace is not None:
+        stored_uuid = str(creds.workspace_uuid or "").strip().lower()
+        if stored_uuid and stored_uuid != token_workspace.uuid.lower():
+            console.print(
+                f"[yellow]Stored workspace does not match the API token; using "
+                f"'{token_workspace.name}' from the token instead.[/yellow]"
+            )
+            creds = _persist_corrected_workspace(creds, token_workspace)
+            workspace_corrected = True
+
     if not skip_confirm:
         env_label, twin_json_files = _detect_existing_edge_configuration()
         if env_label is not None:
@@ -1091,11 +1291,26 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
                 )
 
     try:
-        creds_base_url = creds.cyberwave_base_url
         client = _get_sdk_client(creds.token, base_url=creds_base_url)
 
         workspace = None
-        if creds.workspace_uuid:
+        if token_workspace is not None:
+            workspace = (
+                _resolve_workspace_from_credentials(client, token_workspace.uuid) or token_workspace
+            )
+            if not workspace_corrected:
+                console.print(f"[green]Workspace:[/green] {workspace.name}")
+            # An explicit slug that the token cannot honour is worth saying out
+            # loud. Warn rather than abort: devices already paired against a
+            # stale slug must keep working.
+            requested_slug = os.getenv("CYBERWAVE_WORKSPACE_SLUG", "").strip().lower()
+            workspace_slug = str(getattr(workspace, "slug", "") or "").strip().lower()
+            if requested_slug and workspace_slug and requested_slug != workspace_slug:
+                console.print(
+                    f"[yellow]Ignoring CYBERWAVE_WORKSPACE_SLUG='{requested_slug}': the API "
+                    f"token is bound to '{workspace.name}'.[/yellow]"
+                )
+        elif creds.workspace_uuid:
             workspace = _resolve_workspace_from_credentials(client, creds.workspace_uuid)
             if workspace:
                 console.print(f"[green]Using workspace from credentials:[/green] {workspace.name}")
@@ -1106,6 +1321,8 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
                     "[yellow]Stored workspace is not available for this account. "
                     "Select a workspace.[/yellow]"
                 )
+            # No token/base_url here: reaching this branch means the token has no
+            # workspace context, so re-resolving it would only repeat a failed call.
             workspace = _select_workspace(client, skip_confirm=skip_confirm)
         environment = _select_or_create_environment(
             client,
