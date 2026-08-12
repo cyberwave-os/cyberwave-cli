@@ -80,7 +80,9 @@ class Credentials:
         payload: dict[str, Any] = {
             "token": self.token,
         }
-        if self.email:
+        # `is not None`: save_credentials merges, so ``""`` is the only way a
+        # caller can clear a stale email. Omitting the key keeps the old one.
+        if self.email is not None:
             payload["email"] = self.email
         if self.created_at:
             payload["created_at"] = self.created_at

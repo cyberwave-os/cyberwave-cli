@@ -13,6 +13,12 @@ import cyberwave_cli.main as main_module
 _pair_module = importlib.import_module("cyberwave_cli.commands.pair")
 _edge_module = importlib.import_module("cyberwave_cli.commands.edge")
 
+# Bound before tests stub out `cyberwave_cli.core`; a lazy lookup would resolve
+# back to the stub and recurse.
+from cyberwave_cli.core import (  # noqa: E402
+    normalize_environment_reference as _real_normalize_environment_reference,
+)
+
 
 def test_pair_is_registered_as_top_level_lazy_command() -> None:
     assert "pair" in main_module._LAZY_COMMANDS
@@ -34,6 +40,7 @@ def test_pair_command_forwards_flags_to_setup_edge_core(monkeypatch) -> None:
         "cyberwave_cli.core",
         types.SimpleNamespace(
             setup_edge_core=lambda **kwargs: calls.append(kwargs) or True,
+            normalize_environment_reference=_real_normalize_environment_reference,
         ),
     )
 
@@ -49,6 +56,8 @@ def test_pair_command_forwards_flags_to_setup_edge_core(monkeypatch) -> None:
             "channel": "dev",
             "version": "0.3.1.dev5",
             "force_reinstall": False,
+            "environment": None,
+            "token": None,
         }
     ]
 
@@ -73,3 +82,48 @@ def test_pair_is_eagerly_reexported_from_commands_package() -> None:
 
     assert "pair" in commands_pkg.__all__
     assert getattr(commands_pkg, "pair", None) is _pair_module.pair
+
+
+def test_pair_command_forwards_environment_flag(monkeypatch) -> None:
+    """``pair`` inherits ``-e`` from ``edge install`` via ``list(install_edge.params)``."""
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cyberwave_cli.core",
+        types.SimpleNamespace(
+            setup_edge_core=lambda **kwargs: calls.append(kwargs) or True,
+            normalize_environment_reference=_real_normalize_environment_reference,
+        ),
+    )
+
+    result = CliRunner().invoke(
+        main_module.cli,
+        ["pair", "-e", "acme/envs/production-floor", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["environment"] == "acme/envs/production-floor"
+
+
+def test_pair_command_forwards_token_flag(monkeypatch) -> None:
+    """``pair`` inherits ``--token`` the same way it inherits ``-e``."""
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cyberwave_cli.core",
+        types.SimpleNamespace(
+            setup_edge_core=lambda **kwargs: calls.append(kwargs) or True,
+            normalize_environment_reference=_real_normalize_environment_reference,
+        ),
+    )
+
+    result = CliRunner().invoke(
+        main_module.cli,
+        ["pair", "--token", "cw_secret", "-e", "acme/envs/production-floor", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["token"] == "cw_secret"
+    assert calls[0]["environment"] == "acme/envs/production-floor"

@@ -479,6 +479,19 @@ def edge():
 @edge.command("install")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
 @click.option(
+    "--environment",
+    "-e",
+    type=str,
+    default=None,
+    help="Existing environment to attach to: UUID or full slug (acme/envs/production-floor)",
+)
+@click.option(
+    "--token",
+    type=str,
+    default=None,
+    help="API token to pair with, instead of stored credentials or an interactive login",
+)
+@click.option(
     "--channel",
     type=click.Choice(["stable", "dev", "staging"], case_sensitive=False),
     default="stable",
@@ -530,6 +543,8 @@ def edge():
 )
 def install_edge(
     yes,
+    environment,
+    token,
     channel,
     version,
     force_reinstall,
@@ -552,6 +567,8 @@ def install_edge(
     Examples:
         sudo cyberwave edge install
         sudo cyberwave edge install -y
+        sudo cyberwave edge install -e acme/envs/production-floor
+        sudo cyberwave edge install --token cw_XXXX -e acme/envs/production-floor -y
         sudo cyberwave edge install --force-reinstall
         sudo cyberwave edge install --reconfigure-camera
         sudo cyberwave edge install --reconfigure-microphone
@@ -559,6 +576,45 @@ def install_edge(
         sudo cyberwave edge install --channel dev
         sudo cyberwave edge install --channel staging --version 0.0.42.595
     """
+    # The --reconfigure-* flags return before any login or environment
+    # attachment happens, so neither flag below can be honoured there. Reject
+    # them rather than ignore them.
+    reconfiguring = reconfigure_camera or reconfigure_microphone or reconfigure_speaker
+
+    # Shape check up front; existence is verified in setup_edge_core.
+    if environment is not None:
+        from ...core import normalize_environment_reference
+
+        try:
+            environment = normalize_environment_reference(environment)
+        except ValueError as exc:
+            raise click.BadParameter(str(exc), param_hint="'-e' / '--environment'") from exc
+
+        if reconfiguring:
+            raise click.BadParameter(
+                "--environment does not apply to the --reconfigure-* flags, which only "
+                "re-run device selection. Drop it, or run a full install.",
+                param_hint="'-e' / '--environment'",
+            )
+
+    # `is not None`, not truthiness: `--token "$UNSET_VAR"` must fail loudly
+    # rather than fall back to stored credentials for some other workspace.
+    if token is not None:
+        token = token.strip()
+        if not token:
+            raise click.BadParameter(
+                "--token was given an empty value. Pass an API token, or omit the flag "
+                "to use stored credentials.",
+                param_hint="'--token'",
+            )
+
+        if reconfiguring:
+            raise click.BadParameter(
+                "--token does not apply to the --reconfigure-* flags, which re-run local "
+                "device selection without contacting the API. Drop it, or run a full install.",
+                param_hint="'--token'",
+            )
+
     if reconfigure_microphone:
         from ...macos import is_macos
 
@@ -671,6 +727,8 @@ def install_edge(
             channel=channel.lower(),
             version=version,
             force_reinstall=force_reinstall,
+            environment=environment,
+            token=token,
         ):
             raise SystemExit(1)
     except KeyboardInterrupt:

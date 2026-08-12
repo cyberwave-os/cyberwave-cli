@@ -453,6 +453,8 @@ Top-level alias for [`cyberwave edge install`](#cyberwave-edge-install). Shares 
 ```bash
 sudo cyberwave pair
 sudo cyberwave pair -y
+sudo cyberwave pair -e acme/envs/production-floor
+sudo cyberwave pair --token cw_XXXX -e acme/envs/production-floor -y   # scripted
 sudo cyberwave pair --channel dev
 sudo cyberwave pair --reconfigure-camera
 sudo cyberwave pair --reconfigure-microphone
@@ -465,6 +467,12 @@ Installs the `cyberwave-edge-core` package (via apt-get on Debian/Ubuntu) and cr
 **Workspace:** API tokens are bound to a single workspace, so the installer uses that workspace rather than asking you to pick one. If `CYBERWAVE_WORKSPACE_SLUG` names a different workspace, a first-time install stops and tells you to create a token for that workspace instead; a device that is already paired warns that the slug is being ignored and continues with the token's workspace. Previously either case continued against the wrong workspace and reported that no environments existed.
 
 If the workspace cannot be determined — the API is unreachable, or returns an error — the install now says so and stops rather than picking a workspace at random and creating an empty environment in it.
+
+**Environment:** pass `-e/--environment` to pin the environment up front and skip the selection prompt. Accepts an environment UUID or its full slug (`acme/envs/production-floor`) — the environment name on its own is not enough. The environment must already exist in this device's workspace — the one its API token is bound to, or the one selected at `cyberwave login`: `-e` selects, it never creates, and an unknown environment or one from another workspace stops the install before anything is installed rather than continuing against the wrong target. To attach a device to a different workspace, pass a `--token` for it or run `cyberwave login` again. Without `-e`, `-y` attaches to the most recently created environment in the workspace, which is rarely what you want when provisioning devices. `-e` pins the environment only — twin selection still prompts, and adding `-y` to skip that prompt selects the first edge-compatible twin, so a fully scripted install is currently only reliable for an environment with a single twin.
+
+**Authentication:** by default the installer reuses the credentials saved by `cyberwave login`, falls back to `CYBERWAVE_API_KEY`, and prompts for email and password if neither is available. Pass `--token` to authenticate with a specific API token instead. Unlike `CYBERWAVE_API_KEY`, which only applies when no valid credentials are stored, `--token` always wins — so re-pairing a device onto a different workspace does not silently reuse the old token. A rejected `--token` stops the install rather than prompting for a password. `--token` changes the credential, not the backend: `CYBERWAVE_BASE_URL` still selects that, and a device already paired against a dev or staging stack keeps it.
+
+Because the token appears in your shell history and in `ps` output, prefer `CYBERWAVE_API_KEY` on shared machines and `--token` in provisioning scripts that already handle secrets.
 
 **Prerequisites — Linux:** Docker is auto-installed via `apt-get` when missing (Ubuntu / Debian / Raspbian, amd64 / arm64). No manual setup required.
 
@@ -483,12 +491,16 @@ On **Linux** with multiple camera-bearing twins, the installer walks you through
 ```bash
 sudo cyberwave edge install
 sudo cyberwave edge install -y   # skip prompts
+sudo cyberwave edge install -e acme/envs/production-floor   # pin the environment
+sudo cyberwave edge install --token cw_XXXX -e acme/envs/production-floor -y   # scripted
 sudo cyberwave edge install --reconfigure-camera   # re-select camera without full reinstall
 sudo cyberwave edge install --reconfigure-microphone   # re-select microphone without full reinstall
 ```
 
 **Options:**
 
+- `-e`, `--environment`: Environment to attach this device to, as a UUID or full slug. Skips the environment prompt. Must already exist in the token's workspace.
+- `--token`: API token to authenticate with. Overrides stored credentials, `CYBERWAVE_API_KEY`, and the interactive login. Has no short form.
 - `--reconfigure-camera`: Re-run the camera selection prompt and restart the camera stream and edge-core service. Useful when switching between cameras (e.g. laptop webcam to external USB camera).
 - `--reconfigure-microphone`: Re-run the microphone selection prompt and restart the audio stream bridge and edge-core service. Useful when switching microphones or fixing a broken PCM bridge.
 - `--force-reinstall`: Force reinstall of the USB/IP server on macOS. Camera stream and edge-core setup are always forced during install.

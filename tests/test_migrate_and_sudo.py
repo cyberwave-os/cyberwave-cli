@@ -98,7 +98,7 @@ def test_setup_service_proceeds_when_root_on_linux(monkeypatch):
     monkeypatch.setattr(core, "_is_macos", lambda: False)
     monkeypatch.setattr(core.os, "geteuid", lambda: 0)
     monkeypatch.setattr(core, "_migrate_legacy_config_dir", lambda: None)
-    monkeypatch.setattr(core, "_ensure_credentials", lambda skip_confirm=False: True)
+    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm=False, token=None: True)
 
     install_calls: list[tuple] = []
     monkeypatch.setattr(

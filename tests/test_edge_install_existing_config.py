@@ -266,6 +266,136 @@ def test_configure_edge_environment_skips_prompt_with_skip_confirm(
     assert not any("already connected" in p for p in confirm_prompts)
 
 
+def _configure_with_environment(monkeypatch, tmp_path, *, environment, existing):
+    """Run ``configure_edge_environment`` with ``-e`` against a stubbed client.
+
+    Returns ``(result, saved)`` where *saved* collects the kwargs
+    ``_save_environment_file`` was called with.
+    """
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(core, "ENVIRONMENT_FILE", tmp_path / "environment.json")
+    monkeypatch.setattr(core, "FINGERPRINT_FILE", tmp_path / "fingerprint.json")
+
+    fake_creds = type("Creds", (), {
+        "token": "tok-abc",
+        "cyberwave_base_url": "https://api.test",
+        "workspace_uuid": "ws-uuid",
+    })()
+    monkeypatch.setattr(core, "load_credentials", lambda: fake_creds)
+
+    class _FakeWorkspace:
+        uuid = "ws-uuid"
+        name = "Test Workspace"
+
+    class _FakeEnvironments:
+        @staticmethod
+        def get(environment_id):
+            for env in existing:
+                if environment_id in {env.uuid, getattr(env, "slug", None)}:
+                    return env
+            raise RuntimeError("404 Environment not found")
+
+    monkeypatch.setattr(core, "_get_sdk_client", lambda *a, **kw: type("C", (), {
+        "workspaces": type("W", (), {"list": staticmethod(lambda: [_FakeWorkspace()])})(),
+        "environments": _FakeEnvironments(),
+    })())
+    monkeypatch.setattr(
+        core, "_resolve_workspace_from_credentials", lambda *a, **kw: _FakeWorkspace()
+    )
+    # With -e the interactive/most-recent path must never run.
+    monkeypatch.setattr(
+        core,
+        "_select_or_create_environment",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("--environment must skip environment selection")
+        ),
+    )
+    monkeypatch.setattr(core, "_select_connected_twins", lambda *a, **kw: [])
+    monkeypatch.setattr(
+        core, "_detach_edge_fingerprint_from_other_twins", lambda *a, **kw: (0, 0)
+    )
+    monkeypatch.setattr(core, "_load_or_generate_edge_fingerprint", lambda: "fp-test")
+
+    saved: list[dict] = []
+    monkeypatch.setattr(core, "_save_environment_file", lambda **kw: saved.append(kw))
+
+    result = core.configure_edge_environment(
+        skip_confirm=True, environment=environment
+    )
+    return result, saved
+
+
+def test_configure_edge_environment_uses_explicit_environment(monkeypatch, tmp_path):
+    """``-e`` pins the environment instead of prompting or taking the newest."""
+    import types
+
+    requested = types.SimpleNamespace(
+        uuid="11111111-2222-3333-4444-555555555555",
+        name="Production Floor",
+        slug="acme/envs/production-floor",
+        workspace_uuid="ws-uuid",
+    )
+
+    result, saved = _configure_with_environment(
+        monkeypatch,
+        tmp_path,
+        environment="acme/envs/production-floor",
+        existing=[requested],
+    )
+
+    assert result is True
+    assert len(saved) == 1
+    assert saved[0]["environment_uuid"] == requested.uuid
+    assert saved[0]["environment_name"] == "Production Floor"
+    assert saved[0]["workspace_uuid"] == "ws-uuid"
+
+
+def test_configure_edge_environment_fails_on_unknown_environment(monkeypatch, tmp_path):
+    """An unresolvable ``-e`` aborts and writes nothing."""
+    result, saved = _configure_with_environment(
+        monkeypatch,
+        tmp_path,
+        environment="99999999-8888-7777-6666-555555555555",
+        existing=[],
+    )
+
+    assert result is False
+    assert saved == []
+
+
+def test_configure_edge_environment_fails_on_bare_environment_name(monkeypatch, tmp_path):
+    result, saved = _configure_with_environment(
+        monkeypatch,
+        tmp_path,
+        environment="production-floor",
+        existing=[],
+    )
+
+    assert result is False
+    assert saved == []
+
+
+def test_configure_edge_environment_fails_on_out_of_workspace_environment(monkeypatch, tmp_path):
+    import types
+
+    elsewhere = types.SimpleNamespace(
+        uuid="11111111-2222-3333-4444-555555555555",
+        name="Someone Else's Floor",
+        workspace_uuid="ws-other",
+    )
+
+    result, saved = _configure_with_environment(
+        monkeypatch,
+        tmp_path,
+        environment=elsewhere.uuid,
+        existing=[elsewhere],
+    )
+
+    assert result is False
+    assert saved == []
+
+
 def test_cleanup_runs_with_the_workspace_corrected_from_the_token(monkeypatch, tmp_path):
     """Regression: ``_cleanup_existing_edge_configuration`` filters which edge
     registrations get deleted by ``creds.workspace_uuid``. Repairing that value

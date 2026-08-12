@@ -21,7 +21,7 @@ def test_setup_edge_core_non_linux_continues_without_service_setup(monkeypatch):
     monkeypatch.setattr(
         core,
         "_ensure_credentials",
-        lambda *, skip_confirm: calls.append(("credentials", skip_confirm)) or True,
+        lambda *, skip_confirm, token=None: calls.append(("credentials", skip_confirm)) or True,
     )
     monkeypatch.setattr(
         core,
@@ -31,7 +31,8 @@ def test_setup_edge_core_non_linux_continues_without_service_setup(monkeypatch):
     monkeypatch.setattr(
         core,
         "configure_edge_environment",
-        lambda *, skip_confirm: calls.append(("configure", skip_confirm)) or True,
+        lambda *, skip_confirm, environment=None: calls.append(("configure", skip_confirm))
+        or True,
     )
     monkeypatch.setattr(core, "_install_docker", lambda: (_ for _ in ()).throw(AssertionError()))
     monkeypatch.setattr(
@@ -64,9 +65,11 @@ def test_setup_edge_core_non_linux_returns_false_when_config_fails(monkeypatch):
 
     monkeypatch.setattr(core, "_is_linux", lambda: False)
     _mock_is_macos(monkeypatch, core, False)
-    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm, token=None: True)
     monkeypatch.setattr(core, "install_service_package", lambda spec, *, channel, version: True)
-    monkeypatch.setattr(core, "configure_edge_environment", lambda *, skip_confirm: False)
+    monkeypatch.setattr(
+        core, "configure_edge_environment", lambda *, skip_confirm, environment=None: False
+    )
 
     assert core.setup_edge_core(skip_confirm=True) is False
 
@@ -80,7 +83,7 @@ def test_setup_edge_core_macos_calls_usbip_setup(monkeypatch):
     _mock_is_macos(monkeypatch, core, True)
     monkeypatch.setattr(core, "_is_macos", lambda: True)
     monkeypatch.setattr(core, "_check_docker_macos", lambda: True)
-    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm, token=None: True)
     monkeypatch.setattr(core, "_any_twin_has_camera_sensor", lambda: True)
     monkeypatch.setattr(core, "_any_twin_has_microphone_sensor", lambda: True)
     monkeypatch.setattr(
@@ -106,7 +109,7 @@ def test_setup_edge_core_macos_calls_usbip_setup(monkeypatch):
     monkeypatch.setattr(
         core,
         "configure_edge_environment",
-        lambda *, skip_confirm: True,
+        lambda *, skip_confirm, environment=None: True,
     )
     monkeypatch.setattr(
         core,
@@ -131,7 +134,7 @@ def test_setup_edge_core_macos_continues_when_usbip_fails(monkeypatch):
     monkeypatch.setattr(core, "_is_linux", lambda: False)
     _mock_is_macos(monkeypatch, core, True)
     monkeypatch.setattr(core, "_check_docker_macos", lambda: True)
-    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm, token=None: True)
     monkeypatch.setattr(
         core,
         "install_service_package",
@@ -142,7 +145,7 @@ def test_setup_edge_core_macos_continues_when_usbip_fails(monkeypatch):
     monkeypatch.setattr(
         core,
         "configure_edge_environment",
-        lambda *, skip_confirm: True,
+        lambda *, skip_confirm, environment=None: True,
     )
     monkeypatch.setattr(core, "create_launchagent_service", lambda spec, *, config_path=None: True)
     monkeypatch.setattr(core, "load_launchagent_service", lambda spec: True)
@@ -160,7 +163,7 @@ def test_setup_edge_core_force_reinstall_passes_force_to_helpers(monkeypatch):
     monkeypatch.setattr(core, "_is_linux", lambda: False)
     _mock_is_macos(monkeypatch, core, True)
     monkeypatch.setattr(core, "_check_docker_macos", lambda: True)
-    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm, token=None: True)
     monkeypatch.setattr(core, "_any_twin_has_camera_sensor", lambda: True)
     monkeypatch.setattr(core, "_any_twin_has_microphone_sensor", lambda: True)
     monkeypatch.setattr(
@@ -186,7 +189,7 @@ def test_setup_edge_core_force_reinstall_passes_force_to_helpers(monkeypatch):
     monkeypatch.setattr(
         core,
         "configure_edge_environment",
-        lambda *, skip_confirm: True,
+        lambda *, skip_confirm, environment=None: True,
     )
     monkeypatch.setattr(core, "create_launchagent_service", lambda spec, *, config_path=None: True)
     monkeypatch.setattr(core, "load_launchagent_service", lambda spec: True)
@@ -207,7 +210,7 @@ def test_setup_edge_core_default_does_not_force(monkeypatch):
     monkeypatch.setattr(core, "_is_linux", lambda: False)
     _mock_is_macos(monkeypatch, core, True)
     monkeypatch.setattr(core, "_check_docker_macos", lambda: True)
-    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm, token=None: True)
     monkeypatch.setattr(core, "_any_twin_has_camera_sensor", lambda: True)
     monkeypatch.setattr(core, "_any_twin_has_microphone_sensor", lambda: True)
     monkeypatch.setattr(
@@ -233,7 +236,7 @@ def test_setup_edge_core_default_does_not_force(monkeypatch):
     monkeypatch.setattr(
         core,
         "configure_edge_environment",
-        lambda *, skip_confirm: True,
+        lambda *, skip_confirm, environment=None: True,
     )
     monkeypatch.setattr(core, "create_launchagent_service", lambda spec, *, config_path=None: True)
     monkeypatch.setattr(core, "load_launchagent_service", lambda spec: True)

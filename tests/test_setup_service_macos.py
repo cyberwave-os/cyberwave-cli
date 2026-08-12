@@ -29,7 +29,7 @@ def test_setup_service_aborts_on_macos_without_docker(monkeypatch):
     # macOS install path aborts when running as root; pin a non-zero euid
     # so this test never reaches the sudo guard regardless of how CI runs.
     monkeypatch.setattr(core.os, "geteuid", lambda: 501)
-    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm, token=None: True)
 
     install_called: list[bool] = []
     monkeypatch.setattr(

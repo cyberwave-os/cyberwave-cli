@@ -19,6 +19,7 @@ import sys
 import tempfile
 import textwrap
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -392,13 +393,114 @@ def _resolved_edge_log_level(runtime_overrides: dict[str, str | None]) -> str | 
     return runtime_overrides.get("CYBERWAVE_EDGE_LOG_LEVEL")
 
 
-def _ensure_credentials(*, skip_confirm: bool) -> bool:
-    """Ensure valid credentials exist in /etc/cyberwave/ before installing.
+def _resolve_base_url(
+    runtime_overrides: Mapping[str, str | None], fallback: str | None
+) -> str | None:
+    """Pick which backend to talk to, given an optional device-local *fallback*.
+
+    ``get_api_url()`` only reads ``CYBERWAVE_BASE_URL`` and otherwise returns
+    the SDK default, so a device paired against a dev or staging stack keeps
+    that URL solely in its stored credentials. ``--token`` swaps the credential,
+    not the backend: without the fallback, re-pairing such a device would probe
+    production and report a perfectly good token as rejected.
+    """
+    return (runtime_overrides.get("CYBERWAVE_BASE_URL") or fallback or "").strip() or None
+
+
+def _authenticate_with_api_token(
+    token: str, *, skip_confirm: bool, source: str, base_url: str | None = None
+) -> None:
+    """Validate an API token, resolve its workspace, and persist credentials.
+
+    Shared by ``--token`` and ``CYBERWAVE_API_KEY`` so both resolve the
+    workspace the same way — in particular preferring the workspace the token
+    is bound to over ``workspaces[0]``, and honouring the
+    ``CYBERWAVE_WORKSPACE_SLUG`` conflict check.
+
+    *base_url* is the device-local fallback backend; ``CYBERWAVE_BASE_URL``
+    still wins over it.
+
+    Raises rather than returning a bool because the two callers need different
+    policies on failure: an explicit ``--token`` aborts, while the env var
+    falls back to an interactive login.
+    """
+    resolved_base_url = _resolve_base_url(collect_runtime_env_overrides(), base_url)
+    # Re-collect with the resolved URL so the broker settings are inferred from
+    # it, the way `cyberwave configure` does. Explicit env vars still win.
+    runtime_overrides = collect_runtime_env_overrides(api_url_override=resolved_base_url)
+    sdk_client = _get_sdk_client(token, base_url=resolved_base_url)
+    with console.status(f"[dim]Checking the {source} API token...[/dim]"):
+        workspace = _select_workspace_from_env_or_default(
+            sdk_client,
+            skip_confirm=skip_confirm,
+            token=token,
+            base_url=resolved_base_url,
+        )
+
+    save_credentials(
+        Credentials(
+            token=token,
+            # Blank, not omitted: save_credentials merges, so omitting it would
+            # keep reporting the previous login's address as this device.
+            email="",
+            workspace_uuid=str(getattr(workspace, "uuid", "") or ""),
+            workspace_name=str(getattr(workspace, "name", "") or ""),
+            cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
+            cyberwave_edge_log_level=_resolved_edge_log_level(runtime_overrides),
+            cyberwave_worker_log_level=runtime_overrides.get("CYBERWAVE_WORKER_LOG_LEVEL"),
+            # The resolved value, not the raw override: it is the backend this
+            # token was just validated against.
+            cyberwave_base_url=resolved_base_url,
+            cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
+            cyberwave_mqtt_port=runtime_overrides.get("CYBERWAVE_MQTT_PORT"),
+        )
+    )
+    console.print(f"[green]✓[/green] Using the API token from {source}")
+    console.print(f"[dim]Workspace: {workspace.name}[/dim]")
+    console.print(f"[dim]Credentials saved to {CONFIG_DIR}/[/dim]\n")
+
+
+def _ensure_credentials(*, skip_confirm: bool, token: str | None = None) -> bool:
+    """Ensure valid credentials exist in ``CONFIG_DIR`` before installing.
 
     If saved credentials are found and valid, returns True immediately.
     Otherwise prompts for email/password and runs the full login flow.
+
+    An explicit *token* (``--token``) overrides all of that: stored
+    credentials, ``CYBERWAVE_API_KEY``, and the prompt.
     """
     from .auth import APIToken, AuthClient, AuthenticationError
+
+    # `--token` is an instruction, not a fallback. Checking stored credentials
+    # first would keep a device on its previous workspace whenever the old
+    # token still validates — silently ignoring the flag, which is the failure
+    # mode it exists to prevent.
+    if token is not None:
+        # The stored credentials are read for the backend URL only, never for
+        # the token: --token swaps the credential, it does not move the device
+        # to a different backend.
+        stored = load_credentials()
+        try:
+            _authenticate_with_api_token(
+                token,
+                skip_confirm=skip_confirm,
+                source="--token",
+                base_url=getattr(stored, "cyberwave_base_url", None),
+            )
+            return True
+        except WorkspaceConflictError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return False
+        except Exception as exc:
+            # Deliberately no fallback: prompting here would pair the device
+            # against whatever account is typed, which is not what --token asked
+            # for, and on an unattended install there is nobody to type it.
+            console.print(f"[red]The API token passed with --token was rejected:[/red] {exc}")
+            console.print(
+                "[dim]Nothing was installed. Check the token, or drop --token to log in "
+                "interactively.[/dim]"
+            )
+            return False
 
     creds = load_credentials()
     if creds and creds.token:
@@ -407,7 +509,10 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
             sdk_client = _get_sdk_client(creds.token, base_url=creds_base_url)
             with console.status("[dim]Checking existing credentials...[/dim]"):
                 sdk_client.workspaces.list()
-            console.print(f"[green]✓[/green] Logged in as [bold]{creds.email}[/bold]")
+            # API tokens carry no email, so a device paired with --token or
+            # CYBERWAVE_API_KEY would otherwise report "Logged in as None".
+            identity = creds.email or creds.workspace_name or "this device's API token"
+            console.print(f"[green]✓[/green] Logged in as [bold]{identity}[/bold]")
             # Backfill persisted environment overrides when running with explicit
             # env vars so systemd startups can reuse them later.
             runtime_overrides = collect_runtime_env_overrides()
@@ -438,34 +543,9 @@ def _ensure_credentials(*, skip_confirm: bool) -> bool:
     env_token = os.getenv("CYBERWAVE_API_KEY", "").strip()
     if env_token:
         try:
-            runtime_overrides = collect_runtime_env_overrides()
-            sdk_client = _get_sdk_client(
-                env_token,
-                base_url=runtime_overrides.get("CYBERWAVE_BASE_URL") or None,
+            _authenticate_with_api_token(
+                env_token, skip_confirm=skip_confirm, source="CYBERWAVE_API_KEY"
             )
-            with console.status("[dim]Checking CYBERWAVE_API_KEY...[/dim]"):
-                workspace = _select_workspace_from_env_or_default(
-                    sdk_client,
-                    skip_confirm=skip_confirm,
-                    token=env_token,
-                    base_url=runtime_overrides.get("CYBERWAVE_BASE_URL") or None,
-                )
-
-            save_credentials(
-                Credentials(
-                    token=env_token,
-                    workspace_uuid=str(getattr(workspace, "uuid", "") or ""),
-                    workspace_name=str(getattr(workspace, "name", "") or ""),
-                    cyberwave_environment=runtime_overrides.get("CYBERWAVE_ENVIRONMENT"),
-                    cyberwave_edge_log_level=_resolved_edge_log_level(runtime_overrides),
-                    cyberwave_base_url=runtime_overrides.get("CYBERWAVE_BASE_URL"),
-                    cyberwave_mqtt_host=runtime_overrides.get("CYBERWAVE_MQTT_HOST"),
-                    cyberwave_mqtt_port=runtime_overrides.get("CYBERWAVE_MQTT_PORT"),
-                )
-            )
-            console.print("[green]✓[/green] Using CYBERWAVE_API_KEY from environment")
-            console.print(f"[dim]Workspace: {workspace.name}[/dim]")
-            console.print(f"[dim]Credentials saved to {CONFIG_DIR}/[/dim]\n")
             return True
         except WorkspaceConflictError as e:
             # Not a credentials problem, so prompting for a password below would
@@ -881,6 +961,177 @@ def _create_environment_in_workspace(
     return environment
 
 
+def _looks_like_uuid(value: str) -> bool:
+    """Return ``True`` when *value* parses as a UUID."""
+    from uuid import UUID
+
+    try:
+        UUID(value)
+    except (ValueError, AttributeError):
+        return False
+    return True
+
+
+def normalize_environment_reference(reference: str) -> str:
+    """Validate an ``-e/--environment`` reference and return it stripped.
+
+    Format-only, so the CLI can reject a typo before installing anything. An
+    empty value raises rather than reading as "no ``-e`` given", which would
+    silently fall back to guessing an environment.
+    """
+    ref = reference.strip()
+    if not ref:
+        raise ValueError(
+            "--environment was given an empty value. Pass an environment UUID or full "
+            "slug, or omit the flag to select one interactively."
+        )
+
+    # The middle segment must be `envs`: the three-part shape is shared with
+    # twins and workflows, so a URL pasted from the wrong page looks valid.
+    slug_parts = ref.split("/")
+    if not _looks_like_uuid(ref) and not (
+        len(slug_parts) == 3 and all(slug_parts) and slug_parts[1] == "envs"
+    ):
+        raise ValueError(
+            f"'{ref}' is not a valid environment reference. Pass the environment UUID, or "
+            "its full slug as '<workspace>/envs/<environment>' "
+            "(for example 'acme/envs/production-floor') — the environment name on its own "
+            "is not enough."
+        )
+    return ref
+
+
+def _resolve_requested_environment(client: Any, workspace_uuid: str, reference: str) -> Any:
+    """Resolve an explicit ``-e/--environment`` reference.
+
+    Accepts a UUID or a full unified slug (``acme/envs/production-floor``).
+    Never creates: an unresolvable reference is a typo, and silently creating an
+    environment named after one is far worse than refusing to continue.
+    """
+    ref = normalize_environment_reference(reference)
+
+    try:
+        environment = client.environments.get(ref)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Environment '{ref}' could not be loaded: {exc}. Check that it exists and that "
+            "this device's API token belongs to the same workspace."
+        ) from exc
+    if environment is None:
+        raise RuntimeError(
+            f"Environment '{ref}' was not found. Check that it exists and that this device's "
+            "API token belongs to the same workspace."
+        )
+
+    # A share link can make an environment readable from outside the token's
+    # workspace; pairing into it would split the edge from its twins.
+    environment_workspace = _environment_workspace_uuid(environment)
+    if environment_workspace and environment_workspace.lower() != workspace_uuid.strip().lower():
+        raise RuntimeError(
+            f"Environment '{getattr(environment, 'name', ref)}' belongs to workspace "
+            f"{environment_workspace}, not {workspace_uuid}. Use an environment from this "
+            "device's workspace, or run 'cyberwave login' again to switch workspace."
+        )
+
+    console.print(
+        f"[green]Environment:[/green] {getattr(environment, 'name', ref)} "
+        "[dim](from --environment)[/dim]"
+    )
+    return environment
+
+
+_PREFLIGHT_ABORT_HINT = (
+    "[dim]Nothing was installed. Check that it exists and that this device's "
+    "API token belongs to the same workspace.[/dim]"
+)
+
+
+def _preflight_environment_reference(reference: str, *, token: str | None = None) -> bool:
+    """Confirm ``-e`` resolves before anything is installed.
+
+    ``configure_edge_environment`` is the real check, but it runs post-install —
+    too late to save the apt-get. The workspace is compared explicitly here:
+    public, share-linked and directly-granted environments are readable across
+    workspaces, so a successful lookup is not proof of the right one.
+
+    An explicit ``--token`` wins over stored credentials: it is the credential
+    the install will actually use, and on a never-paired device it is the only
+    one there is — which is what lets the check run on a first-ever pair.
+    Without one, the comparison falls back to the stored workspace, which is the
+    one ``configure_edge_environment`` will pick.
+
+    Only a definite answer aborts. A stale token, an unreachable backend, or a
+    stored workspace this account can no longer see say nothing about the
+    environment, and ``setup_service`` repairs them.
+    """
+    ref = normalize_environment_reference(reference)
+
+    creds = load_credentials()
+    if token:
+        probe_token = token
+        # Same backend the install itself will use: the env override, else the
+        # one this device is already paired against.
+        probe_base_url = _resolve_base_url(
+            collect_runtime_env_overrides(), getattr(creds, "cyberwave_base_url", None)
+        )
+    elif creds and creds.token:
+        probe_token = creds.token
+        probe_base_url = creds.cyberwave_base_url
+    else:
+        # No credentials yet: login happens inside setup_service, so let it proceed.
+        return True
+
+    try:
+        client = _get_sdk_client(probe_token, base_url=probe_base_url)
+        # Probe the token first, the way _ensure_credentials does. Without this a
+        # stale token reads as "bad environment" and blocks an install that would
+        # have succeeded after the login inside setup_service.
+        client.workspaces.list()
+    except Exception as exc:
+        console.print(f"[dim]Skipping the environment pre-check: {exc}[/dim]")
+        return True
+
+    try:
+        environment = client.environments.get(ref)
+    except Exception as exc:
+        console.print(f"[red]Environment '{ref}' could not be loaded:[/red] {exc}")
+        console.print(_PREFLIGHT_ABORT_HINT)
+        return False
+
+    if environment is None:
+        console.print(f"[red]Environment '{ref}' was not found.[/red]")
+        console.print(_PREFLIGHT_ABORT_HINT)
+        return False
+
+    token_workspace = _api_token_workspace(probe_token, base_url=probe_base_url)
+    if token_workspace is None and not token:
+        # A session token has no bound workspace, so configure_edge_environment
+        # uses the stored one. Only compare while it is still listed: when it is
+        # stale that check falls through to selection and may land elsewhere.
+        stored_uuid = str(getattr(creds, "workspace_uuid", "") or "").strip()
+        if stored_uuid and _resolve_workspace_from_credentials(client, stored_uuid) is not None:
+            token_workspace = _TokenWorkspace(uuid=stored_uuid, name=stored_uuid)
+
+    environment_workspace = _environment_workspace_uuid(environment)
+    if (
+        token_workspace is not None
+        and environment_workspace
+        and environment_workspace.lower() != token_workspace.uuid.strip().lower()
+    ):
+        console.print(
+            f"[red]Environment '{getattr(environment, 'name', ref)}' belongs to workspace "
+            f"{environment_workspace}, not {token_workspace.uuid}.[/red]"
+        )
+        switch_hint = "pass a token for that workspace" if token else "run 'cyberwave login' again"
+        console.print(
+            "[dim]Nothing was installed. Use an environment from this device's workspace, "
+            f"or {switch_hint} to switch workspace.[/dim]"
+        )
+        return False
+
+    return True
+
+
 def _select_or_create_environment(client: Any, workspace_uuid: str, *, skip_confirm: bool) -> Any:
     """Pick existing environment or create a new one."""
     environments = _workspace_environments(client, workspace_uuid)
@@ -1243,8 +1494,14 @@ def _cleanup_existing_edge_configuration(
     console.print("[green]Previous edge configuration cleared.[/green]")
 
 
-def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
-    """Select workspace + environment and save /etc/cyberwave/environment.json."""
+def configure_edge_environment(
+    *, skip_confirm: bool = False, environment: str | None = None
+) -> bool:
+    """Select workspace + environment and save ``environment.json`` in ``CONFIG_DIR``.
+
+    When *environment* is set (``-e/--environment``) that environment is used
+    verbatim instead of prompting or defaulting to the most recent one.
+    """
     from .auth import AuthenticationError
 
     creds = load_credentials()
@@ -1324,14 +1581,22 @@ def configure_edge_environment(*, skip_confirm: bool = False) -> bool:
             # No token/base_url here: reaching this branch means the token has no
             # workspace context, so re-resolving it would only repeat a failed call.
             workspace = _select_workspace(client, skip_confirm=skip_confirm)
-        environment = _select_or_create_environment(
-            client,
-            str(workspace.uuid),
-            skip_confirm=skip_confirm,
-        )
 
-        env_uuid = str(getattr(environment, "uuid", ""))
-        env_name = str(getattr(environment, "name", ""))
+        # `is not None`, not truthiness: an empty --environment is a mistake
+        # (unset shell variable), not a request to guess one.
+        if environment is not None:
+            selected_environment = _resolve_requested_environment(
+                client, str(workspace.uuid), environment
+            )
+        else:
+            selected_environment = _select_or_create_environment(
+                client,
+                str(workspace.uuid),
+                skip_confirm=skip_confirm,
+            )
+
+        env_uuid = str(getattr(selected_environment, "uuid", ""))
+        env_name = str(getattr(selected_environment, "name", ""))
         if not env_uuid:
             console.print("[red]Could not determine selected environment UUID.[/red]")
             return False
@@ -2745,12 +3010,16 @@ def setup_service(
     config_path: str | None = None,
     post_install_hook: Any = None,
     force_reinstall: bool = False,
+    token: str | None = None,
 ) -> bool:
     """Generic install orchestrator: install package, optionally set up Docker + systemd.
 
     When *force_reinstall* is True, platform helpers (USB/IP server, camera
     stream) are torn down and rebuilt from scratch instead of being skipped
     when already running.
+
+    *token* is an explicit API token to authenticate with, overriding stored
+    credentials and the interactive login.
 
     Returns True if everything succeeded.
     """
@@ -2782,9 +3051,6 @@ def setup_service(
             console.print(
                 "[dim]On macOS, USB devices are shared to Docker containers via USB/IP.[/dim]"
             )
-
-    if not _ensure_credentials(skip_confirm=skip_confirm):
-        return False
 
     if not skip_confirm:
         if linux_service_setup:
@@ -2833,6 +3099,11 @@ def setup_service(
         if not Confirm.ask("Continue?", default=True):
             console.print("[dim]Aborted.[/dim]")
             return False
+
+    # After the confirm, not before: `--token` overwrites a credential that may
+    # still be valid, so declining above must leave the device untouched.
+    if not _ensure_credentials(skip_confirm=skip_confirm, token=token):
+        return False
 
     # Pre-flight: on macOS we cannot auto-install Docker Desktop, so check
     # before pip-installing edge-core. Catches the common "I forgot to open
@@ -3041,11 +3312,17 @@ def setup_edge_core(
     version: str | None = None,
     force_reinstall: bool = False,
     pull_worker_image: bool = True,
+    environment: str | None = None,
+    token: str | None = None,
 ) -> bool:
     """Full setup for edge core: install the package, create the service, enable on boot.
 
     When *force_reinstall* is True, platform helpers (USB/IP, camera stream)
     are torn down and rebuilt from scratch.
+
+    *environment* pins the environment to attach to (``-e/--environment``)
+    instead of prompting for it. *token* pins the API token to pair with
+    (``--token``) instead of stored credentials or an interactive login.
 
     The *pull_worker_image* parameter is **deprecated** and ignored.
     The ML worker Docker image is now pulled asynchronously by the
@@ -3054,9 +3331,15 @@ def setup_edge_core(
 
     Returns True if everything succeeded.
     """
+    # The preflight reads credentials, and setup_service migrates too late —
+    # `cyberwave pair` also skips the `edge` group callback's migration.
+    _migrate_legacy_config_dir()
+
+    if environment is not None and not _preflight_environment_reference(environment, token=token):
+        return False
 
     def _post_install() -> bool:
-        return configure_edge_environment(skip_confirm=skip_confirm)
+        return configure_edge_environment(skip_confirm=skip_confirm, environment=environment)
 
     return setup_service(
         EDGE_CORE_SPEC,
@@ -3065,4 +3348,5 @@ def setup_edge_core(
         version=version,
         post_install_hook=_post_install,
         force_reinstall=force_reinstall,
+        token=token,
     )

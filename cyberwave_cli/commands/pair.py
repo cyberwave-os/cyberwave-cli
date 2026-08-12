@@ -23,6 +23,8 @@ service registration.
 Examples:
     sudo cyberwave pair
     sudo cyberwave pair -y
+    sudo cyberwave pair -e acme/envs/production-floor
+    sudo cyberwave pair --token cw_XXXX -e acme/envs/production-floor -y
     sudo cyberwave pair --channel dev
     sudo cyberwave pair --reconfigure-camera
     sudo cyberwave pair --reconfigure-microphone

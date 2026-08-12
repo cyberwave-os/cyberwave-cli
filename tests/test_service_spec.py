@@ -541,7 +541,7 @@ def test_setup_service_cloud_node_non_linux(monkeypatch):
     monkeypatch.setattr(
         core,
         "_ensure_credentials",
-        lambda *, skip_confirm: calls.append("creds") or True,
+        lambda *, skip_confirm, token=None: calls.append("creds") or True,
     )
     monkeypatch.setattr(
         core,
@@ -571,7 +571,7 @@ def test_setup_service_cloud_node_macos_creates_launchagent(monkeypatch):
     monkeypatch.setattr(
         core,
         "_ensure_credentials",
-        lambda *, skip_confirm: calls.append("creds") or True,
+        lambda *, skip_confirm, token=None: calls.append("creds") or True,
     )
     monkeypatch.setattr(
         core,
@@ -636,7 +636,7 @@ def test_setup_service_does_not_call_docker_when_requires_docker_false(monkeypat
 
     monkeypatch.setattr(core, "_is_linux", lambda: True)
     monkeypatch.setattr(core, "os", type("os", (), {"geteuid": staticmethod(lambda: 0)})())
-    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm, token=None: True)
     monkeypatch.setattr(core, "install_service_package", lambda spec, *, channel, version: True)
     monkeypatch.setattr(core, "_install_docker", lambda: docker_called.append(True) or True)
     monkeypatch.setattr(core, "create_systemd_service", lambda spec=None: True)
@@ -653,7 +653,7 @@ def test_setup_service_calls_post_install_hook(monkeypatch):
 
     monkeypatch.setattr(core, "_is_linux", lambda: False)
     monkeypatch.setattr(core, "_is_macos", lambda: False, raising=False)
-    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm, token=None: True)
     monkeypatch.setattr(core, "install_service_package", lambda spec, *, channel, version: True)
 
     core.setup_service(
@@ -710,7 +710,7 @@ def test_ensure_credentials_uses_env_api_key_without_prompt(monkeypatch):
     monkeypatch.setattr(
         core,
         "collect_runtime_env_overrides",
-        lambda: {"CYBERWAVE_BASE_URL": "http://localhost:8000"},
+        lambda **_kwargs: {"CYBERWAVE_BASE_URL": "http://localhost:8000"},
     )
     monkeypatch.setattr(core.console, "status", lambda *args, **kwargs: _Status())
     monkeypatch.setattr(
@@ -1149,7 +1149,7 @@ def test_setup_service_non_linux_allows_nonstable_channels(monkeypatch):
     install_calls: list[tuple[str, str | None]] = []
     monkeypatch.setattr(core, "_is_linux", lambda: False)
     monkeypatch.setattr(core, "_is_macos", lambda: False, raising=False)
-    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm, token=None: True)
     monkeypatch.setattr(
         core,
         "install_service_package",

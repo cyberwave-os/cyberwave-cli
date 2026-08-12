@@ -42,7 +42,7 @@ def test_macos_install_automates_usbip_camera_and_audio(monkeypatch):
     monkeypatch.setattr(core, "_is_linux", lambda: False)
     _mock_is_macos(monkeypatch, core, True)
     monkeypatch.setattr(core, "_check_docker_macos", lambda: True)
-    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm, token=None: True)
     monkeypatch.setattr(core, "_any_twin_has_camera_sensor", lambda: True)
     monkeypatch.setattr(core, "_any_twin_has_microphone_sensor", lambda: True)
     monkeypatch.setattr(
@@ -61,7 +61,9 @@ def test_macos_install_automates_usbip_camera_and_audio(monkeypatch):
         "setup_audio_stream_server",
         lambda **kw: calls.append("audio") or True,
     )
-    monkeypatch.setattr(core, "configure_edge_environment", lambda *, skip_confirm: True)
+    monkeypatch.setattr(
+        core, "configure_edge_environment", lambda *, skip_confirm, environment=None: True
+    )
     monkeypatch.setattr(core, "create_launchagent_service", lambda *a, **kw: True)
     monkeypatch.setattr(core, "load_launchagent_service", lambda spec: True)
     monkeypatch.setattr(core, "_list_camera_twins", lambda: [])
@@ -80,7 +82,7 @@ def test_linux_install_skips_macos_bridges_and_uses_v4l2(monkeypatch):
     monkeypatch.setattr(core, "_is_linux", lambda: True)
     _mock_is_macos(monkeypatch, core, False)
     monkeypatch.setattr(core.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm, token=None: True)
     monkeypatch.setattr(core, "_any_twin_has_camera_sensor", lambda: True)
     monkeypatch.setattr(core, "_any_twin_has_microphone_sensor", lambda: True)
     monkeypatch.setattr(
@@ -107,7 +109,9 @@ def test_linux_install_skips_macos_bridges_and_uses_v4l2(monkeypatch):
         "_detect_and_select_cameras",
         lambda: calls.append("v4l2") or None,
     )
-    monkeypatch.setattr(core, "configure_edge_environment", lambda *, skip_confirm: True)
+    monkeypatch.setattr(
+        core, "configure_edge_environment", lambda *, skip_confirm, environment=None: True
+    )
     monkeypatch.setattr(core, "create_systemd_service", lambda spec=None: True)
     monkeypatch.setattr(core, "enable_and_start_service", lambda spec=None: True)
 
@@ -122,7 +126,7 @@ def test_macos_install_skips_camera_when_no_camera_twins(monkeypatch):
     monkeypatch.setattr(core, "_is_linux", lambda: False)
     _mock_is_macos(monkeypatch, core, True)
     monkeypatch.setattr(core, "_check_docker_macos", lambda: True)
-    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm: True)
+    monkeypatch.setattr(core, "_ensure_credentials", lambda *, skip_confirm, token=None: True)
     monkeypatch.setattr(core, "_any_twin_has_camera_sensor", lambda: False)
     monkeypatch.setattr(core, "_any_twin_has_microphone_sensor", lambda: False)
     monkeypatch.setattr(
@@ -141,7 +145,9 @@ def test_macos_install_skips_camera_when_no_camera_twins(monkeypatch):
         "setup_audio_stream_server",
         lambda **kw: (_ for _ in ()).throw(AssertionError()),
     )
-    monkeypatch.setattr(core, "configure_edge_environment", lambda *, skip_confirm: True)
+    monkeypatch.setattr(
+        core, "configure_edge_environment", lambda *, skip_confirm, environment=None: True
+    )
     monkeypatch.setattr(core, "create_launchagent_service", lambda *a, **kw: True)
     monkeypatch.setattr(core, "load_launchagent_service", lambda spec: True)
 
