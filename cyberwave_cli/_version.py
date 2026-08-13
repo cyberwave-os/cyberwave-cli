@@ -5,7 +5,7 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as metadata_version
 
-STATIC_VERSION = "0.12.6"
+STATIC_VERSION = "0.12.7"
 
 try:
     from ._build_version import BUILD_VERSION
