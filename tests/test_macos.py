@@ -6,11 +6,15 @@ implementation now lives in ``cyberwave.edge.platform``.
 """
 
 import subprocess
+import sys
+import threading
+import types
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from click.testing import CliRunner
 
 from tests._core_module_loader import load_core_module
 
@@ -1396,3 +1400,519 @@ def test_warn_on_audio_stream_config_drift_flags_orphan_twins(
     assert "8102" in printed
     assert "--reconfigure-microphone" in printed
     assert "twin-served" not in printed
+
+
+def test_usbip_wrapper_enables_server_logging(monkeypatch, tmp_path):
+    """The host server calls ``env_logger::init()``, which stays silent unless
+    RUST_LOG is set. Without it ``usbip.log`` is always empty, so a crashed or
+    misbehaving server is indistinguishable from a healthy one."""
+    macos = _load_macos(monkeypatch)
+
+    wrapper = tmp_path / "usbip_wrapper.sh"
+    monkeypatch.setattr(macos, "_usbip_wrapper_path", lambda: wrapper)
+    monkeypatch.setattr(macos, "_usbip_binary_path", lambda: tmp_path / "host")
+    monkeypatch.setattr(macos, "_chown_to_real_user", lambda *a, **k: None)
+
+    assert macos._create_wrapper_script() is True
+
+    contents = wrapper.read_text()
+    assert "RUST_LOG" in contents, "wrapper must configure env_logger"
+    assert "export RUST_LOG" in contents or "RUST_LOG=" in contents
+
+
+# ---- macOS serial bridge (SO101 arms) ----------------------------------------
+
+
+def _fake_write_file(path, contents, mode=None):
+    """Stand-in for _write_file_as_real_user (no chown/sudo in tests)."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(contents)
+    if mode is not None:
+        Path(path).chmod(mode)
+
+
+def test_serial_bridge_ports_are_consecutive_from_the_base(monkeypatch):
+    """Slot order decides which arm becomes ttyACM0 in the container."""
+    macos = _load_macos(monkeypatch)
+
+    assert macos._serial_bridge_port(0) == macos.SERIAL_BRIDGE_PORT
+    assert macos._serial_bridge_port(1) == macos.SERIAL_BRIDGE_PORT + 1
+    assert macos._serial_bridge_port(2) == macos.SERIAL_BRIDGE_PORT + 2
+
+
+def test_serial_bridge_labels_are_unique_per_slot(monkeypatch):
+    macos = _load_macos(monkeypatch)
+
+    labels = {macos._serial_bridge_launchd_label(s) for s in (0, 1, 2)}
+    assert len(labels) == 3
+
+
+def test_serial_bridge_wrapper_serves_the_device_over_tcp(monkeypatch, tmp_path):
+    """socat must bridge the arm's /dev/cu.* node to a TCP listener at 1 Mbaud —
+    that is the whole point, since USB/IP cannot carry CDC data on macOS."""
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setattr(macos, "_serial_bridge_wrapper_path", lambda slot=None: tmp_path / "sb.sh")
+    monkeypatch.setattr(macos, "_serial_bridge_plist_path", lambda slot=None: tmp_path / "sb.plist")
+    monkeypatch.setattr(macos, "_serial_bridge_log_path", lambda slot=None: tmp_path / "sb.log")
+    monkeypatch.setattr(macos, "_chown_to_real_user", lambda *a, **k: None)
+    monkeypatch.setattr(macos, "_write_file_as_real_user", _fake_write_file)
+
+    assert macos._create_serial_bridge_service(0, "/dev/cu.usbmodemABC") is True
+
+    body = (tmp_path / "sb.sh").read_text()
+    # pyserial, not socat: macOS socat cannot set a non-standard baud.
+    assert "cyberwave_cli.macos" in body
+    assert "socat" not in body
+    assert "/dev/cu.usbmodemABC" in body
+    assert str(macos.SERIAL_BRIDGE_BAUD) in body
+    assert str(macos.SERIAL_BRIDGE_PORT) in body
+    # launchd KeepAlive restarts the job, but socat exits on every client
+    # disconnect; loop in-wrapper so a reconnect does not depend on launchd.
+    assert "while" in body
+
+
+def test_serial_bridge_config_matches_the_edge_core_schema(monkeypatch, tmp_path):
+    """edge-core reads bridges[].port in order; keep the contract explicit."""
+    macos = _load_macos(monkeypatch)
+    cfg = tmp_path / "serial_bridges.json"
+    monkeypatch.setattr(macos, "_serial_bridges_config_path", lambda: cfg)
+    monkeypatch.setattr(macos, "_chown_to_real_user", lambda *a, **k: None)
+    monkeypatch.setattr(macos, "_write_file_as_real_user", _fake_write_file)
+
+    macos._write_serial_bridges_config(
+        [(0, "/dev/cu.usbmodemA"), (1, "/dev/cu.usbmodemB")]
+    )
+
+    import json as _json
+
+    data = _json.loads(cfg.read_text())
+    assert [b["port"] for b in data["bridges"]] == [
+        macos.SERIAL_BRIDGE_PORT,
+        macos.SERIAL_BRIDGE_PORT + 1,
+    ]
+    assert [b["device"] for b in data["bridges"]] == [
+        "/dev/cu.usbmodemA",
+        "/dev/cu.usbmodemB",
+    ]
+    assert [b["slot"] for b in data["bridges"]] == [0, 1]
+
+
+def test_serial_device_discovery_prefers_cu_nodes(monkeypatch):
+    """/dev/tty.* blocks on open waiting for DCD; /dev/cu.* does not."""
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setattr(
+        macos.glob,
+        "glob",
+        lambda pattern: ["/dev/cu.usbmodemB", "/dev/cu.usbmodemA"]
+        if "cu." in pattern
+        else ["/dev/tty.usbmodemA"],
+    )
+    monkeypatch.setattr(
+        macos,
+        "_usb_vidpids_for_serial_callouts",
+        lambda: {
+            "/dev/cu.usbmodemA": "1a86:55d3",
+            "/dev/cu.usbmodemB": "1a86:55d3",
+        },
+        raising=False,
+    )
+
+    assert macos._discover_serial_devices() == [
+        "/dev/cu.usbmodemA",
+        "/dev/cu.usbmodemB",
+    ]
+
+
+def test_serial_bridge_discovery_filters_non_so101_usb_devices(monkeypatch):
+    """Default discovery must not reset and hold unrelated CDC devices."""
+    macos = _load_macos(monkeypatch)
+    monkeypatch.delenv("CYBERWAVE_SERIAL_DEVICE_GLOB", raising=False)
+    monkeypatch.delenv("CYBERWAVE_USBIP_SERIAL_VIDPID", raising=False)
+    monkeypatch.setattr(
+        macos.glob,
+        "glob",
+        lambda pattern: [
+            "/dev/cu.usbmodemSO101",
+            "/dev/cu.usbmodemARDUINO",
+        ],
+    )
+    monkeypatch.setattr(
+        macos,
+        "_usb_vidpids_for_serial_callouts",
+        lambda: {
+            "/dev/cu.usbmodemSO101": "1a86:55d3",
+            "/dev/cu.usbmodemARDUINO": "2341:0043",
+        },
+        raising=False,
+    )
+
+    assert macos._discover_serial_devices() == ["/dev/cu.usbmodemSO101"]
+
+
+def test_custom_serial_glob_keeps_broad_discovery_without_an_allowlist(monkeypatch):
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setenv("CYBERWAVE_SERIAL_DEVICE_GLOB", "/dev/cu.custom*")
+    monkeypatch.setattr(
+        macos.glob,
+        "glob",
+        lambda pattern: ["/dev/cu.customA", "/dev/cu.customB"],
+    )
+
+    assert macos._discover_serial_devices() == [
+        "/dev/cu.customA",
+        "/dev/cu.customB",
+    ]
+
+
+def test_usb_registry_maps_callout_nodes_to_parent_vidpid(monkeypatch):
+    import plistlib
+
+    macos = _load_macos(monkeypatch)
+    payload = plistlib.dumps(
+        [
+            {
+                "idVendor": 0x1A86,
+                "idProduct": 0x55D3,
+                "IORegistryEntryChildren": [
+                    {
+                        "IORegistryEntryChildren": [
+                            {"IOCalloutDevice": "/dev/cu.usbmodemSO101"}
+                        ]
+                    }
+                ],
+            },
+            {
+                "idVendor": 0x2341,
+                "idProduct": 0x0043,
+                "IORegistryEntryChildren": [
+                    {"IOCalloutDevice": "/dev/cu.usbmodemARDUINO"}
+                ],
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        macos,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=payload, stderr=b""
+        ),
+    )
+
+    assert macos._usb_vidpids_for_serial_callouts() == {
+        "/dev/cu.usbmodemSO101": "1a86:55d3",
+        "/dev/cu.usbmodemARDUINO": "2341:0043",
+    }
+
+
+def test_bridge_entrypoint_is_exposed_by_the_macos_module(monkeypatch):
+    """All host bridging lives in macos.py, so the launchd wrapper invokes this
+    module rather than a separate one."""
+    macos = _load_macos(monkeypatch)
+
+    assert hasattr(macos, "_serial_bridge_serve")
+    assert hasattr(macos, "main")
+
+    called = {}
+    monkeypatch.setattr(
+        macos,
+        "_serial_bridge_serve",
+        lambda device, port, baud: called.update(d=device, p=port, b=baud) or 0,
+    )
+
+    rc = macos.main(["--serial-bridge", "/dev/cu.usbmodemZ", "8100", "1000000"])
+
+    assert rc == 0
+    assert called == {"d": "/dev/cu.usbmodemZ", "p": 8100, "b": 1000000}
+
+
+def test_bridge_wrapper_invokes_the_macos_module(monkeypatch, tmp_path):
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setattr(macos, "_serial_bridge_wrapper_path", lambda slot=None: tmp_path / "sb.sh")
+    monkeypatch.setattr(macos, "_serial_bridge_plist_path", lambda slot=None: tmp_path / "sb.plist")
+    monkeypatch.setattr(macos, "_serial_bridge_log_path", lambda slot=None: tmp_path / "sb.log")
+    monkeypatch.setattr(macos, "_write_file_as_real_user", _fake_write_file)
+
+    assert macos._create_serial_bridge_service(0, "/dev/cu.usbmodemABC") is True
+
+    body = (tmp_path / "sb.sh").read_text()
+    assert "cyberwave_cli.macos" in body
+    assert "--serial-bridge" in body
+
+
+def test_bridge_wrapper_uses_hidden_cli_command_when_frozen(monkeypatch, tmp_path):
+    """A PyInstaller binary is not a Python interpreter, so ``binary -m`` is
+    parsed by Click and the launchd bridge crash-loops instead of opening the
+    serial device."""
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setattr(macos, "_serial_bridge_wrapper_path", lambda slot=None: tmp_path / "sb.sh")
+    monkeypatch.setattr(macos, "_serial_bridge_plist_path", lambda slot=None: tmp_path / "sb.plist")
+    monkeypatch.setattr(macos, "_serial_bridge_log_path", lambda slot=None: tmp_path / "sb.log")
+    monkeypatch.setattr(macos, "_write_file_as_real_user", _fake_write_file)
+    monkeypatch.setattr(macos.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(macos.sys, "executable", "/Applications/Cyberwave CLI/cyberwave")
+
+    assert macos._create_serial_bridge_service(0, "/dev/cu.usbmodemABC") is True
+
+    body = (tmp_path / "sb.sh").read_text()
+    assert '"$PYTHON" __serial_bridge "$DEVICE" "$PORT" "$BAUD"' in body
+    assert "-m cyberwave_cli.macos" not in body
+
+
+def test_hidden_cli_command_starts_serial_bridge(monkeypatch):
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setattr(sys.modules["cyberwave_cli"], "__version__", "test", raising=False)
+    import cyberwave_cli.main as cli_main
+
+    called = {}
+    monkeypatch.setattr(
+        macos,
+        "_serial_bridge_serve",
+        lambda device, port, baud: called.update(d=device, p=port, b=baud) or 0,
+    )
+
+    result = CliRunner().invoke(
+        cli_main.cli,
+        ["__serial_bridge", "/dev/cu.usbmodemZ", "8300", "1000000"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert called == {"d": "/dev/cu.usbmodemZ", "p": 8300, "b": 1000000}
+
+
+def _stub_launchd(monkeypatch, macos, tmp_path):
+    monkeypatch.setattr(macos, "_write_file_as_real_user", _fake_write_file)
+    monkeypatch.setattr(macos, "_chown_to_real_user", lambda *a, **k: None)
+    monkeypatch.setattr(macos, "_bootout_launchd_service", lambda label: None)
+    monkeypatch.setattr(macos, "wait_for_launchd_unload", lambda *a, **k: True)
+    monkeypatch.setattr(macos, "bootstrap_launchd_service", lambda *a, **k: None)
+    monkeypatch.setattr(macos, "_resolve_real_user", lambda: ("u", 501, 20))
+    monkeypatch.setattr(macos, "_is_port_listening", lambda port: False)
+    monkeypatch.setattr(macos, "_wait_for_serial_bridge_listener", lambda port: True)
+    monkeypatch.setattr(
+        macos,
+        "_serial_bridges_config_path",
+        lambda: tmp_path / "serial_bridges.json",
+    )
+    monkeypatch.setattr(
+        macos, "_serial_bridge_wrapper_path", lambda slot=None: tmp_path / f"sb.{slot}.sh"
+    )
+    monkeypatch.setattr(
+        macos, "_serial_bridge_plist_path", lambda slot=None: tmp_path / f"sb.{slot}.plist"
+    )
+    monkeypatch.setattr(
+        macos, "_serial_bridge_log_path", lambda slot=None: tmp_path / f"sb.{slot}.log"
+    )
+
+
+def test_setup_serial_bridges_is_a_noop_off_macos(monkeypatch):
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setattr(macos, "is_macos", lambda: False)
+
+    assert macos.setup_serial_bridges() is True
+
+
+def test_setup_serial_bridges_creates_one_service_per_device(monkeypatch, tmp_path):
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setattr(macos, "is_macos", lambda: True)
+    _stub_launchd(monkeypatch, macos, tmp_path)
+    monkeypatch.setattr(
+        macos,
+        "_discover_serial_devices",
+        lambda: ["/dev/cu.usbmodemA", "/dev/cu.usbmodemB"],
+    )
+
+    assert macos.setup_serial_bridges() is True
+
+    import json as _json
+
+    data = _json.loads((tmp_path / "serial_bridges.json").read_text())
+    assert [b["device"] for b in data["bridges"]] == ["/dev/cu.usbmodemA", "/dev/cu.usbmodemB"]
+    assert (tmp_path / "sb.0.sh").exists()
+    assert (tmp_path / "sb.1.sh").exists()
+
+
+def test_setup_serial_bridges_with_no_devices_writes_empty_config(monkeypatch, tmp_path):
+    """An empty config must replace a stale one, or edge-core keeps pointing
+    the driver at ports nothing serves."""
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setattr(macos, "is_macos", lambda: True)
+    _stub_launchd(monkeypatch, macos, tmp_path)
+    monkeypatch.setattr(macos, "_discover_serial_devices", lambda: [])
+
+    assert macos.setup_serial_bridges() is True
+
+    import json as _json
+
+    assert _json.loads((tmp_path / "serial_bridges.json").read_text())["bridges"] == []
+
+
+def test_setup_serial_bridges_rejects_a_service_that_never_listens(monkeypatch, tmp_path):
+    """A registered launchd job is not healthy until its TCP bridge answers."""
+    macos = _load_macos(monkeypatch)
+    monkeypatch.setattr(macos, "is_macos", lambda: True)
+    _stub_launchd(monkeypatch, macos, tmp_path)
+    monkeypatch.setattr(macos, "_discover_serial_devices", lambda: ["/dev/cu.usbmodemA"])
+    monkeypatch.setattr(macos, "_wait_for_serial_bridge_listener", lambda port: False)
+    booted_out: list[str] = []
+    monkeypatch.setattr(macos, "_bootout_launchd_service", booted_out.append)
+
+    assert macos.setup_serial_bridges() is False
+
+    import json as _json
+
+    assert _json.loads((tmp_path / "serial_bridges.json").read_text())["bridges"] == []
+    assert booted_out[-1] == macos._serial_bridge_launchd_label(0)
+
+
+def test_serial_bridge_listener_must_survive_the_first_probe(monkeypatch):
+    """The first client makes the server open the device; verify it stays alive."""
+    macos = _load_macos(monkeypatch)
+    probes = iter([True, True])
+    monkeypatch.setattr(macos, "_is_port_listening", lambda port: next(probes))
+    monkeypatch.setattr(macos.time, "sleep", lambda seconds: None)
+
+    assert macos._wait_for_serial_bridge_listener(8300, timeout=1.0) is True
+
+
+def test_serial_bridge_listener_rejects_a_crash_after_the_first_probe(monkeypatch):
+    macos = _load_macos(monkeypatch)
+    probes = iter([True, False])
+    monotonic_values = iter([0.0, 0.0, 1.0])
+    monkeypatch.setattr(macos, "_is_port_listening", lambda port: next(probes))
+    monkeypatch.setattr(macos.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(macos.time, "sleep", lambda seconds: None)
+
+    assert macos._wait_for_serial_bridge_listener(8300, timeout=1.0) is False
+
+
+def test_serial_bridge_ports_do_not_collide_with_other_bridges(monkeypatch):
+    """8100+N once overlapped AUDIO_STREAM_PORT (8101): with two arms the
+    second bridge stole the microphone's port, and whichever bound first won."""
+    macos = _load_macos(monkeypatch)
+
+    reserved = {
+        macos.CAMERA_STREAM_PORT,
+        macos.AUDIO_STREAM_PORT,
+        macos.AUDIO_PLAYBACK_PORT,
+    }
+    # Head-room for several arms and several cameras on one host.
+    serial_ports = {macos._serial_bridge_port(slot) for slot in range(8)}
+    camera_ports = {macos._camera_stream_port(slot) for slot in range(8)}
+
+    assert not serial_ports & reserved
+    assert not serial_ports & camera_ports
+
+
+def test_serial_bridge_reads_block_instead_of_spinning(monkeypatch):
+    """timeout=0 is pyserial's non-blocking mode: read() returns b'' immediately
+    whenever the arm is idle, so the pump thread spins a whole core per bridged
+    device — two saturated cores on the Mac that is driving the robot."""
+    macos = _load_macos(monkeypatch)
+
+    opened: dict = {}
+
+    class _FakeSerial:
+        def __init__(self, device, baud, timeout=None):
+            opened["timeout"] = timeout
+            raise RuntimeError("stop after capturing ctor args")
+
+    fake_serial = types.SimpleNamespace(Serial=_FakeSerial)
+    monkeypatch.setitem(sys.modules, "serial", fake_serial)
+
+    class _FakeConn:
+        def close(self):
+            pass
+
+    class _FakeSrv:
+        def setsockopt(self, *a):
+            pass
+
+        def bind(self, *a):
+            pass
+
+        def listen(self, *a):
+            pass
+
+        def accept(self):
+            return _FakeConn(), ("127.0.0.1", 1)
+
+    monkeypatch.setattr(macos.socket, "socket", lambda *a, **k: _FakeSrv())
+
+    macos._serial_bridge_serve("/dev/cu.fake", 9999, 1000000)
+
+    assert opened["timeout"], "reads must block (or poll with a timeout), not busy-wait"
+    assert opened["timeout"] > 0
+
+
+def test_bridge_does_not_listen_when_serial_preflight_fails(monkeypatch):
+    macos = _load_macos(monkeypatch)
+
+    class _FakeSerial:
+        def __init__(self, *args, **kwargs):
+            raise OSError("device busy")
+
+    fake_serial = types.SimpleNamespace(Serial=_FakeSerial)
+    monkeypatch.setitem(sys.modules, "serial", fake_serial)
+    socket_created = False
+
+    def _socket(*args, **kwargs):
+        nonlocal socket_created
+        socket_created = True
+        raise AssertionError("listener must not be created")
+
+    monkeypatch.setattr(macos.socket, "socket", _socket)
+
+    assert macos._serial_bridge_serve("/dev/cu.fake", 9999, 1000000) == 1
+    assert socket_created is False
+
+
+def test_pump_forwards_short_replies_without_waiting_for_the_timeout(monkeypatch):
+    """pyserial's read(n) blocks until n bytes OR the timeout — it does not
+    return early on a short reply. Feetech replies are 6-30 bytes, so reading a
+    512-byte chunk stalls every packet for the full read timeout, which also
+    sits exactly on the packet_timeout floor _patch_port_handler sets."""
+    import time as _time
+
+    macos = _load_macos(monkeypatch)
+    payload = b"\xff\xff\x01\x02\x01\xfb\x00\x00"
+
+    class _FakeSerial:
+        timeout = 0.05
+
+        def __init__(self, data):
+            self._buf = bytearray(data)
+
+        @property
+        def in_waiting(self):
+            return len(self._buf)
+
+        def read(self, n):
+            if not self._buf:
+                _time.sleep(self.timeout)
+                return b""
+            if n <= len(self._buf):
+                out = bytes(self._buf[:n])
+                del self._buf[:n]
+                return out
+            # Asked for more than is buffered: pyserial waits out the timeout.
+            _time.sleep(self.timeout)
+            out = bytes(self._buf)
+            self._buf.clear()
+            return out
+
+    sent: list[bytes] = []
+    stop = threading.Event()
+
+    class _FakeConn:
+        def sendall(self, data):
+            sent.append(data)
+            stop.set()
+
+    start = _time.perf_counter()
+    macos._serial_bridge_pump(_FakeSerial(payload), _FakeConn(), stop)
+    elapsed = _time.perf_counter() - start
+
+    assert b"".join(sent) == payload
+    assert elapsed < _FakeSerial.timeout / 2, (
+        f"reply took {elapsed * 1000:.1f}ms; must not wait out the read timeout"
+    )

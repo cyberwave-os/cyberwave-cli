@@ -799,7 +799,11 @@ def uninstall_edge(yes, channel):
 
     if _is_macos():
         from ...config import clean_subprocess_env
-        from ...macos import _teardown_audio_stream_server, _teardown_camera_stream_server
+        from ...macos import (
+            _teardown_audio_stream_server,
+            _teardown_camera_stream_server,
+            _teardown_serial_bridges,
+        )
 
         _domain, target = _macos_launchagent_target()
         plist_path = _macos_launchagent_plist_path()
@@ -835,6 +839,16 @@ def uninstall_edge(yes, channel):
         except Exception as exc:
             console.print(
                 f"[yellow]Audio stream teardown encountered an error: {exc}[/yellow]"
+            )
+
+        # Serial bridge agents carry RunAtLoad + KeepAlive, so without this they
+        # survive uninstall and reboot, holding their TCP ports and re-opening
+        # the device on every connection.
+        try:
+            _teardown_serial_bridges()
+        except Exception as exc:
+            console.print(
+                f"[yellow]Serial bridge teardown encountered an error: {exc}[/yellow]"
             )
 
         if plist_path.exists():

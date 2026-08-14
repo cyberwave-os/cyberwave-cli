@@ -28,6 +28,9 @@ dependencies = [
     "packaging==26.2",
     "rich==15.0.0",
     "cyberwave>=0.6.4",
+    # macOS serial bridge: pyserial reaches the arms' 1 Mbaud via IOSSIOSPEED,
+    # which socat cannot set on Darwin.
+    "pyserial>=3.5",
 ]
 
 [project.optional-dependencies]

@@ -165,6 +165,17 @@ def selfcheck_sdk() -> None:
     raise click.exceptions.Exit(run_sdk_selfcheck())
 
 
+@cli.command(name="__serial_bridge", hidden=True)
+@click.argument("device")
+@click.argument("port", type=int)
+@click.argument("baud", type=int)
+def serial_bridge(device: str, port: int, baud: int) -> None:
+    """Run the internal macOS serial bridge from a packaged CLI."""
+    from .macos import _serial_bridge_serve
+
+    raise click.exceptions.Exit(_serial_bridge_serve(device, port, baud))
+
+
 def _announce_cli_identity() -> None:
     """Tell the SDK which tool is calling, for backend request attribution.
 

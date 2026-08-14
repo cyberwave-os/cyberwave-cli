@@ -14,14 +14,19 @@ the systemd-based experience on Linux.
 
 from __future__ import annotations
 
+import glob
+import json
 import logging
 import os
 import platform
+import plistlib
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -756,8 +761,12 @@ def _create_wrapper_script() -> bool:
     """
     wrapper_path = _usbip_wrapper_path()
     binary_path = _usbip_binary_path()
+    # The server calls env_logger::init(), which stays silent unless RUST_LOG
+    # is set. Without this the log is always empty, so a server that is
+    # dropping device imports looks identical to a healthy one.
     wrapper_contents = textwrap.dedent(f"""\
         #!/bin/bash
+        export RUST_LOG="${{RUST_LOG:-info}}"
         exec "{binary_path}"
     """)
     try:
@@ -935,6 +944,84 @@ def setup_usbip_server(*, force: bool = False, skip_confirm: bool = False) -> bo
 # ffmpeg-based MJPEG server captures from macOS AVFoundation and serves
 # an HTTP MJPEG stream that Docker containers consume via cv2.VideoCapture(url).
 
+SERIAL_BRIDGE_LAUNCHD_LABEL = "com.cyberwave.serial-bridge"
+# Base TCP port; slot N serves SERIAL_BRIDGE_PORT + N. Kept clear of the camera
+# (8091+N), microphone (8101) and speaker (8201) bridges: an earlier 8100 base
+# put the second arm on the microphone's port, and whichever service bound
+# first silently won.
+SERIAL_BRIDGE_PORT = 8300
+SERIAL_BRIDGE_LAUNCHD_LABEL_PREFIX = f"{SERIAL_BRIDGE_LAUNCHD_LABEL}."
+# Records device -> port so edge-core can tell the driver container which
+# endpoints to turn back into PTYs.
+SERIAL_BRIDGES_FILENAME = "serial_bridges.json"
+# Default line rate for bridged devices. 1 Mbaud suits the servo buses we ship
+# with; override per install with CYBERWAVE_SERIAL_BRIDGE_BAUD.
+SERIAL_BRIDGE_BAUD = 1000000
+# Blocking read timeout for the pump thread. Keeps the thread asleep while the
+# device is idle instead of spinning, and bounds shutdown latency.
+SERIAL_BRIDGE_READ_TIMEOUT_S = 0.05
+# Socket read size for the host -> device direction.
+SERIAL_BRIDGE_CHUNK_BYTES = 512
+# How long installation waits for each launchd bridge to bind its TCP port.
+SERIAL_BRIDGE_STARTUP_WAIT_S = 10.0
+SO101_SERIAL_BRIDGE_VIDPID = "1a86:55d3"
+
+# The bridge process exits when the arm is unplugged, so loop rather than
+# relying on launchd's KeepAlive: a reconnect should take about a second, not
+# wait out launchd's throttle. Mirrors the camera stream wrapper's ffmpeg loop.
+#
+# socat is deliberately not used on this side: the arms run at 1 Mbaud and
+# macOS socat cannot apply a non-standard baud (tcsetattr: Invalid argument).
+# pyserial goes through the IOSSIOSPEED ioctl, which does.
+_SERIAL_BRIDGE_WRAPPER_TEMPLATE = textwrap.dedent("""\
+    #!/bin/bash
+    # Cyberwave serial bridge — publishes a USB serial device over TCP.
+    #
+    # macOS keeps AppleUSBACM attached to CDC devices and Darwin has no
+    # libusb_detach_kernel_driver, so USB/IP enumerates the device but its bulk
+    # endpoints stay inert. Bridging the working /dev/cu.* node over TCP is what
+    # actually reaches the hardware from inside a Linux container.
+    DEVICE="${{CYBERWAVE_SERIAL_BRIDGE_DEVICE:-{device}}}"
+    PORT="${{CYBERWAVE_SERIAL_BRIDGE_PORT:-{port}}}"
+    BAUD="${{CYBERWAVE_SERIAL_BRIDGE_BAUD:-{baud}}}"
+    PYTHON="{python}"
+
+    while true; do
+        if [ ! -e "$DEVICE" ]; then
+            echo "[serial-bridge] waiting for $DEVICE"
+            sleep 5
+            continue
+        fi
+        "$PYTHON" {bridge_entrypoint} "$DEVICE" "$PORT" "$BAUD"
+        echo "[serial-bridge] bridge exited; restarting"
+        sleep 1
+    done
+""")
+
+_SERIAL_BRIDGE_PLIST_TEMPLATE = textwrap.dedent("""\
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+      "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>{label}</string>
+        <key>ProgramArguments</key>
+        <array>
+            <string>{wrapper_path}</string>
+        </array>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>KeepAlive</key>
+        <true/>
+        <key>StandardOutPath</key>
+        <string>{log_path}</string>
+        <key>StandardErrorPath</key>
+        <string>{log_path}</string>
+    </dict>
+    </plist>
+""")
+
 CAMERA_STREAM_LAUNCHD_LABEL = "com.cyberwave.camera-stream"
 CAMERA_STREAM_PORT = 8091
 # Prefix used for per-camera launchd labels when more than one physical
@@ -1041,6 +1128,457 @@ _CAMERA_STREAM_PLIST_TEMPLATE = textwrap.dedent("""\
     </dict>
     </plist>
 """)
+
+
+def _serial_bridge_launchd_label(slot: Optional[int] = None) -> str:
+    if slot is None or slot == 0:
+        return SERIAL_BRIDGE_LAUNCHD_LABEL
+    return f"{SERIAL_BRIDGE_LAUNCHD_LABEL_PREFIX}{slot}"
+
+
+def _serial_bridge_wrapper_path(slot: Optional[int] = None) -> Path:
+    if slot is None or slot == 0:
+        return _user_home() / ".cyberwave" / "serial_bridge.sh"
+    return _user_home() / ".cyberwave" / f"serial_bridge.{slot}.sh"
+
+
+def _serial_bridge_plist_path(slot: Optional[int] = None) -> Path:
+    label = _serial_bridge_launchd_label(slot)
+    return _user_home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+
+def _serial_bridge_log_path(slot: Optional[int] = None) -> Path:
+    if slot is None or slot == 0:
+        return _user_home() / ".cyberwave" / "serial_bridge.log"
+    return _user_home() / ".cyberwave" / f"serial_bridge.{slot}.log"
+
+
+def _serial_bridge_port(slot: Optional[int] = None) -> int:
+    return SERIAL_BRIDGE_PORT + (slot or 0)
+
+
+def _serial_bridges_config_path() -> Path:
+    return _user_home() / ".cyberwave" / SERIAL_BRIDGES_FILENAME
+
+
+def _format_ioreg_usb_id(value: Any) -> Optional[str]:
+    if isinstance(value, int) and 0 <= value <= 0xFFFF:
+        return f"{value:04x}"
+    if isinstance(value, str):
+        candidate = value.strip().lower()
+        try:
+            parsed = int(candidate, 16)
+        except ValueError:
+            return None
+        if 0 <= parsed <= 0xFFFF:
+            return f"{parsed:04x}"
+    return None
+
+
+def _usb_vidpids_for_serial_callouts() -> dict[str, str]:
+    """Map macOS serial callout paths to their USB parent's VID:PID."""
+    try:
+        proc = _run(
+            ["ioreg", "-r", "-c", "IOUSBHostDevice", "-l", "-w", "0", "-a"],
+            check=False,
+            capture_output=True,
+        )
+    except OSError as exc:
+        logger.warning("Could not inspect macOS USB registry: %s", exc)
+        return {}
+    if proc.returncode != 0:
+        logger.warning("Could not inspect macOS USB registry (exit %s)", proc.returncode)
+        return {}
+
+    raw = proc.stdout
+    if isinstance(raw, str):
+        raw = raw.encode()
+    try:
+        roots = plistlib.loads(raw or b"")
+    except (plistlib.InvalidFileException, ValueError, TypeError) as exc:
+        logger.warning("Could not parse macOS USB registry: %s", exc)
+        return {}
+
+    callouts: dict[str, str] = {}
+
+    def visit(node: Any, parent_vid: Optional[str], parent_pid: Optional[str]) -> None:
+        if not isinstance(node, dict):
+            return
+        vid = _format_ioreg_usb_id(node.get("idVendor")) or parent_vid
+        pid = _format_ioreg_usb_id(node.get("idProduct")) or parent_pid
+        callout = node.get("IOCalloutDevice")
+        if isinstance(callout, str) and callout.startswith("/dev/cu.") and vid and pid:
+            callouts[callout] = f"{vid}:{pid}"
+        children = node.get("IORegistryEntryChildren") or []
+        if isinstance(children, list):
+            for child in children:
+                visit(child, vid, pid)
+
+    if isinstance(roots, list):
+        for root in roots:
+            visit(root, None, None)
+    return callouts
+
+
+def _resolve_serial_bridge_vidpid_allowlist() -> Optional[set[str]]:
+    """Return allowed USB VID:PIDs, or ``None`` when filtering is disabled."""
+    if "CYBERWAVE_SERIAL_DEVICE_GLOB" in os.environ:
+        return None
+    configured = os.environ.get(
+        "CYBERWAVE_USBIP_SERIAL_VIDPID", SO101_SERIAL_BRIDGE_VIDPID
+    )
+    if not configured.strip():
+        return None
+
+    allowed: set[str] = set()
+    for item in configured.split(","):
+        candidate = item.strip().lower()
+        if re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", candidate):
+            allowed.add(candidate)
+        elif candidate:
+            logger.warning("Ignoring invalid serial bridge VID:PID %r", item.strip())
+    return allowed
+
+
+def _discover_serial_devices() -> list[str]:
+    """Return USB serial callout nodes, sorted for a stable slot assignment.
+
+    ``/dev/cu.*`` rather than ``/dev/tty.*``: opening a ``tty.`` node blocks
+    waiting for carrier detect, which a USB serial adapter never asserts.
+    Override the glob with ``CYBERWAVE_SERIAL_DEVICE_GLOB`` for adapters that
+    enumerate under a different prefix (e.g. ``/dev/cu.usbserial*``).
+    """
+    pattern = os.environ.get("CYBERWAVE_SERIAL_DEVICE_GLOB", "/dev/cu.usbmodem*")
+    devices = sorted(glob.glob(pattern))
+    allowed_vidpids = _resolve_serial_bridge_vidpid_allowlist()
+    if allowed_vidpids is None:
+        return devices
+    callout_vidpids = _usb_vidpids_for_serial_callouts()
+    return [device for device in devices if callout_vidpids.get(device) in allowed_vidpids]
+
+
+def _write_serial_bridges_config(entries: list[tuple[int, str]]) -> bool:
+    """Persist the slot/device/port mapping edge-core reads.
+
+    Order matters downstream: entry N becomes ``/dev/ttyACM<N>`` in the driver
+    container, and voltage autodiscovery then assigns leader/follower roles.
+    """
+    payload = {
+        "bridges": [
+            {"slot": slot, "device": device, "port": _serial_bridge_port(slot)}
+            for slot, device in entries
+        ]
+    }
+    path = _serial_bridges_config_path()
+    try:
+        _write_file_as_real_user(path, json.dumps(payload, indent=2) + "\n")
+    except OSError as exc:
+        _get_console().print(f"[red]Failed to write {path}: {exc}[/red]")
+        return False
+    return True
+
+
+def _create_serial_bridge_service(slot: int, device: str) -> bool:
+    """Create the bridge wrapper + launchd plist that publishes *device*."""
+    console = _get_console()
+    wrapper_path = _serial_bridge_wrapper_path(slot)
+    plist_path = _serial_bridge_plist_path(slot)
+    log_path = _serial_bridge_log_path(slot)
+
+    wrapper_contents = _SERIAL_BRIDGE_WRAPPER_TEMPLATE.format(
+        device=device,
+        port=_serial_bridge_port(slot),
+        baud=SERIAL_BRIDGE_BAUD,
+        # Pin the installed executable because launchd's PATH would not find
+        # the CLI venv or standalone binary otherwise.
+        python=sys.executable,
+        # A PyInstaller executable is the Click CLI, not a Python interpreter;
+        # ``binary -m cyberwave_cli.macos`` would be rejected as an unknown
+        # option. The hidden command keeps the bridge available in both forms.
+        bridge_entrypoint=(
+            "__serial_bridge"
+            if getattr(sys, "frozen", False)
+            else "-m cyberwave_cli.macos --serial-bridge"
+        ),
+    )
+    try:
+        _write_file_as_real_user(wrapper_path, wrapper_contents, mode=0o755)
+    except OSError as exc:
+        console.print(f"[red]Failed to create serial bridge script: {exc}[/red]")
+        return False
+
+    plist_contents = _SERIAL_BRIDGE_PLIST_TEMPLATE.format(
+        label=_serial_bridge_launchd_label(slot),
+        wrapper_path=str(wrapper_path),
+        log_path=str(log_path),
+    )
+    try:
+        _write_file_as_real_user(plist_path, plist_contents)
+    except OSError as exc:
+        console.print(f"[red]Failed to write serial bridge plist: {exc}[/red]")
+        return False
+
+    return True
+
+
+def _serial_bridge_pump(ser: Any, conn: Any, stop: threading.Event) -> None:
+    """Forward device -> socket, one reply at a time, with no added latency.
+
+    ``read(n)`` blocks until *n* bytes arrive or the timeout expires; it does
+    not return early on a short reply. Servo replies are a handful of bytes, so
+    reading a large chunk would stall every packet for the whole timeout. Block
+    on a single byte instead — which also keeps the thread asleep while the bus
+    is idle — then drain whatever else already arrived.
+    """
+    while not stop.is_set():
+        try:
+            first = ser.read(1)
+            if first and ser.in_waiting:
+                first += ser.read(ser.in_waiting)
+        except Exception:
+            stop.set()
+            return
+        if first:
+            try:
+                conn.sendall(first)
+            except OSError:
+                stop.set()
+                return
+
+
+def _serial_bridge_serve(device: str, port: int, baud: int = SERIAL_BRIDGE_BAUD) -> int:
+    """Serve *device* on *port* until interrupted, one client at a time.
+
+    Run by the launchd wrapper, not interactively. pyserial rather than socat:
+    macOS socat cannot apply a non-standard baud (``tcsetattr: Invalid
+    argument``) whereas pyserial goes through the ``IOSSIOSPEED`` ioctl.
+    """
+    import serial
+
+    # Do not advertise a TCP listener until the physical device has been
+    # opened successfully at least once. This lets the installer distinguish
+    # a healthy bridge from a launchd job that immediately crash-loops because
+    # the serial node is busy, inaccessible, or unusable at this baud.
+    try:
+        preflight_serial = serial.Serial(
+            device,
+            baud,
+            timeout=SERIAL_BRIDGE_READ_TIMEOUT_S,
+        )
+        preflight_serial.close()
+    except Exception as exc:
+        print(f"[serial-bridge] cannot open {device}: {exc}", flush=True)
+        return 1
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", port))
+    srv.listen(1)
+    print(f"[serial-bridge] serving {device} on tcp/{port} at {baud} baud", flush=True)
+
+    while True:
+        conn, addr = srv.accept()
+        print(f"[serial-bridge] client {addr[0]}:{addr[1]}", flush=True)
+        # Opened per connection so a replugged device is picked up on reconnect
+        # instead of pinning a stale descriptor for the process lifetime.
+        try:
+            # A short blocking read, not timeout=0. Non-blocking reads return
+            # b'' the instant the device is idle, so the pump thread would spin
+            # a full core per bridged device on the machine driving the robot.
+            # The timeout still bounds shutdown latency when `stop` is set.
+            ser = serial.Serial(device, baud, timeout=SERIAL_BRIDGE_READ_TIMEOUT_S)
+        except Exception as exc:
+            print(f"[serial-bridge] cannot open {device}: {exc}", flush=True)
+            conn.close()
+            return 1
+
+        stop = threading.Event()
+        reader = threading.Thread(
+            target=_serial_bridge_pump, args=(ser, conn, stop), daemon=True
+        )
+        reader.start()
+        try:
+            while not stop.is_set():
+                try:
+                    data = conn.recv(SERIAL_BRIDGE_CHUNK_BYTES)
+                except OSError:
+                    break
+                if not data:
+                    break
+                ser.write(data)
+        finally:
+            stop.set()
+            reader.join(timeout=1.0)
+            try:
+                conn.close()
+            finally:
+                ser.close()
+            print("[serial-bridge] client gone", flush=True)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """``python -m cyberwave_cli.macos --serial-bridge <device> <port> [baud]``."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if len(args) >= 3 and args[0] == "--serial-bridge":
+        baud = int(args[3]) if len(args) > 3 else SERIAL_BRIDGE_BAUD
+        try:
+            return _serial_bridge_serve(args[1], int(args[2]), baud) or 0
+        except KeyboardInterrupt:
+            return 0
+    print(
+        "usage: python -m cyberwave_cli.macos --serial-bridge <device> <port> [baud]",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _installed_serial_bridge_slots() -> list[int]:
+    """Slots whose plist exists on disk, so teardown covers every service."""
+    slots: list[int] = []
+    agents = _user_home() / "Library" / "LaunchAgents"
+    if _serial_bridge_plist_path(0).exists():
+        slots.append(0)
+    if agents.is_dir():
+        for entry in agents.iterdir():
+            name = entry.name
+            if not name.startswith(SERIAL_BRIDGE_LAUNCHD_LABEL_PREFIX):
+                continue
+            if not name.endswith(".plist"):
+                continue
+            suffix = name[len(SERIAL_BRIDGE_LAUNCHD_LABEL_PREFIX) : -len(".plist")]
+            try:
+                slots.append(int(suffix))
+            except ValueError:
+                continue
+    return sorted(set(slots))
+
+
+def _teardown_serial_bridges() -> None:
+    """Stop every serial bridge service and remove its artifacts."""
+    for slot in _installed_serial_bridge_slots():
+        _bootout_launchd_service(_serial_bridge_launchd_label(slot))
+        for path in (
+            _serial_bridge_plist_path(slot),
+            _serial_bridge_wrapper_path(slot),
+            _serial_bridge_log_path(slot),
+        ):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+
+
+def _wait_for_serial_bridge_listener(
+    port: int, *, timeout: float = SERIAL_BRIDGE_STARTUP_WAIT_S
+) -> bool:
+    """Wait until the serial bridge owns *port* and survives a probe client."""
+    deadline = time.monotonic() + timeout
+    consecutive_successes = 0
+    while True:
+        if _is_port_listening(port):
+            # The first TCP probe makes the bridge open the physical serial
+            # device. Require a second successful probe after that connection
+            # closes so an open-device failure cannot masquerade as readiness.
+            consecutive_successes += 1
+            if consecutive_successes >= 2:
+                return True
+        else:
+            consecutive_successes = 0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.25, remaining))
+
+
+def setup_serial_bridges(*, force: bool = False) -> bool:
+    """Publish each host USB serial device over TCP for driver containers.
+
+    macOS keeps its own CDC driver attached to these devices, so USB/IP can
+    enumerate them but never carries their bulk data. One launchd service per
+    device exposes it on a TCP port, and the mapping is persisted to
+    ``~/.cyberwave/serial_bridges.json`` for edge-core.
+
+    Returns True on success, and immediately on non-macOS.
+    """
+    if not is_macos():
+        return True
+
+    console = _get_console()
+
+    # Always start clean: slot order determines which device a container sees
+    # as ttyACM0, so a stale service from a previous layout would misassign it.
+    if force or _installed_serial_bridge_slots():
+        _teardown_serial_bridges()
+
+    devices = _discover_serial_devices()
+    entries = list(enumerate(devices))
+
+    # Clear stale mappings before launch. Only bridges that prove they are
+    # listening are written back below, so edge-core never trusts a plist that
+    # launchd registered while its process crash-loops.
+    if not _write_serial_bridges_config([]):
+        return False
+
+    if not devices:
+        console.print("[dim]No USB serial devices found; no serial bridges created.[/dim]")
+        return True
+
+    _, real_uid, _ = _resolve_real_user()
+    gui_domain = f"gui/{real_uid}" if real_uid is not None else None
+
+    ok = True
+    live_entries: list[tuple[int, str]] = []
+    for slot, device in entries:
+        label = _serial_bridge_launchd_label(slot)
+        port = _serial_bridge_port(slot)
+        wait_for_launchd_unload(label)
+
+        # A listener left after our job was unloaded belongs to another
+        # process. Treat that as a collision instead of accepting its open port
+        # as proof that the Cyberwave bridge started.
+        if _is_port_listening(port):
+            console.print(
+                f"[red]Cannot start serial bridge {label}: tcp/{port} is already in use.[/red]"
+            )
+            ok = False
+            continue
+
+        if not _create_serial_bridge_service(slot, device):
+            ok = False
+            continue
+        plist_path = _serial_bridge_plist_path(slot)
+        try:
+            if gui_domain:
+                bootstrap_launchd_service(gui_domain, plist_path)
+            else:
+                _run(_launchctl_as_user(["load", str(plist_path)]))
+        except subprocess.CalledProcessError as exc:
+            console.print(
+                f"[red]Failed to load serial bridge service {label} (exit {exc.returncode}).[/red]"
+            )
+            ok = False
+            continue
+
+        if not _wait_for_serial_bridge_listener(port):
+            console.print(
+                f"[red]Serial bridge {label} loaded but tcp/{port} is not listening "
+                f"after {SERIAL_BRIDGE_STARTUP_WAIT_S:g}s. Check logs at "
+                f"{_serial_bridge_log_path(slot)}[/red]"
+            )
+            _bootout_launchd_service(label)
+            ok = False
+            continue
+
+        live_entries.append((slot, device))
+        console.print(
+            f"[green]Serial bridge:[/green] {device} -> tcp/{port} ({label})"
+        )
+
+    if not _write_serial_bridges_config(live_entries):
+        return False
+    return ok
 
 
 def _camera_stream_wrapper_path(slot: Optional[int] = None) -> Path:
@@ -3808,3 +4346,7 @@ def setup_edge_core_launchd_service(*, force: bool = False) -> bool:
         )
 
     return True
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

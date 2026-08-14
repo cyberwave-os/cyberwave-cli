@@ -49,6 +49,7 @@ from .macos import (
     setup_audio_playback_server,
     setup_audio_stream_server,
     setup_camera_stream_server,
+    setup_serial_bridges,
     setup_usbip_server,
     wait_for_launchd_unload,
 )
@@ -3131,6 +3132,16 @@ def setup_service(
             console.print(
                 "[yellow]USB/IP setup failed. USB devices will not be "
                 "available inside Docker containers.[/yellow]\n"
+                "[dim]You can retry later: cyberwave edge install[/dim]"
+            )
+
+        # USB/IP enumerates serial devices inside the VM but macOS keeps its own
+        # CDC driver attached, so their bulk endpoints never carry data. Publish
+        # each one over TCP as well; drivers prefer the bridge when present.
+        if not setup_serial_bridges(force=force_reinstall):
+            console.print(
+                "[yellow]Serial bridge setup failed. USB serial devices will "
+                "not be reachable from Docker containers.[/yellow]\n"
                 "[dim]You can retry later: cyberwave edge install[/dim]"
             )
 
