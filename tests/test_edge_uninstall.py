@@ -158,6 +158,8 @@ def test_uninstall_edge_stops_driver_and_worker_containers(monkeypatch, tmp_path
     fake_core.SYSTEMD_UNIT_PATH = unit_path
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
+    fake_core._repair_workspace_from_token = lambda creds, *, base_url=None: (creds, None, False)
+    fake_core._release_twins_for_fingerprint = lambda **_kwargs: (0, 0)
     fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
     fake_core.require_root = lambda hint: None
 
@@ -243,6 +245,8 @@ def test_uninstall_edge_exits_when_not_root(monkeypatch, tmp_path):
     fake_core.SYSTEMD_UNIT_PATH = unit_path
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
+    fake_core._repair_workspace_from_token = lambda creds, *, base_url=None: (creds, None, False)
+    fake_core._release_twins_for_fingerprint = lambda **_kwargs: (0, 0)
     fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
 
     def _require_root_exits(hint):
@@ -298,6 +302,8 @@ def test_uninstall_edge_exits_before_confirmation_when_not_root(monkeypatch, tmp
     fake_core.SYSTEMD_UNIT_PATH = tmp_path / "nonexistent.service"
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
+    fake_core._repair_workspace_from_token = lambda creds, *, base_url=None: (creds, None, False)
+    fake_core._release_twins_for_fingerprint = lambda **_kwargs: (0, 0)
     fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
 
     def _require_root_exits(hint):
@@ -366,6 +372,8 @@ def test_uninstall_edge_removes_detected_channel_package(monkeypatch, tmp_path):
     fake_core.SYSTEMD_UNIT_PATH = unit_path
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
+    fake_core._repair_workspace_from_token = lambda creds, *, base_url=None: (creds, None, False)
+    fake_core._release_twins_for_fingerprint = lambda **_kwargs: (0, 0)
     fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core-dev"
     fake_core.require_root = lambda hint: None
 
@@ -427,6 +435,8 @@ def test_uninstall_edge_macos_removes_launchagent_and_uninstalls_package(monkeyp
     fake_core._launchagent_plist_path = lambda spec: plist_path
     fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
+    fake_core._repair_workspace_from_token = lambda creds, *, base_url=None: (creds, None, False)
+    fake_core._release_twins_for_fingerprint = lambda **_kwargs: (0, 0)
 
     fake_credentials = ModuleType("cyberwave_cli.credentials")
     fake_credentials.load_credentials = lambda: None
@@ -493,6 +503,8 @@ def _make_linux_uninstall_fixtures(monkeypatch, tmp_path):
     fake_core.SYSTEMD_UNIT_PATH = unit_path
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
+    fake_core._repair_workspace_from_token = lambda creds, *, base_url=None: (creds, None, False)
+    fake_core._release_twins_for_fingerprint = lambda **_kwargs: (0, 0)
     fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
     fake_core.require_root = lambda hint: None
 
@@ -620,3 +632,111 @@ def test_delete_registered_edges_for_fingerprint_deletes_only_matching_workspace
 
     assert (deleted_count, failed_count) == (1, 0)
     assert deleted_edge_ids == ["edge-1"]
+
+
+def _uninstall_ordering_fixtures(monkeypatch, tmp_path, *, creds):
+    """Linux uninstall mocks that record the order of backend cleanup calls."""
+    config_dir = tmp_path / "cyberwave-config"
+    config_dir.mkdir()
+    unit_path = tmp_path / "cyberwave-edge-core.service"
+    unit_path.write_text("[Unit]\nDescription=Test\n", encoding="utf-8")
+
+    events: list[tuple[str, str | None]] = []
+
+    fake_config = ModuleType("cyberwave_cli.config")
+    fake_config.CONFIG_DIR = config_dir
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.PACKAGE_NAME = "cyberwave-edge-core"
+    fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
+    fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
+    fake_core.SYSTEMD_UNIT_PATH = unit_path
+    fake_core._is_macos = lambda: False
+    fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
+    fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
+    fake_core.require_root = lambda hint: None
+    fake_core._run = lambda command, *, check=True, **_kwargs: None
+
+    def _fake_release(**kwargs):
+        events.append(("release", kwargs["workspace_uuid"]))
+        return (1, 0)
+
+    fake_core._release_twins_for_fingerprint = _fake_release
+
+    # Stands in for the real repair: the token is bound to ws-token.
+    def _fake_repair(creds_in, *, base_url=None):
+        from dataclasses import replace
+
+        return replace(creds_in, workspace_uuid="ws-token"), None, False
+
+    fake_core._repair_workspace_from_token = _fake_repair
+
+    fake_credentials = ModuleType("cyberwave_cli.credentials")
+    fake_credentials.load_credentials = lambda: creds
+
+    fake_macos = ModuleType("cyberwave_cli.macos")
+    fake_macos.is_macos = lambda: False
+
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
+
+    def _fake_delete(**kwargs):
+        events.append(("delete-edge", kwargs["workspace_uuid"]))
+        return (1, 0)
+
+    monkeypatch.setattr(edge_module, "_delete_registered_edges_for_fingerprint", _fake_delete)
+    monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", lambda _runner: [])
+    monkeypatch.setattr(edge_module, "_stop_edge_worker_containers", lambda _runner: [])
+    monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", lambda: None)
+    monkeypatch.setattr(edge_module, "_prune_stopped_cyberwave_containers", lambda: 0)
+    monkeypatch.setattr(edge_module, "_prune_unused_docker_images", lambda: False)
+    monkeypatch.setattr(edge_module.os, "geteuid", lambda: 0)
+
+    return events
+
+
+def test_uninstall_releases_twin_bindings_before_deleting_the_edge_row(monkeypatch, tmp_path):
+    """Regression: ``uninstall`` deleted the edge row and released nothing, so
+    twins kept ``metadata.edge_fingerprint`` while the row the next install's
+    sweep resolves them through was already gone -- stale forever.
+    """
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Creds:
+        token: str = "token-123"
+        workspace_uuid: str | None = "ws-token"
+        workspace_name: str | None = "Token WS"
+        cyberwave_base_url: str | None = "https://api.example.com"
+
+    events = _uninstall_ordering_fixtures(monkeypatch, tmp_path, creds=_Creds())
+
+    edge_module.uninstall_edge.callback(yes=True, channel=None)
+
+    assert events == [("release", "ws-token"), ("delete-edge", "ws-token")]
+
+
+def test_uninstall_cleans_up_with_the_workspace_resolved_from_the_token(monkeypatch, tmp_path):
+    """Regression: ``uninstall`` read ``creds.workspace_uuid`` raw. After
+    ``configure --token`` that is unset, which made the release skip while the
+    delete matched on fingerprint alone -- the same leak as the install path, so
+    both entry points resolve the workspace through the shared helper.
+    """
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Creds:
+        token: str = "token-123"
+        workspace_uuid: str | None = None  # what `configure --token` writes
+        workspace_name: str | None = None
+        cyberwave_base_url: str | None = "https://api.example.com"
+
+    events = _uninstall_ordering_fixtures(monkeypatch, tmp_path, creds=_Creds())
+
+    edge_module.uninstall_edge.callback(yes=True, channel=None)
+
+    # Both halves see the repaired workspace, so neither can fall back to a
+    # fingerprint-only match.
+    assert events == [("release", "ws-token"), ("delete-edge", "ws-token")]

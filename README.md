@@ -510,6 +510,10 @@ sudo cyberwave edge install --reconfigure-microphone   # re-select microphone wi
 
 Stops the systemd service, removes the unit file, and optionally uninstalls the package.
 
+Uninstalling also releases the twins this device was paired to, so they stop
+appearing under it in **Workspace settings → Edges** and are free to pair
+elsewhere. Twins in other workspaces are never touched.
+
 ```bash
 sudo cyberwave edge uninstall
 sudo cyberwave edge uninstall --channel dev   # keep Docker images/containers

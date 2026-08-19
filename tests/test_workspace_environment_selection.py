@@ -204,69 +204,264 @@ def test_workspace_environments_deduplicates_between_project_and_global_lists(mo
     assert [env.uuid for env in result] == ["env-dup", "env-standalone"]
 
 
-def test_detach_edge_fingerprint_sends_explicit_null_to_delete_key(monkeypatch):
-    """Regression: backend treats missing keys as "unchanged" and only
-    explicit ``None`` values as deletions, so the detach call must send
-    ``{"edge_fingerprint": None}`` rather than a stripped copy of the
-    existing metadata. Otherwise stale fingerprints from previous installs
-    survive forever and pin unwanted driver containers to this edge.
+class _FakeEdgesManager:
+    """``client.edges`` for the sweep.
+
+    *no_binding_twins* are ones the unpair endpoint answers
+    ``{"success": False}`` for — it had nothing to remove.
     """
+
+    def __init__(
+        self,
+        edges,
+        bound=None,
+        fail_list=False,
+        fail_get_twins=False,
+        fail_unpair=(),
+        no_binding_twins=(),
+    ):
+        self._edges = edges
+        self._bound = bound or {}
+        self._fail_list = fail_list
+        self._fail_get_twins = fail_get_twins
+        self._fail_unpair = set(fail_unpair)
+        self._no_binding = set(no_binding_twins)
+        self.get_twins_calls: list[str] = []
+        self.unpair_calls: list[tuple[str, str]] = []
+
+    def list(self):
+        if self._fail_list:
+            raise RuntimeError("connection reset")
+        return list(self._edges)
+
+    def get_twins(self, edge_id):
+        self.get_twins_calls.append(str(edge_id))
+        if self._fail_get_twins:
+            raise RuntimeError("500 Server Error")
+        return list(self._bound.get(str(edge_id), []))
+
+    def unpair_twin(self, edge_id, twin_id):
+        self.unpair_calls.append((str(edge_id), str(twin_id)))
+        if twin_id in self._fail_unpair:
+            raise RuntimeError("403 Forbidden")
+        return {"success": twin_id not in self._no_binding}
+
+
+def _edge(uuid, fingerprint, workspace_uuid):
+    return SimpleNamespace(uuid=uuid, fingerprint=fingerprint, workspace_uuid=workspace_uuid)
+
+
+def _binding(twin_uuid, name="cam"):
+    return {"twin_uuid": twin_uuid, "twin_name": name, "camera_config": {}}
+
+
+def _client(edges, twins=None):
+    return SimpleNamespace(edges=edges, twins=twins if twins is not None else _FakeTwinsManager([]))
+
+
+def test_detach_edge_fingerprint_clears_bindings_in_other_environments(monkeypatch):
+    """Regression: a twin bound by an earlier pairing into another environment
+    was never swept, so it kept the fingerprint forever."""
     core = _load_core_module(monkeypatch)
 
-    environment_uuid = "env-1"
-    fingerprint = "fp-123"
-    selected_twin = SimpleNamespace(uuid="twin-selected", metadata={"edge_fingerprint": fingerprint})
-    stale_twin = SimpleNamespace(
-        uuid="twin-stale",
-        metadata={"edge_fingerprint": fingerprint, "label": "old-binding"},
+    twins = _FakeTwinsManager([])
+    edges = _FakeEdgesManager(
+        [_edge("edge-1", "fp-123", "ws-1")],
+        bound={"edge-1": [_binding("twin-selected"), _binding("twin-previous")]},
     )
-    unrelated_twin = SimpleNamespace(uuid="twin-other", metadata={"edge_fingerprint": "other-fp"})
-    malformed_twin = SimpleNamespace(uuid="twin-malformed", metadata="not-a-dict")
-
-    twins = _FakeTwinsManager(
-        [selected_twin, stale_twin, unrelated_twin, malformed_twin],
-        allowed_environment_id=environment_uuid,
-    )
-    client = SimpleNamespace(twins=twins)
+    client = _client(edges, twins)
 
     detached, failed = core._detach_edge_fingerprint_from_other_twins(
         client,
-        environment_uuid=environment_uuid,
+        workspace_uuid="ws-1",
         keep_twin_uuids=["twin-selected"],
-        edge_fingerprint=fingerprint,
+        edge_fingerprint="fp-123",
     )
 
-    assert detached == 1
-    assert failed == 0
-    assert twins.list_calls == [environment_uuid]
-    # The payload must send an explicit null so the backend deletes the key.
-    # Sending the remaining metadata without ``edge_fingerprint`` would merge
-    # on top of the stored copy, leaving the stale fingerprint intact.
-    assert twins.updated == [("twin-stale", {"edge_fingerprint": None})]
+    assert (detached, failed) == (1, 0)
+    assert edges.unpair_calls == [("edge-1", "twin-previous")]
+    assert twins.list_calls == [], "the sweep must not enumerate twins client-side"
+    assert edges.get_twins_calls == ["edge-1"]
 
 
-def test_detach_edge_fingerprint_from_other_twins_counts_update_failures(monkeypatch):
+def test_detach_edge_fingerprint_ignores_an_edge_row_in_another_workspace(monkeypatch):
+    """A host re-paired into a new workspace must not clear the old one."""
     core = _load_core_module(monkeypatch)
 
-    environment_uuid = "env-1"
-    fingerprint = "fp-123"
-    stale_twin = SimpleNamespace(uuid="twin-stale", metadata={"edge_fingerprint": fingerprint})
-    twins = _FakeTwinsManager(
-        [stale_twin],
-        fail_on_update={"twin-stale"},
-        allowed_environment_id=environment_uuid,
+    twins = _FakeTwinsManager([])
+    edges = _FakeEdgesManager(
+        [_edge("edge-elsewhere", "fp-123", "ws-2")],
+        bound={"edge-elsewhere": [_binding("twin-theirs")]},
     )
-    client = SimpleNamespace(twins=twins)
+    client = _client(edges, twins)
 
     detached, failed = core._detach_edge_fingerprint_from_other_twins(
         client,
-        environment_uuid=environment_uuid,
+        workspace_uuid="ws-1",
         keep_twin_uuids=[],
-        edge_fingerprint=fingerprint,
+        edge_fingerprint="fp-123",
     )
 
-    assert detached == 0
-    assert failed == 1
+    assert (detached, failed) == (0, 0)
+    assert edges.unpair_calls == []
+    assert edges.get_twins_calls == [], "must not even ask for another workspace's bindings"
+
+
+def test_detach_edge_fingerprint_is_a_noop_before_the_edge_exists(monkeypatch):
+    """First install: no edge row, so nothing was ever bound."""
+    core = _load_core_module(monkeypatch)
+
+    twins = _FakeTwinsManager([])
+    edges = _FakeEdgesManager([])
+    client = _client(edges, twins)
+
+    detached, failed = core._detach_edge_fingerprint_from_other_twins(
+        client,
+        workspace_uuid="ws-1",
+        keep_twin_uuids=[],
+        edge_fingerprint="fp-123",
+    )
+
+    assert (detached, failed) == (0, 0)
+    assert edges.get_twins_calls == []
+
+
+def test_detach_edge_fingerprint_unpairs_through_the_edge_endpoint(monkeypatch):
+    """The unpair endpoint clears the legacy ``edge_configs`` shape too; a
+    metadata merge on ``edge_fingerprint`` reaches only the canonical one."""
+    core = _load_core_module(monkeypatch)
+
+    twins = _FakeTwinsManager([])
+    edges = _FakeEdgesManager(
+        [_edge("edge-1", "fp-123", "ws-1")],
+        bound={"edge-1": [_binding("twin-stale")]},
+    )
+    client = _client(edges, twins)
+
+    detached, failed = core._detach_edge_fingerprint_from_other_twins(
+        client,
+        workspace_uuid="ws-1",
+        keep_twin_uuids=[],
+        edge_fingerprint="fp-123",
+    )
+
+    assert (detached, failed) == (1, 0)
+    assert edges.unpair_calls == [("edge-1", "twin-stale")]
+    assert twins.updated == [], "the sweep must not write twin metadata directly"
+
+
+def test_detach_edge_fingerprint_does_not_count_what_it_did_not_remove(monkeypatch):
+    """Regression: a twin the endpoint reports ``success: False`` for must not
+    be counted, or the CLI claims to have fixed a binding that survived."""
+    core = _load_core_module(monkeypatch)
+
+    edges = _FakeEdgesManager(
+        [_edge("edge-1", "fp-123", "ws-1")],
+        bound={"edge-1": [_binding("twin-untouched")]},
+        no_binding_twins=["twin-untouched"],
+    )
+    client = _client(edges)
+
+    detached, failed = core._detach_edge_fingerprint_from_other_twins(
+        client, workspace_uuid="ws-1", keep_twin_uuids=[], edge_fingerprint="fp-123"
+    )
+
+    assert (detached, failed) == (0, 0)
+    assert edges.unpair_calls == [("edge-1", "twin-untouched")]
+
+
+def test_detach_edge_fingerprint_skips_malformed_binding_rows(monkeypatch):
+    """A row that is not a dict must be skipped, not raised on."""
+    core = _load_core_module(monkeypatch)
+
+    edges = _FakeEdgesManager(
+        [_edge("edge-1", "fp-123", "ws-1")],
+        bound={"edge-1": ["not-a-dict", None, _binding("twin-stale")]},
+    )
+    client = _client(edges)
+
+    detached, failed = core._detach_edge_fingerprint_from_other_twins(
+        client, workspace_uuid="ws-1", keep_twin_uuids=[], edge_fingerprint="fp-123"
+    )
+
+    assert (detached, failed) == (1, 0)
+    assert edges.unpair_calls == [("edge-1", "twin-stale")]
+
+
+def test_edge_uuid_for_fingerprint_requires_a_workspace(monkeypatch):
+    """``get_twins`` on a workspace-less edge matches every workspace, so an
+    unknown workspace must resolve to no edge rather than to a wide sweep."""
+    core = _load_core_module(monkeypatch)
+
+    edges = _FakeEdgesManager([_edge("edge-1", "fp-123", "")])
+
+    assert core._edge_uuid_for_fingerprint(_client(edges), "fp-123", "") is None
+    assert core._edge_uuid_for_fingerprint(_client(edges), "fp-123", "ws-1") is None
+
+
+def test_detach_edge_fingerprint_reports_a_failed_edge_listing(monkeypatch):
+    core = _load_core_module(monkeypatch)
+
+    edges = _FakeEdgesManager([], fail_list=True)
+    client = _client(edges)
+
+    detached, failed = core._detach_edge_fingerprint_from_other_twins(
+        client, workspace_uuid="ws-1", keep_twin_uuids=[], edge_fingerprint="fp-123"
+    )
+
+    assert (detached, failed) == (0, 1)
+
+
+def test_detach_edge_fingerprint_reports_a_failed_bindings_lookup(monkeypatch):
+    core = _load_core_module(monkeypatch)
+
+    twins = _FakeTwinsManager([])
+    edges = _FakeEdgesManager([_edge("edge-1", "fp-123", "ws-1")], fail_get_twins=True)
+    client = _client(edges, twins)
+
+    detached, failed = core._detach_edge_fingerprint_from_other_twins(
+        client, workspace_uuid="ws-1", keep_twin_uuids=[], edge_fingerprint="fp-123"
+    )
+
+    assert (detached, failed) == (0, 1)
+    assert edges.unpair_calls == []
+
+
+def test_detach_edge_fingerprint_never_raises_into_the_install(monkeypatch):
+    """``configure_edge_environment`` catches Exception and returns False."""
+    core = _load_core_module(monkeypatch)
+
+    class _ExplodingEdges:
+        def list(self):
+            raise RuntimeError("boom")
+
+    client = _client(_ExplodingEdges())
+
+    try:
+        detached, failed = core._detach_edge_fingerprint_from_other_twins(
+            client, workspace_uuid="ws-1", keep_twin_uuids=[], edge_fingerprint="fp-123"
+        )
+    except Exception as exc:  # noqa: BLE001 - the assertion is the point
+        pytest.fail(f"the sweep must not propagate {type(exc).__name__}")
+
+    assert (detached, failed) == (0, 1)
+
+
+def test_detach_edge_fingerprint_from_other_twins_counts_unpair_failures(monkeypatch):
+    core = _load_core_module(monkeypatch)
+
+    edges = _FakeEdgesManager(
+        [_edge("edge-1", "fp-123", "ws-1")],
+        bound={"edge-1": [_binding("twin-stale")]},
+        fail_unpair=["twin-stale"],
+    )
+    client = _client(edges)
+
+    detached, failed = core._detach_edge_fingerprint_from_other_twins(
+        client, workspace_uuid="ws-1", keep_twin_uuids=[], edge_fingerprint="fp-123"
+    )
+
+    assert (detached, failed) == (0, 1)
 
 
 def test_attach_edge_fingerprint_sends_only_the_key(monkeypatch):

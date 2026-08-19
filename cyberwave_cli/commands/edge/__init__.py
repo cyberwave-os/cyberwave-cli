@@ -106,6 +106,45 @@ def _delete_registered_edges_for_fingerprint(
     return deleted_count, failed_count
 
 
+def _release_and_delete_edges_for_fingerprint(
+    *,
+    fingerprint: str,
+    token: str | None,
+    base_url: str | None,
+    workspace_uuid: str | None,
+) -> tuple[int, int]:
+    """Release this host's twin bindings, then delete its edge row(s).
+
+    ``DELETE /edges/{uuid}`` leaves ``metadata.edge_fingerprint`` on the twins,
+    and the sweep on the next install resolves twins *through* that row -- so a
+    delete that skips the release strands them where nothing can reach them
+    again. Ordering is the whole point; keep the release first.
+
+    Returns:
+        (deleted_count, failed_count) from the delete, so callers report as before.
+    """
+    from ...core import _release_twins_for_fingerprint
+
+    if token:
+        released, release_failed = _release_twins_for_fingerprint(
+            fingerprint=fingerprint,
+            token=token,
+            base_url=base_url,
+            workspace_uuid=workspace_uuid,
+        )
+        if released:
+            console.print(f"[dim]Released twins bound to this edge: {released}[/dim]")
+        if release_failed:
+            console.print(f"[yellow]Failed to release {release_failed} twin binding(s).[/yellow]")
+
+    return _delete_registered_edges_for_fingerprint(
+        fingerprint=fingerprint,
+        token=token,
+        base_url=base_url,
+        workspace_uuid=workspace_uuid,
+    )
+
+
 def _is_legacy_edge_configs_map(edge_configs: dict) -> bool:
     if not isinstance(edge_configs, dict) or not edge_configs:
         return False
@@ -767,6 +806,7 @@ def uninstall_edge(yes, channel):
         SYSTEMD_UNIT_NAME,
         _is_macos,
         _load_or_generate_edge_fingerprint,
+        _repair_workspace_from_token,
         _resolve_installed_edge_core_package_name,
     )
     from ...credentials import load_credentials
@@ -782,8 +822,6 @@ def uninstall_edge(yes, channel):
 
     creds = load_credentials()
     edge_fingerprint = _load_or_generate_edge_fingerprint()
-    token = creds.token if creds else None
-    workspace_uuid = str(getattr(creds, "workspace_uuid", "") or "") if creds else None
     base_url = str(getattr(creds, "cyberwave_base_url", "") or "") if creds else None
 
     skip_docker_cleanup = (channel or "").lower() in {"dev", "staging"}
@@ -796,6 +834,15 @@ def uninstall_edge(yes, channel):
         if not RichConfirm.ask(f"Remove {service_label} and disable boot service?", default=False):
             console.print("[dim]Aborted.[/dim]")
             return
+
+    # The stored workspace scopes both halves of the backend cleanup below, and
+    # `cyberwave configure --token` leaves it unset, so resolve it from the token
+    # before reading it. After the prompt: a declined uninstall should not hit the
+    # network or rewrite credentials.
+    if creds is not None:
+        creds, _token_workspace, _ = _repair_workspace_from_token(creds, base_url=base_url)
+    token = creds.token if creds else None
+    workspace_uuid = str(getattr(creds, "workspace_uuid", "") or "") if creds else None
 
     if _is_macos():
         from ...config import clean_subprocess_env
@@ -912,7 +959,7 @@ def uninstall_edge(yes, channel):
             except FileNotFoundError:
                 console.print("[yellow]pip not found — remove the package manually.[/yellow]")
 
-        deleted_count, failed_count = _delete_registered_edges_for_fingerprint(
+        deleted_count, failed_count = _release_and_delete_edges_for_fingerprint(
             fingerprint=edge_fingerprint,
             token=token,
             base_url=base_url,
@@ -1005,7 +1052,7 @@ def uninstall_edge(yes, channel):
                 except OSError:
                     console.print("[yellow]pip uninstall failed — remove manually.[/yellow]")
 
-    deleted_count, failed_count = _delete_registered_edges_for_fingerprint(
+    deleted_count, failed_count = _release_and_delete_edges_for_fingerprint(
         fingerprint=edge_fingerprint,
         token=token,
         base_url=base_url,

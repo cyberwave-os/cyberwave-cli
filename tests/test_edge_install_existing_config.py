@@ -94,6 +94,71 @@ def test_cleanup_existing_edge_configuration_removes_twin_and_env_files(
     assert creds_file.exists(), "credentials.json must be preserved"
 
 
+def _fake_client(edges, bound=None, events=None):
+    """A stand-in ``Cyberwave`` client recording the order of edge calls."""
+    bound = bound or {}
+    events = events if events is not None else []
+
+    class _Edges:
+        @staticmethod
+        def list():
+            return list(edges)
+
+        @staticmethod
+        def get_twins(edge_id):
+            return list(bound.get(str(edge_id), []))
+
+        @staticmethod
+        def unpair_twin(edge_id, twin_id):
+            events.append(("unpair", str(twin_id)))
+            return {"success": True}
+
+    return SimpleNamespace(edges=_Edges(), twins=SimpleNamespace())
+
+
+def test_cleanup_releases_twin_bindings_before_deleting_the_edge_row(
+    monkeypatch, tmp_path
+):
+    """Regression: ``DELETE /edges/{uuid}`` leaves twin metadata alone, so the
+    bindings have to be released while the row is still there to find them."""
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(core, "ENVIRONMENT_FILE", tmp_path / "environment.json")
+
+    fp_file = tmp_path / "fingerprint.json"
+    fp_file.write_text(json.dumps({"fingerprint": "fp-123"}))
+    monkeypatch.setattr(core, "FINGERPRINT_FILE", fp_file)
+
+    events: list[tuple[str, str]] = []
+
+    import types
+
+    edge_mod = types.ModuleType("cyberwave_cli.commands.edge")
+
+    def _fake_delete_edges(**kwargs):
+        events.append(("delete-edge", kwargs["fingerprint"]))
+        return (1, 0)
+
+    edge_mod._delete_registered_edges_for_fingerprint = _fake_delete_edges
+    monkeypatch.setitem(__import__("sys").modules, "cyberwave_cli.commands.edge", edge_mod)
+
+    client = _fake_client(
+        [SimpleNamespace(uuid="edge-1", fingerprint="fp-123", workspace_uuid="ws-1")],
+        bound={"edge-1": [{"twin_uuid": "twin-stale", "twin_name": "Old Cam"}]},
+        events=events,
+    )
+    monkeypatch.setattr(core, "_get_sdk_client", lambda *a, **kw: client)
+
+    core._cleanup_existing_edge_configuration(
+        twin_json_files=[],
+        creds=SimpleNamespace(
+            token="tok", cyberwave_base_url="https://api.test", workspace_uuid="ws-1"
+        ),
+    )
+
+    assert events == [("unpair", "twin-stale"), ("delete-edge", "fp-123")]
+
+
 def test_cleanup_existing_edge_configuration_calls_backend_cleanup(
     monkeypatch, tmp_path
 ):
@@ -125,6 +190,7 @@ def test_cleanup_existing_edge_configuration_calls_backend_cleanup(
         cyberwave_base_url="https://api.test",
         workspace_uuid="ws-uuid-1",
     )
+    monkeypatch.setattr(core, "_get_sdk_client", lambda *a, **kw: _fake_client([]))
 
     core._cleanup_existing_edge_configuration(
         twin_json_files=[],
@@ -447,3 +513,210 @@ def test_cleanup_runs_with_the_workspace_corrected_from_the_token(monkeypatch, t
 
     assert core.configure_edge_environment(skip_confirm=False) is True
     assert cleanup_workspaces == ["ws-token"]
+
+
+def test_interactive_repair_still_releases_the_deselected_twin(monkeypatch, tmp_path):
+    """Regression: answering the default "disconnect first?" deletes the edge
+    row, and the sweep resolves twins *through* that row. Nothing else clears
+    them, so the release has to happen inside the disconnect.
+
+    Deliberately does not stub the detach helper -- that stub is why this path
+    went uncovered.
+    """
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    env_file = tmp_path / "environment.json"
+    monkeypatch.setattr(core, "ENVIRONMENT_FILE", env_file)
+
+    # A prior pairing left a cached twin file, so the prompt fires.
+    (tmp_path / "twin-stale.json").write_text(json.dumps({"uuid": "twin-stale"}))
+    env_file.write_text(json.dumps({"name": "Production Floor", "uuid": "env-1"}))
+
+    fp_file = tmp_path / "fingerprint.json"
+    fp_file.write_text(json.dumps({"fingerprint": "fp-123"}))
+    monkeypatch.setattr(core, "FINGERPRINT_FILE", fp_file)
+    monkeypatch.setattr(core, "_api_token_workspace", lambda *a, **kw: None)
+    # Enter at the prompt: default=True.
+    monkeypatch.setattr(core.Confirm, "ask", staticmethod(lambda *a, **kw: True))
+
+    edges_state = [SimpleNamespace(uuid="edge-1", fingerprint="fp-123", workspace_uuid="ws-1")]
+    unpaired: list[str] = []
+
+    import types
+
+    edge_mod = types.ModuleType("cyberwave_cli.commands.edge")
+
+    def _fake_delete_edges(**kwargs):
+        edges_state.clear()  # DELETE /edges/{uuid} removes the row
+        return (1, 0)
+
+    edge_mod._delete_registered_edges_for_fingerprint = _fake_delete_edges
+    monkeypatch.setitem(__import__("sys").modules, "cyberwave_cli.commands.edge", edge_mod)
+
+    class _Edges:
+        @staticmethod
+        def list():
+            return list(edges_state)
+
+        @staticmethod
+        def get_twins(edge_id):
+            return [{"twin_uuid": "twin-stale", "twin_name": "Old Cam"}]
+
+        @staticmethod
+        def unpair_twin(edge_id, twin_id):
+            unpaired.append(str(twin_id))
+            return {"success": True}
+
+    client = SimpleNamespace(edges=_Edges(), twins=SimpleNamespace())
+    monkeypatch.setattr(core, "_get_sdk_client", lambda *a, **kw: client)
+
+    monkeypatch.setattr(core, "load_credentials", lambda: SimpleNamespace(
+        token="tok", cyberwave_base_url="https://api.test", workspace_uuid="ws-1"
+    ))
+    monkeypatch.setattr(
+        core,
+        "_resolve_workspace_from_credentials",
+        lambda *a, **kw: SimpleNamespace(uuid="ws-1", name="Test WS", slug="test"),
+    )
+    monkeypatch.setattr(
+        core,
+        "_select_or_create_environment",
+        lambda *a, **kw: SimpleNamespace(uuid="env-1", name="Production Floor"),
+    )
+    # The old camera is deselected this time.
+    monkeypatch.setattr(core, "_select_connected_twins", lambda *a, **kw: [])
+    monkeypatch.setattr(core, "_save_environment_file", lambda **kw: None)
+
+    assert core.configure_edge_environment(skip_confirm=False) is True
+    assert unpaired == ["twin-stale"]
+
+
+def test_cleanup_uses_the_token_workspace_when_credentials_have_none(monkeypatch, tmp_path):
+    """Regression: ``cyberwave configure --token`` persists no workspace at all,
+    and the two halves of the cleanup disagreed about that empty value --
+    ``_release_twins_for_fingerprint`` skipped while the delete fell back to
+    matching the fingerprint alone. The edge row went away and the twin kept its
+    ``edge_fingerprint`` forever. Repairing only a *mismatched* value left this
+    open, so an unset one must be filled from the token too.
+
+    Deliberately does not stub the cleanup helper -- that stub is what hid this.
+    """
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    env_file = tmp_path / "environment.json"
+    monkeypatch.setattr(core, "ENVIRONMENT_FILE", env_file)
+
+    # A prior pairing left a cached twin file, so the disconnect prompt fires.
+    (tmp_path / "twin-stale.json").write_text(json.dumps({"uuid": "twin-stale"}))
+    env_file.write_text(json.dumps({"name": "Production Floor", "uuid": "env-1"}))
+
+    fp_file = tmp_path / "fingerprint.json"
+    fp_file.write_text(json.dumps({"fingerprint": "fp-123"}))
+    monkeypatch.setattr(core, "FINGERPRINT_FILE", fp_file)
+    monkeypatch.setattr(core.Confirm, "ask", staticmethod(lambda *a, **kw: True))
+
+    @dataclass
+    class _Creds:
+        token: str = "cw_test"
+        cyberwave_base_url: str | None = None
+        workspace_uuid: str | None = None  # what `configure --token` writes
+        workspace_name: str | None = None
+
+    saved: list[str | None] = []
+    monkeypatch.setattr(core, "load_credentials", lambda: _Creds())
+    monkeypatch.setattr(core, "save_credentials", lambda creds: saved.append(creds.workspace_uuid))
+    monkeypatch.setattr(
+        core,
+        "_api_token_workspace",
+        lambda token, base_url=None: core._TokenWorkspace(uuid="ws-1", name="Token WS"),
+    )
+
+    events: list[tuple[str, str]] = []
+
+    import types
+
+    edge_mod = types.ModuleType("cyberwave_cli.commands.edge")
+    edges_state = [SimpleNamespace(uuid="edge-1", fingerprint="fp-123", workspace_uuid="ws-1")]
+
+    def _fake_delete_edges(**kwargs):
+        events.append(("delete-edge", kwargs["fingerprint"]))
+        edges_state.clear()  # DELETE /edges/{uuid} removes the row
+        return (1, 0)
+
+    edge_mod._delete_registered_edges_for_fingerprint = _fake_delete_edges
+    monkeypatch.setitem(__import__("sys").modules, "cyberwave_cli.commands.edge", edge_mod)
+
+    client = _fake_client(
+        edges_state,
+        bound={"edge-1": [{"twin_uuid": "twin-stale", "twin_name": "Old Cam"}]},
+        events=events,
+    )
+    monkeypatch.setattr(core, "_get_sdk_client", lambda *a, **kw: client)
+    monkeypatch.setattr(
+        core,
+        "_resolve_workspace_from_credentials",
+        lambda *a, **kw: SimpleNamespace(uuid="ws-1", name="Token WS", slug="token"),
+    )
+    monkeypatch.setattr(
+        core,
+        "_select_or_create_environment",
+        lambda *a, **kw: SimpleNamespace(uuid="env-1", name="Production Floor"),
+    )
+    monkeypatch.setattr(core, "_select_connected_twins", lambda *a, **kw: [])
+    monkeypatch.setattr(core, "_save_environment_file", lambda **kw: None)
+
+    assert core.configure_edge_environment(skip_confirm=False) is True
+    # The release has to land before the row it resolves through is deleted.
+    assert events == [("unpair", "twin-stale"), ("delete-edge", "fp-123")]
+    # And the filled-in workspace is persisted so later runs stop guessing.
+    assert saved == ["ws-1"]
+
+
+def test_repair_workspace_from_token_leaves_a_matching_stored_workspace_alone(monkeypatch):
+    """No write and no warning when the stored workspace already agrees."""
+    core = load_core_module(monkeypatch)
+
+    @dataclass
+    class _Creds:
+        token: str = "cw_test"
+        workspace_uuid: str | None = "WS-1"  # case-insensitive match
+        workspace_name: str | None = "Token WS"
+
+    monkeypatch.setattr(
+        core,
+        "_api_token_workspace",
+        lambda token, base_url=None: core._TokenWorkspace(uuid="ws-1", name="Token WS"),
+    )
+    saved: list[object] = []
+    monkeypatch.setattr(core, "save_credentials", lambda creds: saved.append(creds))
+
+    creds = _Creds()
+    repaired, token_workspace, corrected = core._repair_workspace_from_token(creds, base_url=None)
+
+    assert repaired is creds
+    assert token_workspace is not None and token_workspace.uuid == "ws-1"
+    assert corrected is False
+    assert saved == []
+
+
+def test_repair_workspace_from_token_is_a_noop_without_token_workspace(monkeypatch):
+    """A session token has no bound workspace, so the stored one must survive."""
+    core = load_core_module(monkeypatch)
+
+    @dataclass
+    class _Creds:
+        token: str = "session"
+        workspace_uuid: str | None = "ws-stored"
+        workspace_name: str | None = "Stored WS"
+
+    monkeypatch.setattr(core, "_api_token_workspace", lambda token, base_url=None: None)
+    saved: list[object] = []
+    monkeypatch.setattr(core, "save_credentials", lambda creds: saved.append(creds))
+
+    creds = _Creds()
+    repaired, token_workspace, corrected = core._repair_workspace_from_token(creds, base_url=None)
+
+    assert repaired is creds
+    assert token_workspace is None
+    assert corrected is False
+    assert saved == []

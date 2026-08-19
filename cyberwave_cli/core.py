@@ -705,6 +705,47 @@ def _persist_corrected_workspace(creds: Any, workspace: Any) -> Any:
     return corrected
 
 
+def _repair_workspace_from_token(
+    creds: Any, *, base_url: str | None
+) -> tuple[Any, _TokenWorkspace | None, bool]:
+    """Fill or correct the stored workspace from the one the token is bound to.
+
+    Both halves of the backend edge cleanup are scoped by
+    ``creds.workspace_uuid``, and they disagree about an empty one:
+    ``_release_twins_for_fingerprint`` skips entirely, while
+    ``_delete_registered_edges_for_fingerprint`` falls back to matching the
+    fingerprint alone and deletes the row anyway. ``cyberwave configure
+    --token`` persists exactly that on a fresh host, so an unset value has to be
+    filled here -- not only a mismatched one -- or the cleanup deletes the edge
+    row and releases nothing.
+
+    Returns:
+        (creds, token_workspace, overrode_stored_value). The flag is True only
+        when a stored value was replaced, which the caller has been warned
+        about; filling an unset one is not worth announcing.
+    """
+    token = str(getattr(creds, "token", "") or "")
+    if not token:
+        return creds, None, False
+
+    token_workspace = _api_token_workspace(token, base_url=base_url)
+    if token_workspace is None:
+        return creds, None, False
+
+    stored_uuid = str(getattr(creds, "workspace_uuid", "") or "").strip().lower()
+    if not stored_uuid:
+        return _persist_corrected_workspace(creds, token_workspace), token_workspace, False
+
+    if stored_uuid != token_workspace.uuid.lower():
+        console.print(
+            f"[yellow]Stored workspace does not match the API token; using "
+            f"'{token_workspace.name}' from the token instead.[/yellow]"
+        )
+        return _persist_corrected_workspace(creds, token_workspace), token_workspace, True
+
+    return creds, token_workspace, False
+
+
 def _select_workspace_from_env_or_default(
     client: Any,
     *,
@@ -1355,56 +1396,101 @@ def _attach_edge_fingerprint_to_twins(
     return updated, failed
 
 
+def _edge_uuid_for_fingerprint(client: Any, fingerprint: str, workspace_uuid: str) -> str | None:
+    """The edge row for this host in this workspace, or ``None``.
+
+    Both halves of the match matter: a host re-paired elsewhere must not get its
+    previous workspace's bindings cleared, and ``get_twins`` on a workspace-less
+    edge spans every workspace.
+    """
+    if not fingerprint or not workspace_uuid:
+        return None
+
+    for edge in client.edges.list():
+        if str(getattr(edge, "fingerprint", "") or "") != fingerprint:
+            continue
+        if str(getattr(edge, "workspace_uuid", "") or "") != workspace_uuid:
+            continue
+        return str(getattr(edge, "uuid", "") or "") or None
+    return None
+
+
+def _release_twins_bound_to_edge(
+    client: Any, edge_uuid: str, keep_twin_uuids: list[str] | None = None
+) -> tuple[int, int]:
+    """Unpair every twin bound to *edge_uuid* except those in *keep_twin_uuids*.
+
+    ``DELETE /edges/{uuid}/twins/{twin_uuid}`` clears the canonical key and the
+    legacy ``edge_configs`` map, and reports whether a binding was actually
+    there — so the count cannot overstate what it removed. Failures are
+    counted, never raised.
+
+    Returns:
+        (released_count, failed_count)
+    """
+    keep_set = {str(twin_uuid) for twin_uuid in keep_twin_uuids or [] if twin_uuid}
+    released = 0
+    failed = 0
+
+    try:
+        bound = client.edges.get_twins(edge_uuid)
+    except Exception as exc:
+        console.print(f"[yellow]Could not list twins bound to this edge: {exc}[/yellow]")
+        return released, 1
+
+    for binding in bound or []:
+        if not isinstance(binding, dict):
+            continue
+        twin_uuid = str(binding.get("twin_uuid") or "")
+        if not twin_uuid or twin_uuid in keep_set:
+            continue
+
+        try:
+            result = client.edges.unpair_twin(edge_uuid, twin_uuid)
+            if isinstance(result, dict) and result.get("success"):
+                released += 1
+        except Exception as exc:
+            console.print(
+                f"[yellow]Failed to release twin {twin_uuid[:8]}… from this edge: {exc}[/yellow]"
+            )
+            failed += 1
+
+    return released, failed
+
+
 def _detach_edge_fingerprint_from_other_twins(
     client: Any,
-    environment_uuid: str,
+    workspace_uuid: str,
     keep_twin_uuids: list[str],
     edge_fingerprint: str,
 ) -> tuple[int, int]:
-    """Remove stale edge_fingerprint from twins not selected for this edge.
+    """Release twins bound to this edge that were not selected for it.
 
-    The backend treats explicit ``None`` values in ``metadata`` as deletions
-    while merging everything else, so we must send ``{"edge_fingerprint":
-    None}`` to actually clear the key — simply omitting it would keep the
-    stored value intact (which is exactly the bug that caused stale
-    fingerprints from previous installs to pin unwanted drivers to this
-    edge).
+    ``GET /edges/{uuid}/twins`` runs the same workspace-wide fingerprint match
+    as discovery; sweeping a single environment missed twins bound by earlier
+    pairings. Failures are counted, never raised.
 
     Returns:
         (detached_count, failed_count)
     """
-    keep_set = {str(twin_uuid) for twin_uuid in keep_twin_uuids if twin_uuid}
-    detached = 0
-    failed = 0
-
     try:
-        twins = client.twins.list(environment_id=environment_uuid)
+        edge_uuid = _edge_uuid_for_fingerprint(client, edge_fingerprint, workspace_uuid)
     except Exception as exc:
-        console.print(f"[yellow]Could not list twins to clear stale fingerprints: {exc}[/yellow]")
-        return detached, 1
+        console.print(f"[yellow]Could not resolve this edge to clear stale twins: {exc}[/yellow]")
+        return 0, 1
 
-    for twin in twins:
-        twin_uuid = str(getattr(twin, "uuid", ""))
-        if not twin_uuid or twin_uuid in keep_set:
-            continue
+    # No edge row -> nothing this sweep can resolve. Both paths that delete the
+    # row (the disconnect above, `edge uninstall`) release the bindings first, so
+    # an absent row should mean an empty binding set. Say so rather than
+    # returning a silent zero: a row deleted some other way strands twins this
+    # sweep can no longer reach.
+    if edge_uuid is None:
+        console.print(
+            "[dim]No edge registration for this host; skipping the stale-binding sweep.[/dim]"
+        )
+        return 0, 0
 
-        metadata = getattr(twin, "metadata", {}) or {}
-        if not isinstance(metadata, dict):
-            continue
-
-        if metadata.get("edge_fingerprint") != edge_fingerprint:
-            continue
-
-        try:
-            client.twins.update(twin_uuid, metadata={"edge_fingerprint": None})
-            detached += 1
-        except Exception as exc:
-            console.print(
-                f"[yellow]Failed to detach fingerprint from twin {twin_uuid[:8]}…: {exc}[/yellow]"
-            )
-            failed += 1
-
-    return detached, failed
+    return _release_twins_bound_to_edge(client, edge_uuid, keep_twin_uuids)
 
 
 _NON_TWIN_JSON_FILES = frozenset(
@@ -1444,6 +1530,36 @@ def _detect_existing_edge_configuration() -> tuple[str | None, list[Path]]:
     return env_label, twin_json_files
 
 
+def _release_twins_for_fingerprint(
+    *,
+    fingerprint: str,
+    token: str,
+    base_url: str | None,
+    workspace_uuid: str | None,
+) -> tuple[int, int]:
+    """Unpair the twins bound to this host's edge row. Never raises.
+
+    Returns:
+        (released_count, failed_count)
+    """
+    # No workspace means we cannot tell this host's edge row from a same-named
+    # one elsewhere; skipping is the safe half of that trade.
+    if not workspace_uuid:
+        return 0, 0
+
+    try:
+        client = _get_sdk_client(token, base_url=base_url or None)
+        edge_uuid = _edge_uuid_for_fingerprint(client, fingerprint, workspace_uuid)
+    except Exception as exc:
+        console.print(f"[yellow]Could not resolve this edge to release its twins: {exc}[/yellow]")
+        return 0, 1
+
+    if edge_uuid is None:
+        return 0, 0
+
+    return _release_twins_bound_to_edge(client, edge_uuid)
+
+
 def _cleanup_existing_edge_configuration(
     *,
     twin_json_files: list[Path],
@@ -1475,6 +1591,20 @@ def _cleanup_existing_edge_configuration(
 
     if token:
         from .commands.edge import _delete_registered_edges_for_fingerprint
+
+        # Deleting the edge row leaves twin metadata untouched, so release the
+        # bindings while the row still exists — otherwise nothing ever clears
+        # them and the next discovery re-serves the same stale twins.
+        released, release_failed = _release_twins_for_fingerprint(
+            fingerprint=edge_fingerprint,
+            token=token,
+            base_url=base_url,
+            workspace_uuid=workspace_uuid,
+        )
+        if released:
+            console.print(f"[dim]Released twins bound to this edge: {released}[/dim]")
+        if release_failed:
+            console.print(f"[yellow]Failed to release {release_failed} twin binding(s).[/yellow]")
 
         deleted, failed = _delete_registered_edges_for_fingerprint(
             fingerprint=edge_fingerprint,
@@ -1519,19 +1649,11 @@ def configure_edge_environment(
     #
     # Resolve and repair it *before* the cleanup below. `creds.workspace_uuid`
     # filters which edge registrations the cleanup deletes, so running it
-    # against a stale value silently deletes nothing and strands this device's
-    # registrations in the backend.
-    token_workspace = _api_token_workspace(creds.token, base_url=creds_base_url)
-    workspace_corrected = False
-    if token_workspace is not None:
-        stored_uuid = str(creds.workspace_uuid or "").strip().lower()
-        if stored_uuid and stored_uuid != token_workspace.uuid.lower():
-            console.print(
-                f"[yellow]Stored workspace does not match the API token; using "
-                f"'{token_workspace.name}' from the token instead.[/yellow]"
-            )
-            creds = _persist_corrected_workspace(creds, token_workspace)
-            workspace_corrected = True
+    # against a stale or unset value strands this device's registrations in the
+    # backend. `edge uninstall` shares the helper for the same reason.
+    creds, token_workspace, workspace_corrected = _repair_workspace_from_token(
+        creds, base_url=creds_base_url
+    )
 
     if not skip_confirm:
         env_label, twin_json_files = _detect_existing_edge_configuration()
@@ -1611,7 +1733,7 @@ def configure_edge_environment(
         edge_fingerprint = _load_or_generate_edge_fingerprint()
         detached_count, detach_failed_count = _detach_edge_fingerprint_from_other_twins(
             client,
-            env_uuid,
+            str(workspace.uuid),
             selected_twin_uuids,
             edge_fingerprint,
         )
