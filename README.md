@@ -1,6 +1,10 @@
 <p align="center">
   <a href="https://cyberwave.com">
-    <img src="https://cyberwave.com/cyberwave-logo-black.svg" alt="Cyberwave logo" width="240" />
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/assets/brand/cyberwave-logo-white.svg">
+      <source media="(prefers-color-scheme: light)" srcset=".github/assets/brand/cyberwave-logo-black.svg">
+      <img src=".github/assets/brand/cyberwave-logo-black.svg" alt="Cyberwave" width="240">
+    </picture>
   </a>
 </p>
 
