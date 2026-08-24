@@ -19,6 +19,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -1493,6 +1494,8 @@ def _detach_edge_fingerprint_from_other_twins(
     return _release_twins_bound_to_edge(client, edge_uuid, keep_twin_uuids)
 
 
+# Belt and braces only. The real test is `_is_twin_object_file`; keeping these
+# names listed means a config file that somehow *is* UUID-shaped still survives.
 _NON_TWIN_JSON_FILES = frozenset(
     {
         "credentials.json",
@@ -1501,8 +1504,35 @@ _NON_TWIN_JSON_FILES = frozenset(
         "camera_streams.json",
         "fingerprint.json",
         "edge.json",
+        "serial_bridges.json",
     }
 )
+
+
+def _is_twin_object_file(path: Path) -> bool:
+    """True when *path* is a cached twin object file (``<twin_uuid>.json``).
+
+    Identified by **shape**, not by excluding the config names we happen to know.
+    The exclusion list alone failed open: any file not named in it was a deletion
+    candidate, so every config file added later inherited the bug.
+
+    ``serial_bridges.json`` is how that bit. ``setup_serial_bridges`` writes it
+    early in ``cyberwave edge install``; ``configure_edge_environment`` runs at
+    the *end* of the same install and swept it up as a twin file, so the
+    installer deleted its own output. Edge-core then saw no serial bridge, put
+    the macOS SO101 arms on USB/IP — which cannot carry their serial data,
+    because AppleUSBACM holds the CDC interface and Darwin has no
+    ``libusb_detach_kernel_driver`` — and the arms never appeared.
+
+    ``cyberwave_edge_core.startup`` already identifies these files this way.
+    """
+    if path.name in _NON_TWIN_JSON_FILES:
+        return False
+    try:
+        uuid.UUID(path.stem)
+    except ValueError:
+        return False
+    return True
 
 
 def _detect_existing_edge_configuration() -> tuple[str | None, list[Path]]:
@@ -1513,9 +1543,7 @@ def _detect_existing_edge_configuration() -> tuple[str | None, list[Path]]:
         *environment_name_or_uuid* is ``None`` when no prior configuration
         is detected.
     """
-    twin_json_files = [
-        p for p in sorted(CONFIG_DIR.glob("*.json")) if p.name not in _NON_TWIN_JSON_FILES
-    ]
+    twin_json_files = [p for p in sorted(CONFIG_DIR.glob("*.json")) if _is_twin_object_file(p)]
     if not twin_json_files:
         return None, []
 

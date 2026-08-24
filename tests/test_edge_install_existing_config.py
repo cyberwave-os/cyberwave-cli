@@ -36,11 +36,38 @@ def test_detect_existing_edge_configuration_finds_twin_json(monkeypatch, tmp_pat
     assert twin_files[0].name == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.json"
 
 
+def test_detect_existing_edge_configuration_spares_platform_config(monkeypatch, tmp_path):
+    """A config file that is not UUID-named is never a twin object file.
+
+    ``serial_bridges.json`` is written by ``setup_serial_bridges`` earlier in the
+    same install, and ``configure_edge_environment`` runs *after* it — so
+    classifying it as a twin file made the installer delete its own output. The
+    macOS arms then had no bridge to reach and fell back to USB/IP, which cannot
+    carry their serial data at all.
+
+    The allowlist that used to guard this failed open: anything not named in it
+    was a deletion candidate, so every future config file inherits the bug. A
+    twin object file is UUID-named by contract, so that shape is the test.
+    """
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+
+    (tmp_path / "serial_bridges.json").write_text("{}")
+    # Stand-in for the next config file nobody remembered to allowlist.
+    (tmp_path / "audio_bridges.json").write_text("{}")
+    monkeypatch.setattr(core, "ENVIRONMENT_FILE", tmp_path / "environment.json")
+
+    env_label, twin_files = core._detect_existing_edge_configuration()
+
+    assert twin_files == []
+    assert env_label is None
+
+
 def test_detect_existing_edge_configuration_falls_back_to_uuid(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
 
-    twin_file = tmp_path / "twin-uuid-1.json"
+    twin_file = tmp_path / "11111111-1111-4111-8111-111111111111.json"
     twin_file.write_text("{}")
 
     env_file = tmp_path / "environment.json"
@@ -75,7 +102,7 @@ def test_cleanup_existing_edge_configuration_removes_twin_and_env_files(
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(core, "FINGERPRINT_FILE", tmp_path / "fingerprint.json")
 
-    twin_file = tmp_path / "twin-1.json"
+    twin_file = tmp_path / "22222222-2222-4222-8222-222222222222.json"
     twin_file.write_text("{}")
     env_file = tmp_path / "environment.json"
     env_file.write_text(json.dumps({"name": "Old Env"}))
@@ -210,7 +237,7 @@ def test_configure_edge_environment_prompts_when_existing_config(
     monkeypatch.setattr(core, "ENVIRONMENT_FILE", tmp_path / "environment.json")
     monkeypatch.setattr(core, "FINGERPRINT_FILE", tmp_path / "fingerprint.json")
 
-    twin_file = tmp_path / "twin-uuid-123.json"
+    twin_file = tmp_path / "33333333-3333-4333-8333-333333333333.json"
     twin_file.write_text(json.dumps({"uuid": "twin-uuid-123"}))
     env_file = tmp_path / "environment.json"
     env_file.write_text(json.dumps({"name": "Production Floor", "uuid": "env-1"}))
@@ -286,7 +313,7 @@ def test_configure_edge_environment_skips_prompt_with_skip_confirm(
     monkeypatch.setattr(core, "ENVIRONMENT_FILE", tmp_path / "environment.json")
     monkeypatch.setattr(core, "FINGERPRINT_FILE", tmp_path / "fingerprint.json")
 
-    twin_file = tmp_path / "twin-uuid-123.json"
+    twin_file = tmp_path / "33333333-3333-4333-8333-333333333333.json"
     twin_file.write_text(json.dumps({"uuid": "twin-uuid-123"}))
     env_file = tmp_path / "environment.json"
     env_file.write_text(json.dumps({"name": "Env1", "uuid": "env-1"}))
@@ -473,7 +500,9 @@ def test_cleanup_runs_with_the_workspace_corrected_from_the_token(monkeypatch, t
     monkeypatch.setattr(core, "ENVIRONMENT_FILE", tmp_path / "environment.json")
     monkeypatch.setattr(core, "FINGERPRINT_FILE", tmp_path / "fingerprint.json")
     (tmp_path / "environment.json").write_text(json.dumps({"name": "Env1", "uuid": "env-1"}))
-    (tmp_path / "twin-uuid-123.json").write_text(json.dumps({"uuid": "twin-uuid-123"}))
+    (tmp_path / "33333333-3333-4333-8333-333333333333.json").write_text(
+        json.dumps({"uuid": "twin-uuid-123"})
+    )
 
     monkeypatch.setattr(core.Confirm, "ask", staticmethod(lambda *a, **kw: True))
 
@@ -529,7 +558,9 @@ def test_interactive_repair_still_releases_the_deselected_twin(monkeypatch, tmp_
     monkeypatch.setattr(core, "ENVIRONMENT_FILE", env_file)
 
     # A prior pairing left a cached twin file, so the prompt fires.
-    (tmp_path / "twin-stale.json").write_text(json.dumps({"uuid": "twin-stale"}))
+    (tmp_path / "44444444-4444-4444-8444-444444444444.json").write_text(
+        json.dumps({"uuid": "twin-stale"})
+    )
     env_file.write_text(json.dumps({"name": "Production Floor", "uuid": "env-1"}))
 
     fp_file = tmp_path / "fingerprint.json"
@@ -607,7 +638,9 @@ def test_cleanup_uses_the_token_workspace_when_credentials_have_none(monkeypatch
     monkeypatch.setattr(core, "ENVIRONMENT_FILE", env_file)
 
     # A prior pairing left a cached twin file, so the disconnect prompt fires.
-    (tmp_path / "twin-stale.json").write_text(json.dumps({"uuid": "twin-stale"}))
+    (tmp_path / "44444444-4444-4444-8444-444444444444.json").write_text(
+        json.dumps({"uuid": "twin-stale"})
+    )
     env_file.write_text(json.dumps({"name": "Production Floor", "uuid": "env-1"}))
 
     fp_file = tmp_path / "fingerprint.json"
