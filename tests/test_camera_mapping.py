@@ -11,6 +11,12 @@ from typing import Any
 
 from tests._core_module_loader import load_core_module
 
+# Twin object files are UUID-named by contract, and `_is_twin_object_file`
+# enforces that shape, so these fixtures have to be real UUIDs.
+TWIN_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+TWIN_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+TWIN_C = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+
 
 def _write_twin_json(config_dir, twin_uuid: str, name: str, *, camera: bool) -> None:
     payload: dict[str, Any] = {
@@ -32,9 +38,9 @@ def test_list_camera_twins_returns_only_camera_assets(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(core, "ENVIRONMENT_FILE", tmp_path / "environment.json")
 
-    _write_twin_json(tmp_path, "twin-a", "Cam A", camera=True)
-    _write_twin_json(tmp_path, "twin-b", "Arm", camera=False)
-    _write_twin_json(tmp_path, "twin-c", "Cam C", camera=True)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True)
+    _write_twin_json(tmp_path, TWIN_B, "Arm", camera=False)
+    _write_twin_json(tmp_path, TWIN_C, "Cam C", camera=True)
 
     # Reserved files should never be treated as twin caches even when the
     # asset-schema happens to look camera-like.
@@ -45,7 +51,7 @@ def test_list_camera_twins_returns_only_camera_assets(monkeypatch, tmp_path):
     (tmp_path / "credentials.json").write_text("{}")
 
     twins = core._list_camera_twins()
-    assert [t[0] for t in twins] == ["twin-a", "twin-c"]
+    assert [t[0] for t in twins] == [TWIN_A, TWIN_C]
     assert [t[1] for t in twins] == ["Cam A", "Cam C"]
 
 
@@ -55,17 +61,17 @@ def test_list_camera_twins_respects_selected_uuids(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(core, "ENVIRONMENT_FILE", tmp_path / "environment.json")
 
-    _write_twin_json(tmp_path, "twin-a", "Cam A", camera=True)
-    _write_twin_json(tmp_path, "twin-b", "Cam B", camera=True)
-    _write_twin_json(tmp_path, "twin-c", "Cam C", camera=True)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True)
+    _write_twin_json(tmp_path, TWIN_B, "Cam B", camera=True)
+    _write_twin_json(tmp_path, TWIN_C, "Cam C", camera=True)
 
-    # User only selected twin-a and twin-c in this install run.
+    # User only selected TWIN_A and TWIN_C in this install run.
     (tmp_path / "environment.json").write_text(
-        json.dumps({"twin_uuids": ["twin-a", "twin-c"]})
+        json.dumps({"twin_uuids": [TWIN_A, TWIN_C]})
     )
 
     twins = core._list_camera_twins()
-    assert [t[0] for t in twins] == ["twin-a", "twin-c"]
+    assert [t[0] for t in twins] == [TWIN_A, TWIN_C]
 
 
 def test_list_camera_twins_falls_back_when_environment_missing(monkeypatch, tmp_path):
@@ -73,11 +79,11 @@ def test_list_camera_twins_falls_back_when_environment_missing(monkeypatch, tmp_
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(core, "ENVIRONMENT_FILE", tmp_path / "environment.json")
 
-    _write_twin_json(tmp_path, "twin-a", "Cam A", camera=True)
-    _write_twin_json(tmp_path, "twin-b", "Cam B", camera=True)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True)
+    _write_twin_json(tmp_path, TWIN_B, "Cam B", camera=True)
 
     twins = core._list_camera_twins()
-    assert [t[0] for t in twins] == ["twin-a", "twin-b"]
+    assert [t[0] for t in twins] == [TWIN_A, TWIN_B]
 
 
 def test_list_camera_twins_falls_back_when_no_twin_uuids_key(monkeypatch, tmp_path):
@@ -85,18 +91,18 @@ def test_list_camera_twins_falls_back_when_no_twin_uuids_key(monkeypatch, tmp_pa
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(core, "ENVIRONMENT_FILE", tmp_path / "environment.json")
 
-    _write_twin_json(tmp_path, "twin-a", "Cam A", camera=True)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True)
     (tmp_path / "environment.json").write_text(json.dumps({"name": "env"}))
 
     twins = core._list_camera_twins()
-    assert [t[0] for t in twins] == ["twin-a"]
+    assert [t[0] for t in twins] == [TWIN_A]
 
 
 def test_any_twin_has_camera_sensor_delegates_to_list(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
     assert core._any_twin_has_camera_sensor() is False
-    _write_twin_json(tmp_path, "twin-a", "Cam A", camera=True)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True)
     assert core._any_twin_has_camera_sensor() is True
 
 
@@ -140,8 +146,8 @@ def test_detect_and_select_cameras_single_physical_auto_assigns_all_twins(
 ):
     core = load_core_module(monkeypatch)
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
-    _write_twin_json(tmp_path, "twin-a", "Cam A", camera=True)
-    _write_twin_json(tmp_path, "twin-b", "Cam B", camera=True)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True)
+    _write_twin_json(tmp_path, TWIN_B, "Cam B", camera=True)
 
     cameras = [_FakeCam(0, "USB Cam", "/dev/video0")]
     _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=[])
@@ -150,7 +156,7 @@ def test_detect_and_select_cameras_single_physical_auto_assigns_all_twins(
 
     data = json.loads((tmp_path / "cameras.json").read_text())
     assert data["selected_device"] == 0
-    assert data["twin_to_device"] == {"twin-a": 0, "twin-b": 0}
+    assert data["twin_to_device"] == {TWIN_A: 0, TWIN_B: 0}
 
 
 def test_detect_and_select_cameras_single_twin_keeps_legacy_prompt(
@@ -158,7 +164,7 @@ def test_detect_and_select_cameras_single_twin_keeps_legacy_prompt(
 ):
     core = load_core_module(monkeypatch)
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
-    _write_twin_json(tmp_path, "twin-a", "Cam A", camera=True)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True)
 
     cameras = [
         _FakeCam(0, "Cam A", "/dev/video0"),
@@ -170,14 +176,14 @@ def test_detect_and_select_cameras_single_twin_keeps_legacy_prompt(
 
     data = json.loads((tmp_path / "cameras.json").read_text())
     assert data["selected_device"] == 2
-    assert data["twin_to_device"] == {"twin-a": 2}
+    assert data["twin_to_device"] == {TWIN_A: 2}
 
 
 def test_detect_and_select_cameras_multi_twin_builds_mapping(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
-    _write_twin_json(tmp_path, "twin-a", "Cam A", camera=True)
-    _write_twin_json(tmp_path, "twin-b", "Cam B", camera=True)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True)
+    _write_twin_json(tmp_path, TWIN_B, "Cam B", camera=True)
 
     cameras = [
         _FakeCam(0, "Logitech", "/dev/video0"),
@@ -193,7 +199,7 @@ def test_detect_and_select_cameras_multi_twin_builds_mapping(monkeypatch, tmp_pa
     core._detect_and_select_cameras()
 
     data = json.loads((tmp_path / "cameras.json").read_text())
-    assert data["twin_to_device"] == {"twin-a": 0, "twin-b": 1}
+    assert data["twin_to_device"] == {TWIN_A: 0, TWIN_B: 1}
     # First mapping is mirrored into the legacy single-select field.
     assert data["selected_device"] == 0
 
@@ -203,7 +209,7 @@ def test_detect_and_select_cameras_invalid_selection_aborts_without_file(
 ):
     core = load_core_module(monkeypatch)
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
-    _write_twin_json(tmp_path, "twin-a", "Cam A", camera=True)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True)
 
     cameras = [
         _FakeCam(0, "Logitech", "/dev/video0"),

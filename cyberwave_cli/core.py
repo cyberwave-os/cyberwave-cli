@@ -44,6 +44,9 @@ from .credentials import (
 )
 
 from .macos import (
+    AUDIO_STREAMS_FILENAME,
+    CAMERA_STREAMS_FILENAME,
+    SERIAL_BRIDGES_FILENAME,
     bootstrap_launchd_service,
     is_macos,
     legacy_labels_for_package,
@@ -1501,10 +1504,14 @@ _NON_TWIN_JSON_FILES = frozenset(
         "credentials.json",
         "environment.json",
         "cameras.json",
-        "camera_streams.json",
         "fingerprint.json",
         "edge.json",
-        "serial_bridges.json",
+        # Spelled out rather than imported from `commands.compute`, which would
+        # pull `click` into this module's import graph.
+        "instance_identity.json",
+        AUDIO_STREAMS_FILENAME,
+        CAMERA_STREAMS_FILENAME,
+        SERIAL_BRIDGES_FILENAME,
     }
 )
 
@@ -2802,13 +2809,7 @@ def _list_camera_twins() -> list[tuple[str, str]]:
     selected_uuids = _load_selected_twin_uuids()
     results: list[tuple[str, str]] = []
     for path in sorted(CONFIG_DIR.glob("*.json")):
-        if path.name in (
-            "credentials.json",
-            "environment.json",
-            "cameras.json",
-            "fingerprint.json",
-            "edge.json",
-        ):
+        if not _is_twin_object_file(path):
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -2839,15 +2840,7 @@ def _list_microphone_twins() -> list[tuple[str, str]]:
     selected_uuids = _load_selected_twin_uuids()
     results: list[tuple[str, str]] = []
     for path in sorted(CONFIG_DIR.glob("*.json")):
-        if path.name in (
-            "credentials.json",
-            "environment.json",
-            "cameras.json",
-            "camera_streams.json",
-            "audio_streams.json",
-            "fingerprint.json",
-            "edge.json",
-        ):
+        if not _is_twin_object_file(path):
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -2879,15 +2872,7 @@ def _list_speaker_twins() -> list[tuple[str, str]]:
     selected_uuids = _load_selected_twin_uuids()
     results: list[tuple[str, str]] = []
     for path in sorted(CONFIG_DIR.glob("*.json")):
-        if path.name in (
-            "credentials.json",
-            "environment.json",
-            "cameras.json",
-            "camera_streams.json",
-            "audio_streams.json",
-            "fingerprint.json",
-            "edge.json",
-        ):
+        if not _is_twin_object_file(path):
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
