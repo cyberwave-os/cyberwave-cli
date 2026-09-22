@@ -24,10 +24,22 @@ console = Console()
 
 
 def get_sdk_client(token: str):
-    """Get Cyberwave SDK client instance."""
+    """Get Cyberwave SDK client instance.
+
+    The logged-in workspace is threaded through as ``workspace_id`` so the SDK
+    names it on every request — the backend no longer picks one on the caller's
+    behalf.
+    """
     try:
         from cyberwave import Cyberwave
-        return Cyberwave(base_url=get_api_url(), token=token)
+
+        creds = load_credentials()
+        workspace_id = getattr(creds, "workspace_uuid", None) if creds else None
+        return Cyberwave(
+            base_url=get_api_url(),
+            token=token,
+            workspace_id=workspace_id or None,
+        )
     except ImportError:
         console.print("[red][ERROR][/red] Cyberwave SDK not installed.")
         console.print("[dim]Install with: pip install cyberwave[/dim]")

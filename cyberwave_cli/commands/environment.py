@@ -19,7 +19,13 @@ def get_sdk_client():
         return None
     try:
         from cyberwave import Cyberwave
-        return Cyberwave(base_url=get_api_url(), token=creds.token)
+        # workspace_id names the workspace on every request: the backend no
+        # longer picks one, so a multi-workspace token would otherwise 400.
+        return Cyberwave(
+            base_url=get_api_url(),
+            token=creds.token,
+            workspace_id=creds.workspace_uuid or None,
+        )
     except ImportError:
         return None
 

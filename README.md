@@ -69,6 +69,13 @@ cyberwave --version
 # cyberwave, version 0.x.y
 ```
 
+### Workspace
+
+Every command acts in the workspace you selected during `cyberwave login`, which
+is sent with each request. If your API token is scoped to several workspaces and
+none is selected, the backend answers `400 workspace_required` rather than
+picking one for you. Re-run `cyberwave login` to change the selected workspace.
+
 ## Commands
 
 | Command       | Description                                                   |

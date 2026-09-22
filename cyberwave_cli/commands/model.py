@@ -36,7 +36,11 @@ def fetch_edge_models() -> list[dict]:
     
     try:
         from cyberwave import Cyberwave
-        client = Cyberwave(base_url=get_api_url(), token=creds.token)
+        client = Cyberwave(
+            base_url=get_api_url(),
+            token=creds.token,
+            workspace_id=creds.workspace_uuid or None,
+        )
         # Use raw API call for mlmodels (not a standard resource manager)
         models = client.api.src_app_api_mlmodels_list_mlmodels(edge_compatible=True)
         return [

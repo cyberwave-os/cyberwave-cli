@@ -318,10 +318,22 @@ from .interactive_select import _select_with_arrows, _select_multiple_with_arrow
 
 
 def _get_sdk_client(token: str, *, base_url: str | None = None):
-    """Create a Cyberwave SDK client from a token."""
+    """Create a Cyberwave SDK client from a token.
+
+    The logged-in workspace is passed as ``workspace_id`` so the SDK names it
+    on every request. Without it, a token scoped to more than one workspace
+    has no way to say which one a call means and the backend answers
+    ``400 workspace_required``.
+    """
     from cyberwave import Cyberwave
 
-    return Cyberwave(base_url=base_url or get_api_url(), token=token)
+    creds = load_credentials()
+    workspace_id = getattr(creds, "workspace_uuid", None) if creds else None
+    return Cyberwave(
+        base_url=base_url or get_api_url(),
+        token=token,
+        workspace_id=workspace_id or None,
+    )
 
 
 def _save_environment_file(
