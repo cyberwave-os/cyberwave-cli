@@ -446,7 +446,7 @@ def write_cameras_json(
     config_dir: Path,
     *,
     selected_index: int | None = None,
-    twin_to_device: dict[str, int] | None = None,
+    twin_to_device: dict[str, int | str] | None = None,
 ) -> Path:
     """Write discovered cameras to a JSON file in the config directory.
 
@@ -457,9 +457,14 @@ def write_cameras_json(
             as ``selected_device`` in the JSON).  Preserved for back-compat;
             when ``twin_to_device`` is provided this should be the first
             twin's device so older edge-core builds still work.
-        twin_to_device: Optional ``{twin_uuid: video_index}`` mapping that lets
-            each camera-bearing twin bind to a specific ``/dev/video*``
-            device on the host. Stored under ``twin_to_device`` in the JSON.
+        twin_to_device: Optional ``{twin_uuid: video_index | source}`` mapping
+            that lets each camera-bearing twin bind to a specific camera.
+            An ``int`` is a ``/dev/video*`` index, which edge-core renders back
+            as ``/dev/video{N}``. A ``str`` is a stable source -- a
+            ``/dev/v4l/by-id`` path or a stream URL -- and is passed through to
+            the driver verbatim, because rendering it as an index would throw
+            away the identity the pin exists to carry. Stored under
+            ``twin_to_device`` in the JSON.
 
     Returns:
         Path to the written cameras.json file.
@@ -473,8 +478,11 @@ def write_cameras_json(
     if selected_index is not None:
         data["selected_device"] = selected_index
     if twin_to_device:
+        # ``int()`` on every value would raise on a by-id path and, before
+        # that, quietly rounded the whole feature down to positional indices.
         data["twin_to_device"] = {
-            str(twin_uuid): int(idx) for twin_uuid, idx in twin_to_device.items()
+            str(twin_uuid): value if isinstance(value, str) else int(value)
+            for twin_uuid, value in twin_to_device.items()
         }
     atomic_write_json(cameras_file, data, mode=0o644)
     logger.info("Wrote cameras.json to %s (%d devices)", cameras_file, len(cameras))

@@ -1,7 +1,7 @@
 """Pip release-channel helpers and PEP 503 simple-index parsing.
 
-Selects pip package versions based on release channels (stable / dev / staging)
-and fetches available versions from Buildkite-hosted Python registries.
+Selects pip package versions based on release channels (stable / dev / staging
+/ pr) and fetches available versions from Buildkite-hosted Python registries.
 """
 
 from __future__ import annotations
@@ -16,19 +16,38 @@ from packaging.version import InvalidVersion, Version
 
 BUILDKITE_ORG_SLUG = "cyberwave"
 INTERNAL_PYTHON_REGISTRY_SLUG = "cyberwave-internal-python"
+# PR builds live in their own registry rather than as a version bucket inside
+# the shared prerelease one. A PR build is an unreviewed artifact, so the
+# safest guarantee is that no normal install ever reads the index holding it.
+PR_PYTHON_REGISTRY_SLUG = "cyberwave-pr-python"
+
+SERVICE_CHANNELS = ("stable", "dev", "staging", "pr")
 
 
 def _normalize_service_channel(channel: str | None) -> str:
     """Return a normalized service release channel."""
     normalized_channel = (channel or "stable").strip().lower()
-    if normalized_channel not in {"stable", "dev", "staging"}:
+    if normalized_channel not in SERVICE_CHANNELS:
         raise ValueError(f"Unsupported channel: {normalized_channel}")
     return normalized_channel
 
 
 def _pip_version_matches_channel(version: Version, channel: str) -> bool:
-    """Return whether ``version`` belongs to the selected release channel."""
+    """Return whether ``version`` belongs to the selected release channel.
+
+    PR builds carry a PEP 440 local version (``1.2.3rc45+gabc123def456``),
+    which sorts *above* the plain ``1.2.3rc45`` it was cut from. Since
+    :func:`_select_pip_version_for_channel` takes the maximum match, a PR
+    build reaching the staging index would silently outrank the real staging
+    release for every install. Excluding local versions from the release
+    channels is the guard that makes registry separation fail safe rather
+    than fail silently.
+    """
     normalized_channel = _normalize_service_channel(channel)
+    if normalized_channel == "pr":
+        return version.local is not None
+    if version.local is not None:
+        return False
     if normalized_channel == "stable":
         return not version.is_prerelease and not version.is_devrelease
     if normalized_channel == "dev":
@@ -69,18 +88,32 @@ def _buildkite_python_registry_slug(package_name: str) -> str:
 
 
 def _resolve_buildkite_python_registry_slug(package_name: str, channel: str) -> str:
-    """Return the shared prerelease registry slug or per-package stable slug."""
+    """Return the PR, shared prerelease, or per-package stable registry slug."""
     normalized_channel = _normalize_service_channel(channel)
     if normalized_channel == "stable":
         return _buildkite_python_registry_slug(package_name)
+    if normalized_channel == "pr":
+        return PR_PYTHON_REGISTRY_SLUG
     return INTERNAL_PYTHON_REGISTRY_SLUG
 
 
 def _select_pip_version_for_channel(
     versions: list[Version], *, package_name: str, channel: str
 ) -> Version:
-    """Choose the highest available version that matches ``channel``."""
+    """Choose the highest available version that matches ``channel``.
+
+    The ``pr`` channel deliberately has no "highest" answer: the PR registry
+    holds builds from unrelated branches whose ordering carries no meaning,
+    so picking a maximum would install whichever PR happened to sort last.
+    Callers must name the exact version instead.
+    """
     normalized_channel = _normalize_service_channel(channel)
+    if normalized_channel == "pr":
+        raise ValueError(
+            f"The 'pr' channel has no default version for {package_name}: PR builds are "
+            f"not ordered against each other. Pass the exact version from the PR comment, "
+            f"e.g. --version 1.2.3rc45+gabc123def456."
+        )
     matching_versions = [
         version for version in versions if _pip_version_matches_channel(version, normalized_channel)
     ]

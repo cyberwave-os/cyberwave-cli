@@ -23,7 +23,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
@@ -67,11 +67,15 @@ _init_macos_console(console)
 PACKAGE_NAME = "cyberwave-edge-core"
 BUILDKITE_ORG_SLUG = "cyberwave"
 INTERNAL_DEB_REGISTRY_SLUG = "cyberwave-internal-deb"
+# PR builds get their own apt registry for the same reason as the Python ones:
+# an unreviewed artifact should never sit in an index a normal install reads.
+PR_DEB_REGISTRY_SLUG = "cyberwave-pr-deb"
 INTERNAL_DEB_READ_TOKEN_ENV = "CYBERWAVE_INTERNAL_DEB_READ_TOKEN"
 EDGE_CORE_PACKAGE_CHANNELS = {
     "stable": PACKAGE_NAME,
     "dev": "cyberwave-edge-core-dev",
     "staging": "cyberwave-edge-core-staging",
+    "pr": "cyberwave-edge-core-pr",
 }
 BINARY_PATH = Path("/usr/bin/cyberwave-edge-core")
 SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
@@ -184,6 +188,9 @@ CLOUD_NODE_SPEC = ServiceSpec(
         "stable": "cyberwave-cloud-node",
         "dev": "cyberwave-cloud-node-dev",
         "staging": "cyberwave-cloud-node-staging",
+        # No "pr": cloud-node-test-and-publish.yml builds no PR artifact, so the
+        # channel would resolve to a package that is never published. Add it back
+        # together with the workflow that fills it.
     },
     public_deb_registry_slug="cyberwave-cloud-node",
     deb_repo_url="https://packages.buildkite.com/cyberwave/cyberwave-cloud-node/any/",
@@ -1326,12 +1333,19 @@ def _download_twin_json_files(client: Any, twin_uuids: list[str]) -> int:
     written = 0
     for twin_uuid in twin_uuids:
         try:
-            twin = client.twins.get(twin_uuid)
-            twin_data: dict[str, Any] = (
-                twin.to_dict()
-                if hasattr(twin, "to_dict")
-                else {"uuid": twin_uuid, "name": getattr(twin, "name", None)}
-            )
+            # ``get_raw`` returns the generated ``TwinSchema``, whose
+            # ``to_dict()`` carries every API field -- including ``metadata``,
+            # which is where ``serial_number`` lives.  ``twins.get()`` returns
+            # the rich ``Twin`` handle instead, and that class defines no
+            # ``to_dict``: the old ``hasattr`` ternary therefore always took
+            # the ``else`` branch and wrote a ``{uuid, name}`` stub.  The
+            # failure was invisible because ``twin_data["asset"]`` below
+            # refilled the file to ~10KB, but every twin-level field was gone,
+            # so ``_load_twin_camera_serials`` never saw a pinned serial and
+            # the camera auto-bind prompted for every twin.  No fallback here:
+            # a missing ``to_dict`` must raise rather than silently truncate.
+            twin = client.twins.get_raw(twin_uuid)
+            twin_data: dict[str, Any] = twin.to_dict()
 
             asset_uuid = getattr(twin, "asset_uuid", None) or getattr(twin, "asset_id", "")
             asset_data: dict[str, Any] = {}
@@ -1849,6 +1863,8 @@ def _resolve_deb_registry_slug(spec: ServiceSpec, channel: str = "stable") -> st
     normalized_channel = _normalize_service_channel(channel)
     if normalized_channel == "stable":
         return spec.public_deb_registry_slug
+    if normalized_channel == "pr":
+        return PR_DEB_REGISTRY_SLUG
     return INTERNAL_DEB_REGISTRY_SLUG
 
 
@@ -2757,6 +2773,11 @@ def start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
 
 
 _CAMERA_SENSOR_TYPES = {"camera", "rgb", "depth_camera"}
+# Depth sensors appear under two vocabularies: ``asset.universal_schema``
+# types them ``depth_camera``, while ``capabilities`` types them ``depth``
+# with ``depth_camera`` as the sensor *id*. Both are matched so the check
+# holds whichever shape a twin carries.
+_DEPTH_SENSOR_TYPES = {"depth", "depth_camera"}
 _MICROPHONE_SENSOR_TYPES = {"audio", "audio_mono", "audio_stereo", "microphone"}
 _SPEAKER_SENSOR_TYPES = {"speaker", "loudspeaker", "speakerphone", "audio_out"}
 
@@ -2830,6 +2851,228 @@ def _list_camera_twins() -> list[tuple[str, str]]:
     return results
 
 
+def _load_twin_camera_serials() -> dict[str, str]:
+    """Return ``{twin_uuid: serial_number}`` for cached twins that pin one.
+
+    ``metadata.serial_number`` is hardware identity: the camera driver matches
+    it against the RealSense serial or udev's ``/dev/v4l/by-id`` tree, so a
+    twin carrying one has already answered "which physical camera" and needs
+    no positional ``/dev/videoN`` from the operator.  Twins without the field
+    are absent from the mapping, so callers can tell "unpinned" from "pinned".
+    """
+    serials: dict[str, str] = {}
+    for path in sorted(CONFIG_DIR.glob("*.json")):
+        if not _is_twin_object_file(path):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        metadata = data.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        serial = metadata.get("serial_number")
+        if not isinstance(serial, str) or not serial.strip():
+            continue
+        twin_uuid = str(data.get("uuid") or path.stem)
+        if twin_uuid:
+            serials[twin_uuid] = serial.strip()
+    return serials
+
+
+# udev's stable-name trees. Named as in the camera driver's ``main.py`` so the
+# two stay recognisably the same contract; overridden in tests to point at a
+# fixture directory.
+_V4L_BY_ID_DIR = "/dev/v4l/by-id"
+_V4L_BY_PATH_DIR = "/dev/v4l/by-path"
+_CAMERA_STREAM_SCHEMES = ("rtsp://", "rtsps://", "http://", "https://")
+# Marks a ``twin_to_device`` value as hardware identity rather than a video
+# source. Kept in sync with edge-core's ``_SERIAL_SOURCE_PREFIX``.
+_SERIAL_PIN_PREFIX = "serial:"
+
+
+def _stable_camera_device_prefixes() -> tuple[str, ...]:
+    """Path prefixes that name one physical camera rather than a position.
+
+    Mirrors the camera driver's ``_is_stable_device_identifier``: the by-id and
+    by-path trees embed serial or USB topology, so they survive replug, while
+    ``/dev/videoN`` and a bare index mean "whatever enumerated there this boot".
+    """
+    return (f"{_V4L_BY_ID_DIR}/", f"{_V4L_BY_PATH_DIR}/")
+
+
+def _is_camera_stream_url(value: str) -> bool:
+    """True when *value* is a network stream rather than a local device."""
+    return value.strip().lower().startswith(_CAMERA_STREAM_SCHEMES)
+
+
+def _is_local_stable_camera_device(value: str) -> bool:
+    """True when *value* is a udev stable name for a camera on *this* host.
+
+    Only these resolve to a ``/dev/video*`` node, so only these can be matched
+    against the discovery pass. Anything else stable (an RTSP/UDP URL) names a
+    source that needs no local device at all.
+    """
+    return value.strip().startswith(_stable_camera_device_prefixes())
+
+
+def _is_stable_camera_device(value: str) -> bool:
+    """True when *value* names one specific camera rather than a position.
+
+    Mirrors the camera driver's ``_is_stable_device_identifier`` exactly, so a
+    value this function accepts is one the driver will also refuse to
+    substitute away from.  The driver's rule, restated: a bare index or a
+    ``/dev/...`` node is positional; a ``by-id`` / ``by-path`` entry or any
+    other explicit source (URL) names one device.
+
+    Matching the driver matters in both directions.  Too narrow -- the previous
+    by-id/by-path/RTSP allow-list -- and a ``udp://`` pin reads as unpinned
+    here, so the installer offers it up for a learned serial that then
+    overrides it downstream.  Too wide and we would skip a prompt the driver
+    still needs answered.
+
+    Cameras without a serial in their USB descriptor (the Logitech C920 reports
+    ``iSerial 0``) can never be pinned by ``metadata.serial_number``, but udev
+    still publishes a stable name for them under ``/dev/v4l/by-id``. Treating
+    those as identity is what lets such a twin skip the mapping prompt.
+    """
+    candidate = value.strip()
+    if not candidate:
+        return False
+    if _is_local_stable_camera_device(candidate):
+        return True
+    try:
+        int(candidate)
+    except ValueError:
+        pass
+    else:
+        # A bare index is what ``_parse_camera_id`` turns into an OpenCV
+        # device number -- "whatever enumerated there", not a device.
+        return False
+    return not candidate.startswith("/dev/")
+
+
+def _load_twin_camera_devices() -> dict[str, str]:
+    """Return ``{twin_uuid: video_device}`` for cached twins pinning a stable one.
+
+    The companion to :func:`_load_twin_camera_serials` for hardware that has no
+    serial to pin. Only stable values are returned: a twin whose
+    ``metadata.video_device`` is an index or a ``/dev/videoN`` path has not
+    answered "which physical camera", so it must still be asked.
+    """
+    devices: dict[str, str] = {}
+    for path in sorted(CONFIG_DIR.glob("*.json")):
+        if not _is_twin_object_file(path):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        metadata = data.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        device = metadata.get("video_device")
+        if not isinstance(device, str) or not _is_stable_camera_device(device):
+            continue
+        twin_uuid = str(data.get("uuid") or path.stem)
+        if twin_uuid:
+            devices[twin_uuid] = device.strip()
+    return devices
+
+
+class _CameraPin(NamedTuple):
+    """A twin's already-answered "which camera", ready to persist.
+
+    ``device`` is the value written into ``cameras.json``'s ``twin_to_device``,
+    and it is not interchangeable with ``index``.  Edge-core renders a stored
+    index back as ``/dev/video{N}`` and injects it as
+    ``CYBERWAVE_METADATA_VIDEO_DEVICE``; the camera driver's entrypoint then
+    skips exporting the twin's own ``metadata.video_device`` because the
+    variable is already set.  So persisting the index for a device-pinned twin
+    silently downgrades a stable ``by-id`` pin into the positional path the
+    driver is allowed to substitute away from -- defeating the pin entirely.
+
+    Storing the stable string instead keeps the identity intact all the way
+    into the container.  ``index`` is still carried for the installer's own
+    bookkeeping (menu labels, default advancement), which is host-local and
+    never persisted.
+    """
+
+    label: str
+    index: int | None
+    device: int | str
+
+
+def _camera_device_nodes(cam: Any) -> list[str]:
+    """Every ``/dev/video*`` node a discovered camera owns.
+
+    A multi-node device (RealSense exposes depth, colour and IR siblings) is
+    matched on any of them, because a ``by-id`` symlink points at the capture
+    node, which is not necessarily the camera's ``primary_path``.
+    """
+    paths = getattr(cam, "paths", None)
+    if isinstance(paths, list) and paths:
+        return [str(p) for p in paths if p]
+    primary = getattr(cam, "primary_path", None)
+    return [str(primary)] if primary else []
+
+
+def _camera_index_for_device(cameras: list[Any], device: str) -> int | None:
+    """Index of the discovered camera *device* resolves to, or ``None``.
+
+    ``by-id`` / ``by-path`` entries are symlinks into ``/dev/videoN``, so the
+    link is resolved on this host and the target matched against each camera's
+    nodes. Returns ``None`` when the symlink is dangling — the camera it names
+    is not attached — so the caller can warn instead of binding a substitute.
+    """
+    candidate = device.strip()
+    if not candidate or _is_camera_stream_url(candidate):
+        return None
+    try:
+        target = os.path.realpath(candidate)
+    except OSError:
+        return None
+    if not target.startswith("/dev/video"):
+        return None
+    for i, cam in enumerate(cameras):
+        if target in _camera_device_nodes(cam):
+            index = getattr(cam, "index", None)
+            return index if index is not None else i
+    return None
+
+
+def _twin_has_depth_sensor(twin_uuid: str) -> bool:
+    """True when the cached twin declares a depth sensor.
+
+    Depth twins are addressed by librealsense, not V4L2, which changes what an
+    unmatched serial means -- see :func:`_detect_and_select_cameras`. Reads the
+    same cached JSON as :func:`_list_camera_twins`, and checks both sensor
+    vocabularies because assets differ in which one they populate.
+    """
+    path = CONFIG_DIR / f"{twin_uuid}.json"
+    if not _is_twin_object_file(path):
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    asset = data.get("asset") or {}
+    buckets = (
+        (asset.get("universal_schema") or {}).get("sensors"),
+        (data.get("capabilities") or {}).get("sensors"),
+    )
+    for bucket in buckets:
+        if not isinstance(bucket, list):
+            continue
+        for sensor in bucket:
+            if not isinstance(sensor, dict):
+                continue
+            if str(sensor.get("type", "")).strip().lower() in _DEPTH_SENSOR_TYPES:
+                return True
+    return False
+
+
 def _any_twin_has_camera_sensor() -> bool:
     """Check downloaded twin JSON files for camera-type sensors."""
     return bool(_list_camera_twins())
@@ -2899,6 +3142,30 @@ def _any_twin_has_speaker_sensor() -> bool:
     return bool(_list_speaker_twins())
 
 
+def _camera_identity_hint(cam: Any) -> str:
+    """The field that tells this camera apart from an identical sibling.
+
+    Two cameras of the same model render identical ``card`` strings, so the
+    menu's only other column -- ``/dev/videoN`` -- is what an operator ends up
+    choosing on. That is the one attribute that is *not* identity: it is
+    positional and moves on replug and reboot.
+
+    The serial is also the value that goes into ``metadata.serial_number``, so
+    showing it here is what lets an operator read a pin off the screen instead
+    of going back to the host with ``v4l2-ctl``. A camera that reports no
+    serial (the Logitech C920 ships an empty descriptor) falls back to its USB
+    port, the only thing distinguishing two identical such cameras -- and a
+    hint that this twin needs a ``video_device`` pin rather than a serial.
+    """
+    serial = (getattr(cam, "serial", None) or "").strip()
+    if serial:
+        return f"serial {serial}"
+    bus_info = (getattr(cam, "bus_info", None) or "").strip()
+    if bus_info:
+        return f"port {bus_info}"
+    return ""
+
+
 def _render_camera_menu(
     cameras: list[Any],
     *,
@@ -2919,18 +3186,37 @@ def _render_camera_menu(
         score = camera_likelihood_score(cam)
         assigned_to = assignments.get(idx)
         suffix = f"  [yellow](assigned to {assigned_to})[/yellow]" if assigned_to else ""
+        hint = _camera_identity_hint(cam)
+        hint_text = f"  {hint}" if hint else ""
         if score >= 40:
             label = (
                 f"  [bold cyan]{idx}[/bold cyan])  {cam.card}  "
-                f"[dim]{cam.primary_path}[/dim]{suffix}"
+                f"[dim]{cam.primary_path}{hint_text}[/dim]{suffix}"
             )
         else:
             label = (
-                f"  [dim]{idx})  {cam.card}  {cam.primary_path}  "
+                f"  [dim]{idx})  {cam.card}  {cam.primary_path}{hint_text}  "
                 f"(probably not a camera)[/dim]{suffix}"
             )
         console.print(label)
     return valid_indices
+
+
+def _camera_index_for_serial(cameras: list[Any], serial: str) -> int | None:
+    """Index of the discovered camera reporting *serial*, or ``None``.
+
+    Compared case-insensitively after stripping: udev and V4L2 disagree on
+    case for some vendors, and a stored value may carry whitespace from a
+    hand-edited twin.  Cameras that report no serial never match.
+    """
+    target = serial.strip().casefold()
+    if not target:
+        return None
+    for i, cam in enumerate(cameras):
+        cam_serial = (getattr(cam, "serial", None) or "").strip().casefold()
+        if cam_serial and cam_serial == target:
+            return cam.index if cam.index is not None else i
+    return None
 
 
 def _prompt_camera_index(
@@ -3013,6 +3299,54 @@ def _upload_cameras_to_edge_metadata(cameras_data: dict) -> bool:
         return False
 
 
+def _persist_twin_serial_numbers(twin_serials: dict[str, str]) -> int:
+    """Pin ``metadata.serial_number`` on twins the operator mapped by hand.
+
+    Turning one positional answer into stable hardware identity is what stops
+    the installer asking again: the next run resolves these twins from their
+    serial instead of prompting, and the driver stops depending on an index
+    that moves across reboots and replugs.  ``twins.update`` merges metadata
+    server-side, so only the single key is sent.
+
+    Best-effort by design — camera mapping must never block an install.
+    Returns the number of twins updated.
+    """
+    if not twin_serials:
+        return 0
+
+    from .credentials import load_credentials
+    from .utils import resolve_api_url
+
+    creds = load_credentials()
+    if not creds or not creds.token:
+        return 0
+
+    try:
+        from cyberwave import Cyberwave
+
+        client = Cyberwave(base_url=resolve_api_url(creds=creds), api_key=creds.token)
+    except Exception as exc:
+        console.print(f"[dim]Could not record camera serials: {exc}[/dim]")
+        return 0
+
+    updated = 0
+    for twin_uuid, serial in twin_serials.items():
+        try:
+            client.twins.update(twin_uuid, metadata={"serial_number": serial})
+            updated += 1
+        except Exception as exc:
+            console.print(
+                f"[yellow]Could not pin serial {serial} to twin "
+                f"{twin_uuid[:8]}…: {exc}[/yellow]"
+            )
+    if updated:
+        console.print(
+            f"[dim]Pinned camera serial on {updated} twin(s) — "
+            f"future installs resolve them without prompting.[/dim]"
+        )
+    return updated
+
+
 def _detect_and_select_cameras() -> None:
     """Discover cameras and prompt the user to map them to camera-bearing twins.
 
@@ -3021,6 +3355,12 @@ def _detect_and_select_cameras() -> None:
     connected alongside multiple physical cameras, the user is walked through a
     per-twin mapping so each twin ends up bound to a specific ``/dev/video*``
     device.
+
+    A twin that already pins ``metadata.serial_number`` is never prompted for:
+    the serial names the physical unit, and the discovery pass reports the same
+    serial per device, so the binding is computed rather than asked.  Twins
+    without one are prompted as before, and their answer is written back as a
+    serial so the question is asked at most once per camera.
 
     Best-effort: failures are logged but never block installation.
     """
@@ -3034,11 +3374,110 @@ def _detect_and_select_cameras() -> None:
         return
 
     camera_twins = _list_camera_twins()
+    twin_serials = _load_twin_camera_serials()
+    twin_devices = _load_twin_camera_devices()
     default_idx = cameras[0].index if cameras[0].index is not None else 0
+    cameras_by_index: dict[int, Any] = {
+        (cam.index if cam.index is not None else i): cam for i, cam in enumerate(cameras)
+    }
+    # Serials learned from manual answers, pinned back onto their twins below.
+    learned_serials: dict[str, str] = {}
+
+    def _serial_of(index: int) -> str | None:
+        """The discovered serial for a chosen menu index, when it reports one."""
+        cam = cameras_by_index.get(index)
+        value = (getattr(cam, "serial", None) or "").strip() if cam is not None else ""
+        return value or None
+
+    def _warn_unmatched_serial(twin_name: str, serial: str) -> None:
+        console.print(
+            f"[yellow]{twin_name} pins serial {serial}, which no attached camera "
+            f"reports.[/yellow]\n"
+            f"[dim]Its driver will refuse to start rather than open a different "
+            f"camera. Check the twin's metadata.serial_number.[/dim]"
+        )
+
+    def _warn_unverifiable_serial(twin_name: str, serial: str) -> None:
+        console.print(
+            f"[dim]{twin_name} pins serial {serial}, which this host cannot "
+            f"verify — a depth camera's librealsense serial is not visible to "
+            f"v4l2. Leaving it to the driver, which will fail rather than open "
+            f"a different camera if the value is wrong.[/dim]"
+        )
+
+    def _warn_unmatched_device(twin_name: str, device: str) -> None:
+        console.print(
+            f"[yellow]{twin_name} pins device {device}, which does not resolve on "
+            f"this host.[/yellow]\n"
+            f"[dim]Its driver will refuse to start rather than open a different "
+            f"camera. Check the twin's metadata.video_device.[/dim]"
+        )
+
+    def _pinned_camera(twin_uuid: str, twin_name: str) -> _CameraPin | None:
+        """How a twin that already names its camera should be bound.
+
+        Returns ``None`` when the twin is unpinned, or pinned to hardware this
+        host cannot see -- both fall back to asking rather than binding
+        whatever else is attached, and the mismatch is warned about here so
+        every caller reports it alike.
+
+        Otherwise returns a :class:`_CameraPin`.  Its ``index`` is ``None`` for
+        a source with no local node (an RTSP/UDP stream); its ``device`` is
+        what gets persisted, and is deliberately *not* always the index --
+        see :class:`_CameraPin`.
+
+        ``serial_number`` is checked first: it is the stronger identity, and a
+        twin carrying both should not be re-bound by the weaker one.
+        """
+        serial = twin_serials.get(twin_uuid)
+        if serial:
+            matched = _camera_index_for_serial(cameras, serial)
+            if matched is not None:
+                # The index is safe to persist here: the driver resolves the
+                # twin's own ``metadata.serial_number`` first and never reaches
+                # the injected video device.
+                return _CameraPin(f"serial {serial}", matched, matched)
+            if _twin_has_depth_sensor(twin_uuid):
+                # A depth camera reports two unrelated serials: the USB
+                # descriptor one that ``v4l2-ctl`` gives us, and librealsense's
+                # own, which nothing on this host can read. So a serial we
+                # cannot match here may still be a perfectly good pin, and
+                # treating it as wrong would be a false alarm.
+                #
+                # Prompting is also pointless for these twins: the answer is a
+                # ``/dev/videoN`` index, and ``_resolve_camera_source`` ignores
+                # it on the depth path because librealsense addresses the
+                # device by serial. Defer to the driver, which is the only
+                # thing that can actually resolve the value.
+                _warn_unverifiable_serial(twin_name, serial)
+                # Tagged rather than stored bare: a librealsense serial is an
+                # all-digit string, so edge-core's index coercion accepted it
+                # and rendered ``/dev/video213722070420`` -- a device that
+                # cannot exist, which made the driver log a "does not exist
+                # inside the container" warning on every healthy depth camera.
+                # The tag tells edge-core this is hardware identity, not a
+                # video source, so it injects no device at all.
+                return _CameraPin(
+                    f"serial {serial} (verified by driver)",
+                    None,
+                    f"{_SERIAL_PIN_PREFIX}{serial}",
+                )
+            _warn_unmatched_serial(twin_name, serial)
+            return None
+
+        device = twin_devices.get(twin_uuid)
+        if device:
+            if not _is_local_stable_camera_device(device):
+                return _CameraPin(f"source {device}", None, device)
+            matched = _camera_index_for_device(cameras, device)
+            if matched is not None:
+                return _CameraPin(f"device {device}", matched, device)
+            _warn_unmatched_device(twin_name, device)
+        return None
 
     def _save_cameras(
         selected_index: int | None,
-        twin_to_device: dict[str, int] | None,
+        twin_to_device: dict[str, int | str] | None,
     ) -> None:
         write_cameras_json(
             cameras,
@@ -3058,11 +3497,25 @@ def _detect_and_select_cameras() -> None:
     if len(cameras) == 1:
         cam = cameras[0]
         selected = cam.index if cam.index is not None else 0
-        twin_to_device = {twin_uuid: selected for twin_uuid, _ in camera_twins}
         console.print(f"\n[cyan]Detected camera:[/cyan] {cam.card} ({cam.primary_path})")
-        if len(camera_twins) > 1:
+        twin_to_device: dict[str, int | str] = {}
+        shared = 0
+        for twin_uuid, twin_name in camera_twins:
+            pin = _pinned_camera(twin_uuid, twin_name)
+            # A stream-pinned twin needs no local device, but it cannot simply
+            # be left out of the mapping either: edge-core falls back to the
+            # global ``selected_device`` for any twin it cannot find there, so
+            # omitting it injects /dev/video0 ahead of the twin's own
+            # metadata. Recording the source pins it explicitly.
+            if pin is not None and pin.index is None:
+                console.print(f"[dim]{twin_name} is served by {pin.label}.[/dim]")
+                twin_to_device[twin_uuid] = pin.device
+                continue
+            twin_to_device[twin_uuid] = pin.device if pin is not None else selected
+            shared += 1
+        if shared > 1:
             console.print(
-                f"[dim]All {len(camera_twins)} camera twin(s) will share this device.[/dim]"
+                f"[dim]All {shared} camera twin(s) will share this device.[/dim]"
             )
         _save_cameras(selected, twin_to_device or None)
         return
@@ -3070,6 +3523,27 @@ def _detect_and_select_cameras() -> None:
     # Single camera twin (or none known) with multiple cameras: keep the legacy
     # single-select flow so existing scripted installs remain unchanged.
     if len(camera_twins) <= 1:
+        if camera_twins:
+            twin_uuid, twin_name = camera_twins[0]
+            pin = _pinned_camera(twin_uuid, twin_name)
+            if pin is not None:
+                if pin.index is None:
+                    console.print(
+                        f"\n[green]{twin_name}[/green] is served by [cyan]{pin.label}"
+                        f"[/cyan] — no local camera to map."
+                    )
+                    # Persist the source rather than returning early: a
+                    # cameras.json left over from a previous install would
+                    # otherwise keep steering this twin at a local device.
+                    _save_cameras(None, {twin_uuid: pin.device})
+                    return
+                console.print(
+                    f"\n[green]{twin_name}[/green] is pinned to "
+                    f"[cyan]{pin.label}[/cyan] — bound to "
+                    f"{cameras_by_index[pin.index].primary_path} automatically."
+                )
+                _save_cameras(pin.index, {twin_uuid: pin.device})
+                return
         console.print(f"\n[bold]Detected {len(cameras)} camera(s):[/bold]\n")
         valid_indices = _render_camera_menu(cameras)
         console.print()
@@ -3083,6 +3557,15 @@ def _detect_and_select_cameras() -> None:
             return
         console.print(f"[green]Selected:[/green] {valid_indices[selected].card}")
         twin_to_device = {camera_twins[0][0]: selected} if camera_twins else {}
+        if camera_twins:
+            learned = _serial_of(selected)
+            # Mirror the multi-twin guard: a twin pinned by ``video_device``
+            # has already answered "which camera". Writing a learned serial
+            # over it would re-pin it to whatever was picked while its own
+            # camera was unplugged, and the driver prefers serial_number.
+            chosen_twin = camera_twins[0][0]
+            if learned and chosen_twin not in twin_serials and chosen_twin not in twin_devices:
+                _persist_twin_serial_numbers({chosen_twin: learned})
         _save_cameras(selected, twin_to_device or None)
         return
 
@@ -3095,13 +3578,41 @@ def _detect_and_select_cameras() -> None:
         "A device can be assigned to more than one twin if it is shared.[/dim]\n"
     )
 
-    twin_to_device: dict[str, int] = {}
+    twin_to_device: dict[str, int | str] = {}
     assignments_label: dict[int, str] = {}
     first_selected: int | None = None
     remaining_default = default_idx
 
+    def _advance_default() -> None:
+        """Prefer an unassigned device as the next prompt's default."""
+        nonlocal remaining_default
+        remaining = [idx for idx in cameras_by_index if idx not in assignments_label]
+        if remaining:
+            remaining_default = remaining[0]
+
     for twin_uuid, twin_name in camera_twins:
         console.print(f"[bold]Twin:[/bold] {twin_name} [dim]({twin_uuid[:8]}...)[/dim]")
+
+        pinned = twin_uuid in twin_serials or twin_uuid in twin_devices
+        pin = _pinned_camera(twin_uuid, twin_name)
+        if pin is not None:
+            if pin.index is None:
+                # Recorded, not skipped -- see the single-camera branch: an
+                # absent mapping inherits the global ``selected_device``.
+                twin_to_device[twin_uuid] = pin.device
+                console.print(f"[green]Served by[/green] [cyan]{pin.label}[/cyan]\n")
+                continue
+            twin_to_device[twin_uuid] = pin.device
+            assignments_label[pin.index] = twin_name
+            if first_selected is None:
+                first_selected = pin.index
+            _advance_default()
+            console.print(
+                f"[green]Bound by[/green] [cyan]{pin.label}[/cyan] → "
+                f"{cameras_by_index[pin.index].primary_path}\n"
+            )
+            continue
+
         valid_indices = _render_camera_menu(cameras, assignments=assignments_label)
         console.print()
         selected = _prompt_camera_index(
@@ -3120,17 +3631,18 @@ def _detect_and_select_cameras() -> None:
         assignments_label[selected] = twin_name
         if first_selected is None:
             first_selected = selected
-        # Prefer an unassigned device as the next default, but keep the current
-        # choice if every device has been touched.
-        remaining = [idx for idx in valid_indices if idx not in assignments_label]
-        if remaining:
-            remaining_default = remaining[0]
+        if not pinned:
+            learned = _serial_of(selected)
+            if learned:
+                learned_serials[twin_uuid] = learned
+        _advance_default()
         console.print(f"[green]Selected:[/green] {valid_indices[selected].card}\n")
 
     if not twin_to_device:
         console.print("[yellow]No cameras mapped — skipping camera config.[/yellow]")
         return
 
+    _persist_twin_serial_numbers(learned_serials)
     _save_cameras(first_selected, twin_to_device)
 
 
@@ -3160,6 +3672,19 @@ def setup_service(
     Returns True if everything succeeded.
     """
     _migrate_legacy_config_dir()
+
+    # Fail before any package index is touched: the PR registry holds builds
+    # from unrelated branches whose ordering is meaningless, so there is no
+    # sensible "latest" to fall back to. Asking up front also keeps the error
+    # identical on Debian (apt) and elsewhere (pip).
+    if _normalize_service_channel(channel) == "pr" and not version:
+        console.print(
+            "[red]--channel pr requires an explicit --version.[/red]\n"
+            "[dim]PR builds are not ordered against each other, so there is no latest "
+            "one to pick. Copy the version from the pull request's build comment, e.g.\n"
+            f"  {spec.sudo_command_hint} --channel pr --version 1.2.3~pr4337.gabc123def456[/dim]"
+        )
+        return False
 
     linux_service_setup = _is_linux()
     macos_launchagent_supported = _is_macos() and spec.supports_macos_launchagent
