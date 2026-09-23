@@ -495,6 +495,17 @@ For **microphone** twins, the installer sets up a PCM audio stream bridge on the
 
 On **Linux** with multiple camera-bearing twins, the installer walks you through a per-twin mapping so each twin is bound to a specific `/dev/video*` device. The mapping is saved to the backend as `Edge.metadata.cameras` and mirrored locally in `~/.cyberwave/edge.json`. Edge-core reads camera config from `edge.json` at startup; `~/.cyberwave/cameras.json` is kept as a legacy fallback but is deprecated.
 
+A twin that already pins its camera through `metadata.serial_number` is **not** prompted for: the installer matches that serial against the serials reported by the attached cameras and binds the twin automatically. Twins without a serial are asked as before, and the camera you choose is written back to the twin as its `serial_number` — so the prompt appears once per camera instead of on every install, and the binding survives a replug or a reboot that renumbers `/dev/video*`. If a pinned serial matches none of the attached cameras, the installer warns and asks rather than binding a different unit, because the driver refuses to substitute hardware for a pinned twin.
+
+Some cameras have no serial to pin — the Logitech C920, for instance, reports an empty USB serial descriptor, so `metadata.serial_number` can never identify it. For those, set `metadata.video_device` to a udev stable name instead and the twin is skipped in the same way:
+
+```
+/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920-video-index0      # follows the camera across ports
+/dev/v4l/by-path/platform-...-usb-0:1.3:1.0-video-index0     # follows the port, not the camera
+```
+
+Pick `by-id` when the model is unique on the host, `by-path` when you may attach a second identical camera and care which port it is in. An `rtsp://` or `http://` URL in the same field marks the twin as a network camera, which is likewise never asked about and consumes no local device. A positional value (`0`, `/dev/video6`) is **not** identity — it means "whatever enumerated there this boot" — so those twins are still prompted. `serial_number` wins when a twin carries both.
+
 ```bash
 sudo cyberwave edge install
 sudo cyberwave edge install -y   # skip prompts
@@ -511,6 +522,8 @@ sudo cyberwave edge install --reconfigure-microphone   # re-select microphone wi
 - `--reconfigure-camera`: Re-run the camera selection prompt and restart the camera stream and edge-core service. Useful when switching between cameras (e.g. laptop webcam to external USB camera).
 - `--reconfigure-microphone`: Re-run the microphone selection prompt and restart the audio stream bridge and edge-core service. Useful when switching microphones or fixing a broken PCM bridge.
 - `--force-reinstall`: Force reinstall of the USB/IP server on macOS. Camera stream and edge-core setup are always forced during install.
+- `--channel {stable,dev,staging,pr}`: Which build of `cyberwave-edge-core` to install. Defaults to `stable`. `pr` installs an unreviewed build of a single pull request and **requires `--version`** — PR builds are not ordered against each other, so there is no latest one to pick; copy the version from the pull request's build comment. It is meant for testing a change on hardware before it merges, not for running a device.
+- `--version`: Exact package version to install instead of the channel's latest. Required with `--channel pr`.
 - `-y`: Skip interactive confirmation prompts.
 
 ### `cyberwave edge uninstall`
@@ -528,7 +541,7 @@ sudo cyberwave edge uninstall --channel dev   # keep Docker images/containers
 
 **Options:**
 
-- `--channel {stable,dev,staging}`: When set to `dev` or `staging`, Docker images and containers are preserved so that a subsequent reinstall does not need to re-download them. This speeds up QA and development cycles and avoids unnecessary wear on SD cards.
+- `--channel {stable,dev,staging,pr}`: When set to `dev`, `staging` or `pr`, Docker images and containers are preserved so that a subsequent reinstall does not need to re-download them. This speeds up QA and development cycles and avoids unnecessary wear on SD cards.
 - `-y`: Skip interactive confirmation prompts.
 
 ### `cyberwave edge start / stop / restart`

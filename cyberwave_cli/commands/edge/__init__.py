@@ -532,16 +532,22 @@ def edge():
 )
 @click.option(
     "--channel",
-    type=click.Choice(["stable", "dev", "staging"], case_sensitive=False),
+    type=click.Choice(["stable", "dev", "staging", "pr"], case_sensitive=False),
     default="stable",
     show_default=True,
-    help="Which edge-core package channel to install",
+    help=(
+        "Which edge-core package channel to install. 'pr' installs an "
+        "unreviewed per-pull-request build and requires --version."
+    ),
 )
 @click.option(
     "--version",
     type=str,
     default=None,
-    help="Exact edge-core version to install from the selected channel",
+    help=(
+        "Exact edge-core version to install from the selected channel "
+        "(required for --channel pr, e.g. 1.2.3~pr4337.gabc123def456)"
+    ),
 )
 @click.option(
     "--force-reinstall",
@@ -779,7 +785,7 @@ def install_edge(
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
 @click.option(
     "--channel",
-    type=click.Choice(["stable", "dev", "staging"], case_sensitive=False),
+    type=click.Choice(["stable", "dev", "staging", "pr"], case_sensitive=False),
     default=None,
     help=(
         "Release channel the edge was installed from. "

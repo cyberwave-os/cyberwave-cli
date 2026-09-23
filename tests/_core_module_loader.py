@@ -57,10 +57,28 @@ def load_core_module(monkeypatch):
             return ""
 
     rich_console_module.Console = _Console
+    # ``cyberwave_cli.utils`` imports ``rich.table`` at module scope, and the
+    # stub package shadows the real one, so the submodule has to exist too or
+    # any test that reaches utils fails on an unrelated ImportError.
+    rich_table_module = ModuleType("rich.table")
+
+    class _Table:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def add_column(self, *_args, **_kwargs):
+            return None
+
+        def add_row(self, *_args, **_kwargs):
+            return None
+
+    rich_table_module.Table = _Table
+
     rich_prompt_module.Confirm = _Confirm
     rich_prompt_module.Prompt = _Prompt
     rich_module.console = rich_console_module
     rich_module.prompt = rich_prompt_module
+    rich_module.table = rich_table_module
 
     auth_module = ModuleType("cyberwave_cli.auth")
     auth_module.APIToken = object
@@ -91,6 +109,7 @@ def load_core_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "rich", rich_module)
     monkeypatch.setitem(sys.modules, "rich.console", rich_console_module)
     monkeypatch.setitem(sys.modules, "rich.prompt", rich_prompt_module)
+    monkeypatch.setitem(sys.modules, "rich.table", rich_table_module)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.auth", auth_module)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", cli_config_module)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", credentials_module)
