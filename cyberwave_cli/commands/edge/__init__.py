@@ -1338,6 +1338,47 @@ def restart_edge():
         console.print("[dim]Run 'cyberwave edge install' to reinstall it.[/dim]")
 
 
+@edge.command("update")
+@click.option(
+    "--version",
+    type=str,
+    default=None,
+    help=(
+        "Exact edge-core version to install from the installed channel, older ones "
+        "included (required for PR builds, e.g. 1.2.3~pr4337.gabc123def456)"
+    ),
+)
+@click.option(
+    "--check",
+    is_flag=True,
+    default=False,
+    help="Show the installed and available versions without changing anything",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Update even when the package is held with 'apt-mark hold'",
+)
+def update_edge(version, check, force):
+    """Update edge-core to the latest version of its channel and restart it.
+
+    The channel is the one of the installed package (stable, dev, staging or
+    pr); switch channel with 'cyberwave edge install --channel'. The service
+    restarts only when the version changed. Debian and Ubuntu hosts only.
+
+    \b
+    Examples:
+        cyberwave edge update --check
+        sudo cyberwave edge update
+        sudo cyberwave edge update --version 0.1.16
+    """
+    from ...core import update_edge_core
+
+    if not update_edge_core(version=version, check=check, force=force):
+        raise SystemExit(1)
+
+
 def _inspect_container_twin_uuid(container_name: str) -> str:
     """Extract CYBERWAVE_TWIN_UUID from a driver container's env vars."""
     try:

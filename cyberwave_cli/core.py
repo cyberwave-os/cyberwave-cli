@@ -88,6 +88,11 @@ BUILDKITE_DEB_REPO_URL = "https://packages.buildkite.com/cyberwave/cyberwave-edg
 BUILDKITE_GPG_KEY_URL = "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/gpgkey"
 BUILDKITE_KEYRING_PATH = Path("/etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg")
 
+# Fallback only. Edge-core owns its unit template
+# (cyberwave_edge_core/systemd_unit.py) and writes it through
+# ``cyberwave-edge-core __ensure-systemd-unit``; this copy is used for binaries
+# that predate that subcommand. Do not add new unit settings here; remove this
+# copy once the oldest supported edge-core ships ``__ensure-systemd-unit``.
 SYSTEMD_UNIT_TEMPLATE = textwrap.dedent("""\
     [Unit]
     Description=Cyberwave Edge Core Orchestrator
@@ -132,6 +137,9 @@ class ServiceSpec:
     requires_docker: bool
     supports_macos_launchagent: bool
     launch_command: tuple[str, ...]
+    # The binary writes its own unit (``__ensure-systemd-unit``); unit_template
+    # is then only the fallback for binaries that predate it.
+    binary_owns_unit: bool = False
 
 
 EDGE_CORE_SPEC = ServiceSpec(
@@ -152,6 +160,7 @@ EDGE_CORE_SPEC = ServiceSpec(
     requires_docker=True,
     supports_macos_launchagent=True,
     launch_command=(),
+    binary_owns_unit=True,
 )
 
 # ---- cloud node service constants -------------------------------------------
@@ -1929,29 +1938,79 @@ def _resolve_edge_core_package_name(channel: str | None) -> str:
         raise ValueError(f"Unsupported edge-core channel: {normalized_channel}") from exc
 
 
+@dataclass(frozen=True)
+class InstalledPackage:
+    name: str
+    version: str
+    channel: str
+
+
+def _apt_query(cmd: list[str]) -> subprocess.CompletedProcess[str] | None:
+    """Run a read-only dpkg/apt query, or return None when the tool is missing."""
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            # apt and dpkg translate their output; the parsers expect English.
+            env={**clean_subprocess_env(), "LC_ALL": "C"},
+        )
+    except FileNotFoundError:
+        return None
+
+
+def _installed_service_package(spec: ServiceSpec = EDGE_CORE_SPEC) -> InstalledPackage | None:
+    """Return the installed Debian package of the given service, or None if there is none."""
+    for channel, package_name in spec.package_channels.items():
+        result = _apt_query(
+            ["dpkg-query", "-W", "-f=${db:Status-Status} ${Version}", package_name]
+        )
+        if result is None:
+            return None
+        status, _, version = result.stdout.strip().partition(" ")
+        if result.returncode == 0 and status == "installed" and version:
+            return InstalledPackage(name=package_name, version=version, channel=channel)
+    return None
+
+
 def _resolve_installed_service_package_name(spec: ServiceSpec = EDGE_CORE_SPEC) -> str:
     """Best-effort detect which Debian package for the given service is currently installed."""
-    for package_name in spec.package_channels.values():
-        try:
-            result = subprocess.run(
-                ["dpkg-query", "-W", "-f=${db:Status-Status}", package_name],
-                capture_output=True,
-                text=True,
-                check=False,
-                env=clean_subprocess_env(),
-            )
-        except FileNotFoundError:
-            break
-
-        if result.returncode == 0 and result.stdout.strip() == "installed":
-            return package_name
-
-    return spec.package_name
+    installed = _installed_service_package(spec)
+    return installed.name if installed else spec.package_name
 
 
 def _resolve_installed_edge_core_package_name() -> str:
     """Best-effort detect which edge-core Debian package is currently installed."""
     return _resolve_installed_service_package_name(EDGE_CORE_SPEC)
+
+
+def _apt_get_update(env: dict[str, str]) -> None:
+    """Refresh the apt index, retrying transient CDN mirror sync failures.
+
+    After all attempts it warns and returns: apt then uses its cached index for
+    any failing source, and the install or query may still succeed.
+    """
+    apt_update_retries = 3
+    apt_update_retry_delay = 8  # seconds
+    for attempt in range(1, apt_update_retries + 1):
+        try:
+            _run(["apt-get", "update", "-qq"], env=env)
+            return
+        except subprocess.CalledProcessError:
+            if attempt < apt_update_retries:
+                console.print(
+                    f"[yellow]apt-get update failed (attempt {attempt}/{apt_update_retries}),"
+                    f" retrying in {apt_update_retry_delay}s"
+                    " (likely a transient mirror sync — will resolve shortly)...[/yellow]"
+                )
+                time.sleep(apt_update_retry_delay)
+            else:
+                console.print(
+                    "[yellow]apt-get update failed after all retries — "
+                    "one or more sources may be temporarily unavailable. "
+                    "Proceeding with cached package index...[/yellow]"
+                )
 
 
 def _apt_get_install(
@@ -1960,11 +2019,14 @@ def _apt_get_install(
     package_name: str | None = None,
     package_version: str | None = None,
     channel: str = "stable",
+    extra_install_args: tuple[str, ...] = (),
 ) -> bool:
     """Install a service package via apt-get.
 
     Adds the Buildkite package registry GPG key and source if not already
     configured, then installs (or upgrades) the requested version of the package.
+    *extra_install_args* are passed to ``apt-get install`` (for example
+    ``--allow-downgrades``).
 
     Returns True on success.
     """
@@ -2091,31 +2153,17 @@ def _apt_get_install(
     dpkg_force_unsafe_io = "-o=Dpkg::Options::=--force-unsafe-io"
 
     try:
-        # Retry apt-get update to handle transient CDN mirror sync failures.
-        # After all attempts, warn and continue — apt will use its cached index
-        # for any failing source and the install may still succeed.
-        apt_update_retries = 3
-        apt_update_retry_delay = 8  # seconds
-        for attempt in range(1, apt_update_retries + 1):
-            try:
-                _run(["apt-get", "update", "-qq"], env=apt_env)
-                break
-            except subprocess.CalledProcessError:
-                if attempt < apt_update_retries:
-                    console.print(
-                        f"[yellow]apt-get update failed (attempt {attempt}/{apt_update_retries}),"
-                        f" retrying in {apt_update_retry_delay}s"
-                        " (likely a transient mirror sync — will resolve shortly)...[/yellow]"
-                    )
-                    time.sleep(apt_update_retry_delay)
-                else:
-                    console.print(
-                        "[yellow]apt-get update failed after all retries — "
-                        "one or more sources may be temporarily unavailable. "
-                        "Proceeding with cached package index...[/yellow]"
-                    )
+        _apt_get_update(apt_env)
         _run(
-            ["apt-get", "install", "-y", "-qq", dpkg_force_unsafe_io, install_target],
+            [
+                "apt-get",
+                "install",
+                "-y",
+                "-qq",
+                dpkg_force_unsafe_io,
+                *extra_install_args,
+                install_target,
+            ],
             env=apt_env,
         )
     except subprocess.CalledProcessError as exc:
@@ -2630,8 +2678,66 @@ def clear_service_override(spec: ServiceSpec) -> None:
         console.print(f"[yellow]Could not remove override file: {override_file}[/yellow]")
 
 
+ENSURE_SYSTEMD_UNIT_SUBCOMMAND = "__ensure-systemd-unit"
+_ENSURE_SYSTEMD_UNIT_TIMEOUT_SECONDS = 120
+# Click's exit status for a usage error, such as a subcommand this binary does
+# not know. ``__ensure-systemd-unit`` itself only exits 0 or 1.
+_CLICK_USAGE_ERROR_EXIT = 2
+
+
+def _run_ensure_unit(binary: str, *args: str) -> subprocess.CompletedProcess[str] | None:
+    """Run ``<binary> __ensure-systemd-unit``; None when it could not run at all."""
+    try:
+        return subprocess.run(
+            [binary, ENSURE_SYSTEMD_UNIT_SUBCOMMAND, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=clean_subprocess_env(),
+            timeout=_ENSURE_SYSTEMD_UNIT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _ensure_unit_via_binary(spec: ServiceSpec, binary: str) -> bool:
+    """Ask the edge-core binary to write its own systemd unit.
+
+    Edge-core owns the unit template since the auto-update work (plan B1):
+    ``cyberwave-edge-core __ensure-systemd-unit --install`` renders it, writes
+    it only if it changed and runs ``daemon-reload``. It never restarts.
+
+    Returns False when the binary cannot do it (missing, too old to know the
+    subcommand, or any failure), so the caller falls back to the in-CLI
+    template.
+    """
+    result = _run_ensure_unit(
+        binary, "--install", "--binary-path", binary, "--config-dir", str(CONFIG_DIR)
+    )
+    if result is None:
+        return False
+    if result.returncode != 0:
+        if result.returncode != _CLICK_USAGE_ERROR_EXIT:
+            # A binary that knows the subcommand but failed: say why before
+            # the fallback tries (and likely reports the same problem).
+            output = f"{result.stdout or ''}{result.stderr or ''}".strip()
+            detail = output.splitlines()[-1] if output else ""
+            console.print(
+                f"[yellow]{spec.package_name} could not write its systemd unit "
+                f"(exit {result.returncode}); using the CLI template.[/yellow]"
+                + (f"\n[dim]{detail}[/dim]" if detail else "")
+            )
+        return False
+    console.print(f"[green]Created:[/green] {spec.unit_path}")
+    return True
+
+
 def create_systemd_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
     """Write the systemd unit file described by ``spec``.
+
+    For edge-core the binary owns the unit (``__ensure-systemd-unit``); the
+    CLI template below is only a fallback for binaries that predate it.
 
     Returns True on success.
     """
@@ -2640,6 +2746,9 @@ def create_systemd_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
         return False
 
     binary = _resolve_service_binary(spec)
+    if spec.binary_owns_unit and _ensure_unit_via_binary(spec, binary):
+        return True
+
     unit_contents = spec.unit_template.format(binary_path=binary, config_dir=CONFIG_DIR)
 
     try:
@@ -2714,6 +2823,145 @@ def restart_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
 
     console.print(f"[green]Service restarted:[/green] {spec.unit_name}")
     return True
+
+
+# ---- edge-core update (edge-core auto-update plan, B6) -----------------------
+
+
+def _apt_candidate_version(package_name: str) -> str | None:
+    """The version ``apt-get install`` would pick, from the local package index."""
+    result = _apt_query(["apt-cache", "policy", package_name])
+    if result is None:
+        return None
+    for line in result.stdout.splitlines():
+        key, _, value = line.strip().partition(":")
+        if key == "Candidate":
+            value = value.strip()
+            return value if value and value != "(none)" else None
+    return None
+
+
+def _apt_package_is_held(package_name: str) -> bool:
+    result = _apt_query(["apt-mark", "showhold"])
+    return result is not None and package_name in result.stdout.split()
+
+
+def _deb_version_is_newer(candidate: str, installed: str) -> bool:
+    result = _apt_query(["dpkg", "--compare-versions", candidate, "gt", installed])
+    if result is None:
+        return candidate != installed
+    return result.returncode == 0
+
+
+def _print_edge_core_update_check(installed: InstalledPackage, *, held: bool) -> None:
+    if os.geteuid() == 0:
+        _apt_get_update({**clean_subprocess_env(), "DEBIAN_FRONTEND": "noninteractive"})
+    else:
+        console.print("[dim]Using the cached package index; run with sudo to refresh it.[/dim]")
+    candidate = _apt_candidate_version(installed.name)
+    console.print(f"Package:   {installed.name} ({installed.channel} channel)")
+    console.print(f"Installed: {installed.version}")
+    console.print(f"Available: {candidate or 'unknown'}")
+    if held:
+        console.print(
+            "[yellow]The package is held (apt-mark hold); updating it needs --force.[/yellow]"
+        )
+    if installed.channel == "pr":
+        console.print(
+            "[dim]PR builds are not ordered against each other; update with --version.[/dim]"
+        )
+    elif candidate and _deb_version_is_newer(candidate, installed.version):
+        console.print("[cyan]An update is available: sudo cyberwave edge update[/cyan]")
+    else:
+        console.print("[green]Up to date.[/green]")
+
+
+def update_edge_core(
+    *, version: str | None = None, check: bool = False, force: bool = False
+) -> bool:
+    """Update the installed edge-core Debian package in place, then restart its service.
+
+    The installed package decides the channel, so ``update`` never switches
+    channel (that stays ``cyberwave edge install --channel``). With *version*
+    it installs that exact version, downgrades included. A held package is
+    refused unless *force*. The service is restarted only when the installed
+    version changed. Returns True on success.
+    """
+    spec = EDGE_CORE_SPEC
+    if not (_is_linux() and shutil.which("apt-get")):
+        console.print(
+            "[yellow]'cyberwave edge update' supports Debian and Ubuntu (apt) hosts "
+            "only.[/yellow]\n"
+            "[dim]On this host, reinstall instead: "
+            "cyberwave edge install --channel <channel> --version <version>[/dim]"
+        )
+        return False
+
+    installed = _installed_service_package(spec)
+    if installed is None:
+        console.print(
+            "[red]No edge-core Debian package is installed.[/red]\n"
+            f"[dim]Install it first: {spec.sudo_command_hint}[/dim]"
+        )
+        return False
+    held = _apt_package_is_held(installed.name)
+
+    if check:
+        _print_edge_core_update_check(installed, held=held)
+        return True
+
+    require_root("sudo cyberwave edge update")
+
+    if installed.channel == "pr" and not version:
+        console.print(
+            "[red]PR builds are not ordered against each other, so there is no latest one.[/red]\n"
+            "[dim]Pass the build from the pull request's comment: "
+            "sudo cyberwave edge update --version 1.2.3~pr4337.gabc123def456[/dim]"
+        )
+        return False
+    if held and not force:
+        console.print(
+            f"[red]{installed.name} is held (apt-mark hold), so it was not updated.[/red]\n"
+            f"[dim]Re-run with --force, or release the hold: "
+            f"sudo apt-mark unhold {installed.name}[/dim]"
+        )
+        return False
+
+    extra_install_args = (
+        *(("--allow-change-held-packages",) if held else ()),
+        # An explicit version is also how an operator rolls back.
+        *(("--allow-downgrades",) if version else ()),
+    )
+    if not _apt_get_install(
+        spec,
+        package_name=installed.name,
+        package_version=version,
+        channel=installed.channel,
+        extra_install_args=extra_install_args,
+    ):
+        return False
+
+    updated = _installed_service_package(spec)
+    new_version = updated.version if updated else None
+    if new_version == installed.version:
+        console.print(
+            f"[green]{installed.name} is already at {installed.version}; "
+            "nothing to restart.[/green]"
+        )
+        return True
+    console.print(f"[green]Updated {installed.name}: {installed.version} → {new_version}[/green]")
+
+    if not (_has_systemd() and spec.unit_path.exists()):
+        console.print(
+            "[yellow]No edge-core systemd service on this host; "
+            "start the new version with 'cyberwave edge start'.[/yellow]"
+        )
+        return True
+    # Best effort, the same call the deb postinst makes (normally a no-op by
+    # now). No flags, so the unit keeps its ExecStart and config dir; no CLI
+    # template fallback, which would replace the config dir with this shell's.
+    _run_ensure_unit(str(spec.binary_path))
+    return restart_service(spec)
 
 
 def stop_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
