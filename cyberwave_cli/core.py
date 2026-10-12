@@ -21,7 +21,7 @@ import tempfile
 import textwrap
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -44,7 +44,6 @@ from .credentials import (
     save_credentials,
 )
 
-from .device_matching import ambiguous_groups, infer_associations
 from .macos import (
     AUDIO_STREAMS_FILENAME,
     CAMERA_STREAMS_FILENAME,
@@ -2866,13 +2865,12 @@ def _list_camera_twins() -> list[tuple[str, str]]:
 
 
 def _load_twin_camera_serials() -> dict[str, str]:
-    """Return ``{twin_uuid: serial_number}`` for cached twins that pin one.
+    """Return ``{twin_uuid: serial_number}`` for cached twins that set one.
 
-    ``metadata.serial_number`` is hardware identity: the camera driver matches
-    it against the RealSense serial or udev's ``/dev/v4l/by-id`` tree, so a
-    twin carrying one has already answered "which physical camera" and needs
-    no positional ``/dev/videoN`` from the operator.  Twins without the field
-    are absent from the mapping, so callers can tell "unpinned" from "pinned".
+    A camera ``serial_number`` is either a raw hardware serial (RealSense, UVC),
+    which the driver resolves itself, or a by-id name left by an older
+    installer. Either way the twin has already answered "which physical camera".
+    Twins without the field are absent, so callers can tell unpinned from pinned.
     """
     serials: dict[str, str] = {}
     for path in sorted(CONFIG_DIR.glob("*.json")):
@@ -2909,6 +2907,95 @@ _V4L_NODE_RE = re.compile(r"-video-index(\d+)$")
 # ID_BUS prefixes udev puts on by-id names (same set as edge-core); tells a
 # stable name from a raw hardware serial.
 _UDEV_NAME_PREFIXES = ("usb-", "pci-", "platform-")
+
+
+# ---- sensor-agnostic twin <-> device matching ---------------------------------
+
+
+class _Inference(NamedTuple):
+    assigned: dict[str, tuple[Any, str]]  # twin -> (device, why it is certain)
+    unresolved: list[str]
+
+
+def _ambiguous_groups(units: Iterable[tuple[Hashable, bool]]) -> set[Hashable]:
+    """Group keys whose identical units cannot be told apart by their stable id.
+
+    *units* are ``(group key, has its own stable link)``. Identical units without
+    distinct ids collapse onto fewer links, which then identify none of them:
+    some-but-not-all linked means the whole group is ambiguous. No links at all
+    says nothing (no udev tree), and all linked is fine.
+    """
+    groups: dict[Hashable, list[bool]] = {}
+    for key, linked in units:
+        groups.setdefault(key, []).append(linked)
+    return {k for k, v in groups.items() if len(v) > 1 and any(v) and not all(v)}
+
+
+def _infer_associations(
+    twins: list[str],
+    devices: list[Any],
+    *,
+    claimed: set[Any],
+    compatible: Callable[[str, Any], bool],
+    limit: int = 20000,
+) -> _Inference:
+    """Pair twins with devices wherever the evidence leaves exactly one answer.
+
+    *claimed* are devices bound by another twin's verified pin (one sensor serves
+    one twin); *compatible* rules out impossible pairings (e.g. a microphone twin
+    with a playback-only card). Every full assignment is enumerated and a twin is
+    decided only when all agree on its device. With more twins than devices
+    nothing is decided: sharing is the operator's call. Gives up (decides
+    nothing) past *limit* assignments or as soon as no twin can be decided.
+    """
+    free = [d for d in devices if d not in claimed]
+    options = {t: [d for d in free if compatible(t, d)] for t in twins}
+    images: dict[str, set[Any]] = {t: set() for t in twins}
+    order = sorted(twins, key=lambda t: len(options[t]))
+    found = 0
+    stop = False
+
+    def walk(i: int, used: set[Any], current: dict[str, Any]) -> None:
+        nonlocal found, stop
+        if stop:
+            return
+        if i == len(order):
+            found += 1
+            for twin, device in current.items():
+                images[twin].add(device)
+            stop = found > limit or all(len(v) > 1 for v in images.values())
+            return
+        twin = order[i]
+        for device in options[twin]:
+            if device not in used:
+                used.add(device)
+                current[twin] = device
+                walk(i + 1, used, current)
+                used.discard(device)
+                current.pop(twin, None)
+
+    if twins:
+        walk(0, set(), {})
+    if not twins or found == 0 or stop:
+        return _Inference({}, list(twins))
+
+    assigned: dict[str, tuple[Any, str]] = {}
+    for twin in twins:
+        if len(images[twin]) != 1:
+            continue
+        (device,) = images[twin]
+        only = sum(1 for d in devices if compatible(twin, d)) == 1
+        assigned[twin] = (
+            device,
+            "the only attached device it can use"
+            if only
+            else "the only device left once the other twins' verified bindings "
+            "and sensor types are accounted for",
+        )
+    return _Inference(assigned, [t for t in twins if t not in assigned])
+
+
+# ---- udev by-id helpers -------------------------------------------------------
 
 
 class _UdevDevice(NamedTuple):
@@ -2986,7 +3073,10 @@ def _is_local_stable_camera_device(value: str) -> bool:
     against the discovery pass. Anything else stable (an RTSP/UDP URL) names a
     source that needs no local device at all.
     """
-    return value.strip().startswith(_stable_camera_device_prefixes())
+    candidate = value.strip()
+    return candidate.startswith(_stable_camera_device_prefixes()) and (
+        ".." not in candidate.split("/")
+    )
 
 
 def _is_stable_camera_device(value: str) -> bool:
@@ -3107,7 +3197,7 @@ def _udev_name_for_camera(cam: Any) -> str | None:
 
 def _ambiguous_camera_cards(cameras: list[Any]) -> set[Any]:
     """Models whose identical units udev collapsed onto fewer by-id links."""
-    return ambiguous_groups(
+    return _ambiguous_groups(
         (str(cam.card or ""), _udev_name_for_camera(cam) is not None) for cam in cameras
     )
 
@@ -3434,7 +3524,8 @@ def _persist_twin_pins(pins: dict[str, dict[str, str]]) -> int:
             updated += 1
         except Exception as exc:
             console.print(
-                f"[yellow]Could not pin device on twin {twin_uuid[:8]}…: {exc}[/yellow]"
+                f"[yellow]Could not pin device on twin {twin_uuid[:8]}…: {exc}. "
+                f"The twin keeps its previous pin.[/yellow]"
             )
     if updated:
         console.print(
@@ -3686,7 +3777,7 @@ def _detect_and_select_cameras() -> None:
                 pending.append(uuid_)
             elif pin.index is not None:
                 claimed.add(pin.index)
-        result = infer_associations(
+        result = _infer_associations(
             pending, list(cameras_by_index), claimed=claimed, compatible=lambda _t, _i: True
         )
         return {t: (d, why) for t, (d, why) in result.assigned.items() if _identity_of(d)}
@@ -3717,7 +3808,6 @@ def _detect_and_select_cameras() -> None:
         )
         return True
 
-    # Single physical camera: nothing to choose, every camera twin shares it.
     if len(cameras) == 1:
         cam = cameras[0]
         selected = cam.index if cam.index is not None else 0
@@ -3994,7 +4084,7 @@ def _detect_and_select_audio_devices() -> None:
         return
 
     cards = _discover_usb_audio_cards()
-    ambiguous = ambiguous_groups((c.usbid, bool(c.link)) for c in cards)
+    ambiguous = _ambiguous_groups((c.usbid, bool(c.link)) for c in cards)
     saved = {u: n for u, n in _load_twin_audio_pins().items() if u in twins}
     connected = {u: n for u, n in saved.items() if _udev_pin_is_connected(n, _ALSA_BY_ID_DIR)}
 
@@ -4040,7 +4130,7 @@ def _detect_and_select_audio_devices() -> None:
     for uuid_ in pending:
         name = twins[uuid_][0]
         # Unpinnable cards stay in the pool as rivals but are never paired automatically.
-        result = infer_associations(
+        result = _infer_associations(
             [u for u in pending if u not in pins],
             list(by_index),
             claimed={c.index for c in cards if c.link in taken},
@@ -4088,7 +4178,10 @@ def _detect_and_select_audio_devices() -> None:
             console.print("[yellow]No input available — skipping audio pinning.[/yellow]")
             break
         try:
-            _assign(uuid_, pool[int(raw)])
+            choice = int(raw)
+            if choice < 0:
+                raise IndexError(choice)
+            _assign(uuid_, pool[choice])
         except (ValueError, IndexError):
             console.print(f"[yellow]'{raw}' is not a listed device — skipping {name}.[/yellow]")
             continue

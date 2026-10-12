@@ -5,6 +5,7 @@ The ``by-id`` trees are redirected into ``tmp_path`` so no real ``/dev`` is read
 from __future__ import annotations
 
 import json
+import time
 
 from tests._core_module_loader import load_core_module
 from tests.test_camera_mapping import (
@@ -41,7 +42,7 @@ def _node(tmp_path, name: str) -> str:
 # ---- listing -----------------------------------------------------------------
 
 
-def test_list_v4l_by_id_keeps_live_capture_nodes_only(monkeypatch, tmp_path):
+def test_list_v4l_by_id_keeps_live_links_of_every_node(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
     live = _node(tmp_path, "video0")
     meta = _node(tmp_path, "video1")
@@ -52,12 +53,35 @@ def test_list_v4l_by_id_keeps_live_capture_nodes_only(monkeypatch, tmp_path):
         "_V4L_BY_ID_DIR",
         {
             C920: live,
-            C920.replace("index0", "index1"): meta,  # metadata node
+            C920.replace("index0", "index1"): meta,
             BRIO: str(tmp_path / "unplugged"),  # dangling
         },
     )
 
-    assert [d.name for d in core._list_v4l_by_id()] == [C920]
+    assert [d.name for d in core._list_v4l_by_id()] == [C920, C920.replace("index0", "index1")]
+
+
+def test_camera_name_comes_from_the_lowest_node_index_it_owns(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    colour, depth, meta = (_node(tmp_path, n) for n in ("video0", "video2", "video3"))
+    rs = "usb-Intel_RealSense_D435_RS1"
+    _tree(
+        monkeypatch,
+        core,
+        tmp_path,
+        "_V4L_BY_ID_DIR",
+        {f"{rs}-video-index3": meta, f"{rs}-video-index2": depth, f"{rs}-video-index0": colour},
+    )
+    cam = _FakeCam(0, "RealSense", colour, paths=[colour, depth, meta])
+    assert core._udev_name_for_camera(cam) == f"{rs}-video-index0"
+
+
+def test_camera_is_named_even_when_capture_is_not_index_zero(monkeypatch, tmp_path):
+    """No assumption that index0 is the capture node: any link to a node of the camera counts."""
+    core = load_core_module(monkeypatch)
+    node = _node(tmp_path, "video4")
+    _tree(monkeypatch, core, tmp_path, "_V4L_BY_ID_DIR", {"usb-Acme_Cam_77-video-index2": node})
+    assert core._udev_name_for_camera(_FakeCam(4, "Cam", node)) == "usb-Acme_Cam_77-video-index2"
 
 
 def test_list_alsa_by_id_and_missing_directory(monkeypatch, tmp_path):
@@ -97,13 +121,11 @@ def test_manual_camera_choice_is_pinned_as_its_by_id_name(monkeypatch, tmp_path)
     ]
     _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=["1"])
     recorded: dict[str, str] = {}
-    monkeypatch.setattr(core, "_persist_twin_serial_numbers", recorded.update)
+    monkeypatch.setattr(core, "_persist_twin_pins", recorded.update)
 
     core._detect_and_select_cameras()
 
-    # The by-id name wins over the descriptor serial and works for a camera
-    # that reports none.
-    assert recorded == {TWIN_A: C920}
+    assert recorded == {TWIN_A: core._camera_pin_metadata(C920)}
 
 
 def test_camera_menu_shows_the_by_id_name(monkeypatch, tmp_path):
@@ -133,8 +155,6 @@ def test_saved_by_id_pin_binds_without_prompting(monkeypatch, tmp_path):
     core._detect_and_select_cameras()
 
     data = json.loads((tmp_path / "cameras.json").read_text())
-    # The stable path, not an index; and the by-id name given as a serial moves
-    # to video_device because the camera driver cannot resolve it as a serial.
     assert data["twin_to_device"] == {TWIN_A: f"{core._V4L_BY_ID_DIR}/{C920}"}
     assert pinned == {TWIN_A: core._camera_pin_metadata(C920)}
 
@@ -160,17 +180,16 @@ def test_disconnected_by_id_pin_forces_a_new_choice_and_is_replaced(monkeypatch,
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
     node0, node1 = _node(tmp_path, "video0"), _node(tmp_path, "video1")
     _tree(monkeypatch, core, tmp_path, "_V4L_BY_ID_DIR", {BRIO: node1})
-    # Saved pin names a camera that is no longer attached.
     _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True, serial=C920)
 
     cameras = [_FakeCam(0, "Other", node0, serial=SERIAL_A), _FakeCam(1, "Brio", node1)]
     _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=["1"])
     recorded: dict[str, str] = {}
-    monkeypatch.setattr(core, "_persist_twin_serial_numbers", recorded.update)
+    monkeypatch.setattr(core, "_persist_twin_pins", recorded.update)
 
     core._detect_and_select_cameras()
 
-    assert recorded == {TWIN_A: BRIO}
+    assert recorded == {TWIN_A: core._camera_pin_metadata(BRIO)}
 
 
 def test_depth_twin_with_absent_by_id_pin_is_not_waved_through(monkeypatch, tmp_path):
@@ -183,7 +202,7 @@ def test_depth_twin_with_absent_by_id_pin_is_not_waved_through(monkeypatch, tmp_
 
     cameras = [_FakeCam(0, "A", node0), _FakeCam(1, "B", node1)]
     _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=["0"])
-    monkeypatch.setattr(core, "_persist_twin_serial_numbers", lambda _m: 0)
+    monkeypatch.setattr(core, "_persist_twin_pins", lambda _m: 0)
 
     core._detect_and_select_cameras()
 
@@ -201,7 +220,7 @@ def test_identical_cameras_sharing_one_link_are_unidentifiable(monkeypatch, tmp_
     _tree(monkeypatch, core, tmp_path, "_V4L_BY_ID_DIR", {C920: node1})  # video0 lost
 
     cams = [_FakeCam(0, "C920", node0), _FakeCam(1, "C920", node1)]
-    assert core._unidentifiable_cameras(cams) == {0, 1}
+    assert core._ambiguous_camera_cards(cams) == {"C920"}
 
 
 def test_identical_cameras_with_distinct_links_are_fine(monkeypatch, tmp_path):
@@ -210,7 +229,7 @@ def test_identical_cameras_with_distinct_links_are_fine(monkeypatch, tmp_path):
     _tree(monkeypatch, core, tmp_path, "_V4L_BY_ID_DIR", {C920: node0, BRIO: node1})
 
     cams = [_FakeCam(0, "C920", node0), _FakeCam(1, "C920", node1)]
-    assert core._unidentifiable_cameras(cams) == set()
+    assert core._ambiguous_camera_cards(cams) == set()
 
 
 def test_unidentifiable_camera_is_selectable_but_never_pinned(monkeypatch, tmp_path):
@@ -241,7 +260,6 @@ def test_camera_pin_metadata_uses_video_device_and_blanks_a_stale_serial(monkeyp
         "video_device": f"/dev/v4l/by-id/{C920}",
         "serial_number": "",
     }
-    # A hardware serial (depth / legacy) keeps the old contract.
     assert core._camera_pin_metadata(SERIAL_A) == {"serial_number": SERIAL_A}
 
 
@@ -541,7 +559,7 @@ def test_audio_two_twins_one_device_asks_to_share(monkeypatch, tmp_path):
 
     core._detect_and_select_audio_devices()
 
-    assert len(confirms) == 1 and "Use it for all of them?" in confirms[0]
+    assert len(confirms) == 2 and all("Only one device" in c for c in confirms)
     assert set(pinned) == {TWIN_A, TWIN_B}
 
 
@@ -567,12 +585,12 @@ def test_audio_two_twins_two_devices_asks_per_twin(monkeypatch, tmp_path):
         core,
         tmp_path,
         [_card(CARD_HEADSET, HEADSET), _card(CARD_MIC, MIC)],
-        answers=["1", "0"],
+        answers=["1"],
     )
 
     core._detect_and_select_audio_devices()
 
-    assert asked == ["Audio device for Mic A", "Audio device for Mic B"]
+    assert asked == ["Audio device for Mic A"]
     assert pinned == {
         TWIN_A: core._audio_pin_metadata(MIC),
         TWIN_B: core._audio_pin_metadata(HEADSET),
@@ -633,8 +651,6 @@ def test_audio_disconnected_pin_is_invalid_and_forces_a_choice(monkeypatch, tmp_
 
     core._detect_and_select_audio_devices()
 
-    # Exactly one capable device remains, but the twin's own pin did not
-    # resolve, so the substitute needs the operator's approval.
     assert len(confirms) == 1 and "is not connected" in confirms[0]
     assert pinned == {TWIN_A: core._audio_pin_metadata(HEADSET)}
 
@@ -655,7 +671,6 @@ def test_audio_identical_units_without_distinct_ids_are_never_pinned(monkeypatch
     core = load_core_module(monkeypatch)
     _write_audio_twin(tmp_path, TWIN_A, "Mic A")
     _write_audio_twin(tmp_path, TWIN_B, "Mic B")
-    # Two identical dongles; udev kept a single link for the pair.
     asked, _c, pinned = _audio_env(
         monkeypatch,
         core,
@@ -665,7 +680,6 @@ def test_audio_identical_units_without_distinct_ids_are_never_pinned(monkeypatch
 
     core._detect_and_select_audio_devices()
 
-    assert core._unidentifiable_usbids(core._discover_usb_audio_cards()) == {"046d:0825"}
     assert asked == []
     assert pinned == {}
 
@@ -680,12 +694,12 @@ def test_audio_identical_units_with_distinct_ids_are_both_usable(monkeypatch, tm
         core,
         tmp_path,
         [_card(CARD_MIC, MIC), _card(CARD_MIC, other)],
-        answers=["1", "0"],
+        answers=["1"],
     )
 
     core._detect_and_select_audio_devices()
 
-    assert asked == ["Audio device for Mic A", "Audio device for Mic B"]
+    assert asked == ["Audio device for Mic A"]
     assert pinned == {
         TWIN_A: core._audio_pin_metadata(other),
         TWIN_B: core._audio_pin_metadata(MIC),
@@ -733,90 +747,6 @@ def test_audio_is_a_no_op_off_linux_and_without_audio_twins(monkeypatch, tmp_pat
     assert asked == [] and pinned == {}
 
 
-# ---- generic inference -------------------------------------------------------
-
-
-def _any(_twin, _device):
-    return True
-
-
-def test_inference_decides_a_lone_twin_with_a_lone_device(monkeypatch):
-    core = load_core_module(monkeypatch)
-    result = core._infer_associations(["t"], ["d"], claimed=set(), compatible=_any)
-    assert result.assigned["t"][0] == "d" and result.unresolved == []
-
-
-def test_inference_leaves_identical_candidates_to_the_operator(monkeypatch):
-    core = load_core_module(monkeypatch)
-    result = core._infer_associations(["a", "b"], ["x", "y"], claimed=set(), compatible=_any)
-    assert result.assigned == {} and result.unresolved == ["a", "b"]
-
-
-def test_inference_eliminates_devices_claimed_by_verified_pins(monkeypatch):
-    core = load_core_module(monkeypatch)
-    result = core._infer_associations(["b"], ["x", "y"], claimed={"x"}, compatible=_any)
-    assert result.assigned["b"][0] == "y"
-    assert "left" in result.assigned["b"][1]
-
-
-def test_inference_uses_sensor_type_to_split_otherwise_identical_pairs(monkeypatch):
-    core = load_core_module(monkeypatch)
-    can = {("mic", "usb_mic"), ("spk", "usb_spk"), ("mic", "headset"), ("spk", "headset")}
-    result = core._infer_associations(
-        ["mic", "spk"],
-        ["usb_mic", "usb_spk"],
-        claimed=set(),
-        compatible=lambda t, d: (t, d) in can,
-    )
-    assert {t: d for t, (d, _w) in result.assigned.items()} == {"mic": "usb_mic", "spk": "usb_spk"}
-
-
-def test_inference_chains_eliminations(monkeypatch):
-    """a only fits x, so b is left with y, which settles c on z."""
-    core = load_core_module(monkeypatch)
-    fits = {"a": {"x"}, "b": {"x", "y"}, "c": {"y", "z"}}
-    result = core._infer_associations(
-        ["a", "b", "c"],
-        ["x", "y", "z"],
-        claimed=set(),
-        compatible=lambda t, d: d in fits[t],
-    )
-    assert {t: d for t, (d, _w) in result.assigned.items()} == {"a": "x", "b": "y", "c": "z"}
-
-
-def test_inference_decides_only_the_twins_all_assignments_agree_on(monkeypatch):
-    core = load_core_module(monkeypatch)
-    fits = {"a": {"x"}, "b": {"y", "z"}, "c": {"y", "z"}}
-    result = core._infer_associations(
-        ["a", "b", "c"],
-        ["x", "y", "z"],
-        claimed=set(),
-        compatible=lambda t, d: d in fits[t],
-    )
-    assert list(result.assigned) == ["a"] and result.unresolved == ["b", "c"]
-
-
-def test_inference_never_invents_a_pairing_when_devices_run_short(monkeypatch):
-    core = load_core_module(monkeypatch)
-    result = core._infer_associations(["a", "b"], ["x"], claimed=set(), compatible=_any)
-    assert result.assigned == {} and result.unresolved == ["a", "b"]
-
-
-def test_inference_with_nothing_free_decides_nothing(monkeypatch):
-    core = load_core_module(monkeypatch)
-    result = core._infer_associations(["a"], ["x"], claimed={"x"}, compatible=_any)
-    assert result.assigned == {}
-
-
-def test_inference_gives_up_rather_than_explode(monkeypatch):
-    core = load_core_module(monkeypatch)
-    devices = list(range(12))
-    result = core._infer_associations(
-        ["t%d" % i for i in range(12)], devices, claimed=set(), compatible=_any, limit=100
-    )
-    assert result.assigned == {}
-
-
 # ---- the evidence settles multi-sensor installs ------------------------------
 
 
@@ -845,7 +775,6 @@ def test_camera_verified_pin_settles_the_other_twin_among_two_cameras(monkeypatc
         TWIN_A: f"{core._V4L_BY_ID_DIR}/{BRIO}",
         TWIN_B: f"{core._V4L_BY_ID_DIR}/{C920}",
     }
-    # TWIN_A holds its by-id name as a serial: migrated; TWIN_B is newly paired.
     assert pinned == {
         TWIN_A: core._camera_pin_metadata(BRIO),
         TWIN_B: core._camera_pin_metadata(C920),
@@ -869,7 +798,6 @@ def test_camera_single_twin_among_many_with_one_identifiable_stays_a_question(
 
     core._detect_and_select_cameras()
 
-    # Two candidates, so the operator was asked (prompt answered "0").
     assert pinned == {TWIN_A: core._camera_pin_metadata(C920)}
 
 
@@ -924,12 +852,7 @@ def test_audio_verified_pin_settles_the_other_microphone(monkeypatch, tmp_path):
 
 
 def test_reinstall_with_saved_pins_is_never_silent(monkeypatch, tmp_path):
-    """Pins from the first install must not bind cameras without the operator.
-
-    This is the original report: after uninstall + install the cameras were
-    associated without a single question because the backend still carried
-    each twin's pin.
-    """
+    """After uninstall + install, saved pins must not bind cameras without asking."""
     core = load_core_module(monkeypatch)
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
     node0, node1 = _node(tmp_path, "video0"), _node(tmp_path, "video1")
@@ -940,14 +863,12 @@ def test_reinstall_with_saved_pins_is_never_silent(monkeypatch, tmp_path):
     _write_twin_json(tmp_path, TWIN_B, "Cam B", camera=True, video_device=brio_path)
     cams = [_FakeCam(0, "C920", node0), _FakeCam(1, "Brio", node1)]
 
-    # Keep: bindings come from the pins, and the operator was asked first.
     _patch_camera_helpers(monkeypatch, core, cams, prompt_inputs=[])
     confirms: list[str] = []
     monkeypatch.setattr(core.Confirm, "ask", lambda p, **k: confirms.append(p) or True)
     core._detect_and_select_cameras()
     assert confirms == ["Keep these existing camera bindings?"]
 
-    # Decline: every twin is asked again, answers may differ from the pins.
     _patch_camera_helpers(monkeypatch, core, cams, prompt_inputs=[])
     monkeypatch.setattr(core.Confirm, "ask", lambda *a, **k: False)
     asked: list[str] = []
@@ -962,7 +883,6 @@ def test_reinstall_with_saved_pins_is_never_silent(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "_persist_twin_pins", lambda p: pinned.update(p) or 0)
     core._detect_and_select_cameras()
 
-    # Cam A is asked; Cam B is then the only camera left, so it follows.
     assert asked == ["Camera for Cam A"]
     assert pinned[TWIN_A]["video_device"].endswith(BRIO)
     assert pinned[TWIN_B]["video_device"].endswith(C920)
@@ -1056,17 +976,6 @@ def test_declined_substitute_warns_that_edge_core_will_hold_the_twin(monkeypatch
     assert any("edge-core will" in line for line in printed)
 
 
-def test_inference_stops_early_when_nobody_can_be_decided(monkeypatch):
-    """Twelve interchangeable twins and devices must not enumerate 12! assignments."""
-    import time
-
-    core = load_core_module(monkeypatch)
-    started = time.monotonic()
-    result = core._infer_associations(
-        [f"t{i}" for i in range(12)], list(range(12)), claimed=set(), compatible=_any
-    )
-    assert result.assigned == {}
-    assert time.monotonic() - started < 1.0
 
 
 def test_udev_pin_name_rejects_non_udev_values_by_construction(monkeypatch):
@@ -1089,8 +998,6 @@ def test_keeping_a_by_id_serial_pin_queues_its_migration_only_when_used(monkeypa
     cams = [_FakeCam(0, "C920", node0), _FakeCam(1, "Brio", node1)]
     pinned: dict = {}
 
-    # Declined: the old value is dropped from view, so nothing is migrated for it;
-    # only the operator's fresh answer is written.
     _patch_camera_helpers(monkeypatch, core, cams, prompt_inputs=[])
     monkeypatch.setattr(core.Confirm, "ask", lambda *a, **k: False)
     monkeypatch.setattr(core, "_prompt_camera_index", lambda *a, **k: 1)
@@ -1098,9 +1005,158 @@ def test_keeping_a_by_id_serial_pin_queues_its_migration_only_when_used(monkeypa
     core._detect_and_select_cameras()
     assert pinned == {TWIN_A: core._camera_pin_metadata(BRIO)}
 
-    # Kept: the same twin is migrated to video_device without moving cameras.
     pinned.clear()
     _patch_camera_helpers(monkeypatch, core, cams, prompt_inputs=[])
     monkeypatch.setattr(core, "_persist_twin_pins", lambda p: pinned.update(p) or 0)
     core._detect_and_select_cameras()
     assert pinned == {TWIN_A: core._camera_pin_metadata(C920)}
+
+
+# ---- generic matching --------------------------------------------------------
+
+
+def _any(_twin, _device):
+    return True
+
+
+def test_inference_decides_a_lone_twin_with_a_lone_device(monkeypatch):
+    core = load_core_module(monkeypatch)
+    result = core._infer_associations(["t"], ["d"], claimed=set(), compatible=_any)
+    assert result.assigned["t"][0] == "d" and result.unresolved == []
+
+
+def test_inference_leaves_identical_candidates_to_the_operator(monkeypatch):
+    core = load_core_module(monkeypatch)
+    result = core._infer_associations(["a", "b"], ["x", "y"], claimed=set(), compatible=_any)
+    assert result.assigned == {} and result.unresolved == ["a", "b"]
+
+
+def test_inference_eliminates_devices_claimed_by_verified_pins(monkeypatch):
+    core = load_core_module(monkeypatch)
+    result = core._infer_associations(["b"], ["x", "y"], claimed={"x"}, compatible=_any)
+    assert result.assigned["b"][0] == "y"
+    assert "left" in result.assigned["b"][1]
+
+
+def test_inference_uses_sensor_type_to_split_otherwise_identical_pairs(monkeypatch):
+    core = load_core_module(monkeypatch)
+    can = {("mic", "usb_mic"), ("spk", "usb_spk"), ("mic", "headset"), ("spk", "headset")}
+    result = core._infer_associations(
+        ["mic", "spk"],
+        ["usb_mic", "usb_spk"],
+        claimed=set(),
+        compatible=lambda t, d: (t, d) in can,
+    )
+    assert {t: d for t, (d, _w) in result.assigned.items()} == {"mic": "usb_mic", "spk": "usb_spk"}
+
+
+def test_inference_chains_eliminations(monkeypatch):
+    core = load_core_module(monkeypatch)
+    """a only fits x, so b is left with y, which settles c on z."""
+    fits = {"a": {"x"}, "b": {"x", "y"}, "c": {"y", "z"}}
+    result = core._infer_associations(
+        ["a", "b", "c"],
+        ["x", "y", "z"],
+        claimed=set(),
+        compatible=lambda t, d: d in fits[t],
+    )
+    assert {t: d for t, (d, _w) in result.assigned.items()} == {"a": "x", "b": "y", "c": "z"}
+
+
+def test_inference_decides_only_the_twins_all_assignments_agree_on(monkeypatch):
+    core = load_core_module(monkeypatch)
+    fits = {"a": {"x"}, "b": {"y", "z"}, "c": {"y", "z"}}
+    result = core._infer_associations(
+        ["a", "b", "c"],
+        ["x", "y", "z"],
+        claimed=set(),
+        compatible=lambda t, d: d in fits[t],
+    )
+    assert list(result.assigned) == ["a"] and result.unresolved == ["b", "c"]
+
+
+def test_inference_never_invents_a_pairing_when_devices_run_short(monkeypatch):
+    core = load_core_module(monkeypatch)
+    result = core._infer_associations(["a", "b"], ["x"], claimed=set(), compatible=_any)
+    assert result.assigned == {} and result.unresolved == ["a", "b"]
+
+
+def test_inference_with_nothing_free_decides_nothing(monkeypatch):
+    core = load_core_module(monkeypatch)
+    result = core._infer_associations(["a"], ["x"], claimed={"x"}, compatible=_any)
+    assert result.assigned == {}
+
+
+def test_inference_gives_up_rather_than_explode(monkeypatch):
+    core = load_core_module(monkeypatch)
+    devices = list(range(12))
+    result = core._infer_associations(
+        ["t%d" % i for i in range(12)], devices, claimed=set(), compatible=_any, limit=100
+    )
+    assert result.assigned == {}
+
+
+def test_inference_stops_early_when_nobody_can_be_decided(monkeypatch):
+    core = load_core_module(monkeypatch)
+    """Twelve interchangeable twins and devices must not enumerate 12! assignments."""
+
+    started = time.monotonic()
+    result = core._infer_associations(
+        [f"t{i}" for i in range(12)], list(range(12)), claimed=set(), compatible=_any
+    )
+    assert result.assigned == {}
+    assert time.monotonic() - started < 1.0
+
+def test_ambiguous_groups_flags_only_partially_linked_groups(monkeypatch):
+    core = load_core_module(monkeypatch)
+    units = [
+        ("a", True), ("a", False),   # collapsed: one link for two units
+        ("b", True), ("b", True),    # each unit has its own link
+        ("c", False), ("c", False),  # no udev tree at all: says nothing
+        ("d", True),                 # a lone unit is never ambiguous
+    ]
+    assert core._ambiguous_groups(units) == {"a"}
+
+
+def test_audio_negative_index_is_not_a_listed_device(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    _write_audio_twin(tmp_path, TWIN_A, "Mic")
+    _a, _c, pinned = _audio_env(
+        monkeypatch,
+        core,
+        tmp_path,
+        [_card(CARD_HEADSET, HEADSET), _card(CARD_MIC, MIC)],
+        answers=["-1"],
+    )
+
+    core._detect_and_select_audio_devices()
+
+    assert pinned == {}
+
+
+def test_video_device_pin_with_parent_components_is_not_a_pin(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    directory = core._V4L_BY_ID_DIR
+    assert core._is_local_stable_camera_device(f"{directory}/{C920}")
+    assert not core._is_local_stable_camera_device(f"{directory}/../../video0")
+    assert not core._is_local_stable_camera_device(f"{directory}/..")
+
+
+def test_remapping_a_pinned_twin_writes_one_update_with_clear_and_new_pin(monkeypatch, tmp_path):
+    """The old pin is replaced in the same write that sets the new one, never before it."""
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    node0, node1 = _node(tmp_path, "video0"), _node(tmp_path, "video1")
+    _tree(monkeypatch, core, tmp_path, "_V4L_BY_ID_DIR", {C920: node0, BRIO: node1})
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True, serial=SERIAL_A)
+    cams = [_FakeCam(0, "C920", node0), _FakeCam(1, "Brio", node1)]
+    _patch_camera_helpers(monkeypatch, core, cams, prompt_inputs=[])
+    monkeypatch.setattr(core.Confirm, "ask", lambda *a, **k: False)
+    monkeypatch.setattr(core, "_prompt_camera_index", lambda *a, **k: 1)
+    calls: list[dict] = []
+    monkeypatch.setattr(core, "_persist_twin_pins", lambda p: calls.append(dict(p)) or 0)
+
+    core._detect_and_select_cameras()
+
+    assert calls == [{TWIN_A: core._camera_pin_metadata(BRIO)}]
+    assert core._camera_pin_metadata(BRIO)["serial_number"] == ""
