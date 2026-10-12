@@ -90,7 +90,7 @@ def test_audio_pin_is_written_then_read_back(env):
     core = env.core
     core._persist_twin_pins({TWIN_A: core._audio_pin_metadata(MIC)})
 
-    assert env.backend.metadata[TWIN_A] == {"serial_number": MIC, "audio_device": STABLE_AUDIO}
+    assert env.backend.metadata[TWIN_A] == {"audio_device": STABLE_AUDIO, "serial_number": ""}
     env.backend.download(env.dir)
     assert core._load_twin_audio_pins() == {TWIN_A: MIC}
 
@@ -172,7 +172,7 @@ def test_a_failed_update_does_not_stop_the_others(env):
         {TWIN_A: core._camera_pin_metadata(C920), TWIN_B: core._audio_pin_metadata(MIC)}
     )
     assert count == 1
-    assert env.backend.metadata[TWIN_B]["serial_number"] == MIC
+    assert env.backend.metadata[TWIN_B]["audio_device"] == STABLE_AUDIO
     assert env.backend.metadata[TWIN_A] == {}
 
 
@@ -247,3 +247,24 @@ def test_payloads_are_accepted_by_the_real_sdk_schema():
         {"serial_number": "", "video_device": ""},
     ):
         assert schema(metadata=sent).to_dict() == {"metadata": sent}
+
+
+def test_audio_by_id_name_in_serial_number_is_read_and_moved_to_audio_device(env):
+    core = env.core
+    env.backend.metadata[TWIN_A] = {"serial_number": MIC, "audio_device": STABLE_AUDIO}
+    env.backend.download(env.dir)
+    assert core._load_twin_audio_pins() == {TWIN_A: MIC}
+    assert core._load_twin_audio_serials() == {}
+
+    core._persist_twin_pins({TWIN_A: core._audio_pin_metadata(MIC)})
+
+    assert env.backend.metadata[TWIN_A] == {"serial_number": "", "audio_device": STABLE_AUDIO}
+
+
+def test_operator_audio_serial_is_a_serial_not_a_pin(env):
+    core = env.core
+    env.backend.metadata[TWIN_A] = {"serial_number": "00026"}
+    env.backend.download(env.dir)
+
+    assert core._load_twin_audio_serials() == {TWIN_A: "00026"}
+    assert core._load_twin_audio_pins() == {}

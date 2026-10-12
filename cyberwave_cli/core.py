@@ -3394,9 +3394,8 @@ def _render_camera_menu(
 def _camera_index_for_serial(cameras: list[Any], serial: str) -> int | None:
     """Index of the discovered camera reporting *serial*, or ``None``.
 
-    Compared case-insensitively after stripping: udev and V4L2 disagree on
-    case for some vendors, and a stored value may carry whitespace from a
-    hand-edited twin.  Cameras that report no serial never match.
+    A serial reported by V4L2 is compared case-insensitively after stripping. One
+    that only appears in a by-id name is matched exactly, as the driver does.
     """
     target = serial.strip().casefold()
     if not target:
@@ -3408,6 +3407,17 @@ def _camera_index_for_serial(cameras: list[Any], serial: str) -> int | None:
     name = _udev_pin_name(serial, _V4L_BY_ID_DIR)
     if name is not None:
         return _camera_index_for_device(cameras, os.path.join(_V4L_BY_ID_DIR, name))
+    # Like the driver: a raw serial is the delimited field of a by-id name, index0 first.
+    field = re.compile(rf"_{re.escape(serial.strip())}-video-index(\d+)$")
+    matches = sorted(
+        (int(m.group(1)), d.name)
+        for d in _list_v4l_by_id()
+        if (m := field.search(d.name))
+    )
+    for _node, link in matches:
+        found = _camera_index_for_device(cameras, os.path.join(_V4L_BY_ID_DIR, link))
+        if found is not None:
+            return found
     return None
 
 
@@ -3494,9 +3504,9 @@ def _upload_cameras_to_edge_metadata(cameras_data: dict) -> bool:
 def _persist_twin_pins(pins: dict[str, dict[str, str]]) -> int:
     """Write device-identity metadata onto twins, best-effort (never blocks install).
 
-    Cameras get ``video_device`` (by-id path) and a blanked ``serial_number``: the
-    camera driver does not accept a by-id name there and ranks a serial above
-    ``video_device``. Audio gets ``serial_number`` (by-id name) and ``audio_device``.
+    Cameras and audio alike get their by-id path (``video_device`` / ``audio_device``)
+    and a blanked ``serial_number``: a serial outranks the device field in both
+    drivers. A serial the operator set is never written here.
     """
     pins = {u: m for u, m in pins.items() if u and m}
     if not pins:
@@ -4011,11 +4021,9 @@ def _discover_usb_audio_cards() -> list[_AudioCard]:
     return cards
 
 
-def _load_twin_audio_pins() -> dict[str, str]:
-    """{twin_uuid: by-id name} for cached twins pinning an audio device via
-    serial_number or audio_device; raw hardware serials are not audio pins.
-    """
-    pins: dict[str, str] = {}
+def _cached_twin_metadata() -> dict[str, dict[str, Any]]:
+    """{twin_uuid: metadata} from the twin JSON files downloaded at install."""
+    found: dict[str, dict[str, Any]] = {}
     for path in sorted(CONFIG_DIR.glob("*.json")):
         if not _is_twin_object_file(path):
             continue
@@ -4024,51 +4032,67 @@ def _load_twin_audio_pins() -> dict[str, str]:
         except Exception:
             continue
         metadata = data.get("metadata")
-        if not isinstance(metadata, dict):
-            continue
+        if isinstance(metadata, dict):
+            found[str(data.get("uuid") or path.stem)] = metadata
+    return found
+
+
+def _load_twin_audio_pins() -> dict[str, str]:
+    """{twin_uuid: by-id name} for cached twins whose serial_number or audio_device
+    names a /dev/snd/by-id link; raw hardware serials are not audio pins.
+    """
+    pins: dict[str, str] = {}
+    for uuid_, metadata in _cached_twin_metadata().items():
         for key in ("serial_number", "audio_device"):
             value = metadata.get(key)
-            if not isinstance(value, str):
-                continue
-            name = _udev_pin_name(value, _ALSA_BY_ID_DIR)
+            name = _udev_pin_name(value, _ALSA_BY_ID_DIR) if isinstance(value, str) else None
             if name is not None:
-                pins[str(data.get("uuid") or path.stem)] = name
+                pins[uuid_] = name
                 break
     return pins
 
 
-def _microphone_driver_can_select(name: str) -> bool:
-    """True when the microphone driver's serial lookup selects exactly *name*.
-
-    The driver matches ``_<serial>-<n>`` against /dev/snd/by-id and edge-core
-    derives that serial from the pinned name (``usb-miniDSP_UMA16v2_00026-00``
-    -> ``UMA16v2_00026``). A name with no such part, or one the lookup would
-    share with another unit, is refused there, so pinning it would leave the
-    twin held forever.
+def _load_twin_audio_serials() -> dict[str, str]:
+    """{twin_uuid: serial} for twins whose serial_number is a hardware serial an
+    operator set; a by-id link name there is a legacy pin, not a serial.
     """
-    base = re.sub(r"-\d+$", "", name)
-    if "_" not in base:
-        return False
-    token = base.split("_", 1)[1]
-    pattern = re.compile(rf"_{re.escape(token)}-\d+$")
-    try:
-        entries = sorted(os.listdir(_ALSA_BY_ID_DIR))
-    except OSError:
-        return False
-    return [e for e in entries if pattern.search(e)] == [name]
+    serials: dict[str, str] = {}
+    for uuid_, metadata in _cached_twin_metadata().items():
+        value = metadata.get("serial_number")
+        if isinstance(value, str) and value.strip():
+            if _udev_pin_name(value, _ALSA_BY_ID_DIR) is None:
+                serials[uuid_] = value.strip()
+    return serials
+
+
+def _audio_card_for_serial(cards: list[_AudioCard], serial: str) -> _AudioCard | None:
+    """The one card whose by-id link carries *serial* as its delimited serial field.
+
+    Same rule as the microphone driver (``_<serial>-<N>`` at the end of the link
+    name). ALSA reports no serial, so the link name is the only place to match.
+    """
+    serial = serial.strip()
+    if not serial:
+        return None
+    field = re.compile(rf"_{re.escape(serial)}-\d+$")
+    matches = [c for c in cards if c.link and field.search(c.link)]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _audio_pin_metadata(name: str) -> dict[str, str]:
-    return {"serial_number": name, "audio_device": f"{_ALSA_BY_ID_DIR}/{name}"}
+    """Pin an audio device to its by-id link, as cameras pin theirs."""
+    return {"audio_device": f"{_ALSA_BY_ID_DIR}/{name}", "serial_number": ""}
 
 
 def _detect_and_select_audio_devices() -> None:
     """Associate each microphone/speaker twin with a /dev/snd/by-id device (Linux).
 
-    A saved pin whose link exists is reused; a missing one forces a new choice
-    (a substitute needs approval). Unambiguous pairings are made automatically,
-    anything else is a menu, or a confirmation when only one device is left.
-    Identical units udev collapsed onto one link are never pinned. Best-effort.
+    Same contract as cameras. A serial an operator set on the twin is checked
+    first and kept; a saved by-id link is reused when connected. A new choice is
+    written as audio_device plus a blank serial. Anything whose device is missing
+    is replaced only with approval; unambiguous pairings are automatic, the rest
+    is a menu. Identical units udev collapsed onto one link are never pinned.
+    Best-effort.
     """
     if platform.system() != "Linux":
         return
@@ -4085,10 +4109,29 @@ def _detect_and_select_audio_devices() -> None:
 
     cards = _discover_usb_audio_cards()
     ambiguous = _ambiguous_groups((c.usbid, bool(c.link)) for c in cards)
-    saved = {u: n for u, n in _load_twin_audio_pins().items() if u in twins}
+    serials = {u: s for u, s in _load_twin_audio_serials().items() if u in twins}
+    saved = {u: n for u, n in _load_twin_audio_pins().items() if u in twins and u not in serials}
     connected = {u: n for u, n in saved.items() if _udev_pin_is_connected(n, _ALSA_BY_ID_DIR)}
+    by_serial: dict[str, str] = {}
+    for uuid_, serial in serials.items():
+        card = _audio_card_for_serial(cards, serial)
+        if card is not None and card.link:
+            by_serial[uuid_] = card.link
 
     console.print("\n[bold]Audio devices[/bold]")
+    for uuid_, serial in serials.items():
+        if uuid_ in by_serial:
+            console.print(
+                f"  {twins[uuid_][0]}: pinned by serial {serial} -> "
+                f"[cyan]{by_serial[uuid_]}[/cyan] (connected)"
+            )
+        else:
+            console.print(
+                f"[yellow]{twins[uuid_][0]} pins serial {serial}, which no attached audio "
+                f"device reports.[/yellow]\n"
+                f"[dim]Its driver will refuse to start rather than open a different "
+                f"device. Check the twin's metadata.serial_number.[/dim]"
+            )
     for card in cards:
         if card.usbid in ambiguous:
             console.print(
@@ -4105,23 +4148,38 @@ def _detect_and_select_audio_devices() -> None:
                 f"  {twins[uuid_][0]}: [yellow]saved device {name} is not connected "
                 f"— it must be selected again[/yellow]"
             )
-    if connected and not _ask_yes_no("Keep these existing audio bindings?"):
+    # With a single device there is nothing to re-map, so nothing to ask.
+    if (
+        (connected or by_serial)
+        and len(cards) > 1
+        and not _ask_yes_no("Keep these existing audio bindings?")
+    ):
         connected.clear()
+        by_serial.clear()
+        serials.clear()
+        saved.clear()
 
-    pending = [u for u in twins if u not in connected]
-    taken: dict[str, str] = {n: twins[u][0] for u, n in connected.items()}
+    pending = [u for u in twins if u not in connected and u not in by_serial]
+    taken: dict[str, str] = {
+        link: twins[u][0] for u, link in {**connected, **by_serial}.items()
+    }
     pins: dict[str, dict[str, str]] = {}
     by_index = {c.index: c for c in cards}
+    cached = _cached_twin_metadata()
+
+    # Bring twins written by an older installer (link name in serial_number) to the new shape.
+    for uuid_, name in connected.items():
+        metadata = cached.get(uuid_, {})
+        current = metadata.get("audio_device") == f"{_ALSA_BY_ID_DIR}/{name}"
+        if not current or str(metadata.get("serial_number") or "").strip():
+            pins[uuid_] = _audio_pin_metadata(name)
 
     def _can_serve(uuid_: str, card: _AudioCard) -> bool:
         _name, needs_capture, needs_playback = twins[uuid_]
         return (card.capture or not needs_capture) and (card.playback or not needs_playback)
 
-    def _pinnable(uuid_: str, card: _AudioCard) -> bool:
-        if not card.link or card.usbid in ambiguous:
-            return False
-        # Edge-core hands a microphone driver a bare serial it must be able to match.
-        return not twins[uuid_][1] or _microphone_driver_can_select(card.link)
+    def _pinnable(card: _AudioCard) -> bool:
+        return bool(card.link) and card.usbid not in ambiguous
 
     def _assign(uuid_: str, card: _AudioCard) -> None:
         pins[uuid_] = _audio_pin_metadata(card.link or "")
@@ -4137,12 +4195,17 @@ def _detect_and_select_audio_devices() -> None:
             compatible=lambda t, i: _can_serve(t, by_index[i]),
         )
         decided = result.assigned.get(uuid_)
-        if decided and _pinnable(uuid_, by_index[decided[0]]):
+        if decided and _pinnable(by_index[decided[0]]):
             card = by_index[decided[0]]
-            if uuid_ not in saved or _ask_yes_no(
-                f"{name}'s saved device {saved[uuid_]} is not connected. "
-                f"Use {card.link} instead?",
-                on_eof=False,
+            missing = (
+                f"saved device {saved[uuid_]} is not connected"
+                if uuid_ in saved
+                else f"serial {serials[uuid_]} matches no attached device"
+                if uuid_ in serials
+                else None
+            )
+            if missing is None or _ask_yes_no(
+                f"{name}'s {missing}. Use {card.link} instead?", on_eof=False
             ):
                 console.print(
                     f"[green]{name}[/green]: associated automatically with "
@@ -4151,11 +4214,11 @@ def _detect_and_select_audio_devices() -> None:
                 _assign(uuid_, card)
                 continue
 
-        pool = [c for c in cards if _pinnable(uuid_, c) and _can_serve(uuid_, c)]
+        pool = [c for c in cards if _pinnable(c) and _can_serve(uuid_, c)]
         if not pool:
             console.print(
                 f"[yellow]No USB audio device that can be pinned reliably was found for "
-                f"{name} (it needs a distinct udev id the driver can match). "
+                f"{name} (it needs a distinct udev id). "
                 f"Plug one in and run: cyberwave edge install[/yellow]"
             )
             continue
@@ -4185,7 +4248,7 @@ def _detect_and_select_audio_devices() -> None:
         except (ValueError, IndexError):
             console.print(f"[yellow]'{raw}' is not a listed device — skipping {name}.[/yellow]")
             continue
-        console.print(f"[green]Selected:[/green] {pins[uuid_]['serial_number']}")
+        console.print(f"[green]Selected:[/green] {pins[uuid_]['audio_device']}")
 
     _persist_twin_pins(pins)
 

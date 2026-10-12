@@ -263,11 +263,15 @@ def test_camera_pin_metadata_uses_video_device_and_blanks_a_stale_serial(monkeyp
     assert core._camera_pin_metadata(SERIAL_A) == {"serial_number": SERIAL_A}
 
 
-def test_audio_pin_metadata_sets_identity_and_source(monkeypatch):
+def test_audio_pin_metadata_matches_the_camera_shape(monkeypatch):
     core = load_core_module(monkeypatch)
     assert core._audio_pin_metadata(MIC) == {
-        "serial_number": MIC,
         "audio_device": f"/dev/snd/by-id/{MIC}",
+        "serial_number": "",
+    }
+    assert core._camera_pin_metadata(C920) == {
+        "video_device": f"/dev/v4l/by-id/{C920}",
+        "serial_number": "",
     }
 
 
@@ -300,7 +304,7 @@ def test_persist_twin_pins_sends_exactly_the_given_metadata(monkeypatch):
     assert count == 2
     assert calls == [
         (TWIN_A, {"video_device": f"/dev/v4l/by-id/{C920}", "serial_number": ""}),
-        (TWIN_B, {"serial_number": MIC, "audio_device": f"/dev/snd/by-id/{MIC}"}),
+        (TWIN_B, {"audio_device": f"/dev/snd/by-id/{MIC}", "serial_number": ""}),
     ]
 
 
@@ -455,6 +459,10 @@ def _audio_env(monkeypatch, core, tmp_path, cards, *, confirm=True, answers=()):
     return asked, confirms, pinned
 
 
+def _audio_pin(core, name):
+    return {"audio_device": f"{core._ALSA_BY_ID_DIR}/{name}", "serial_number": ""}
+
+
 def _card(spec, link):
     return (*spec[:1], spec[1], spec[2], spec[3], link)
 
@@ -599,15 +607,14 @@ def test_audio_two_twins_two_devices_asks_per_twin(monkeypatch, tmp_path):
 
 def test_audio_connected_pin_is_reused_without_asking(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
-    _write_audio_twin(tmp_path, TWIN_A, "Mic", serial=MIC)
     asked, confirms, pinned = _audio_env(
         monkeypatch, core, tmp_path, [_card(CARD_MIC, MIC)]
     )
+    _write_audio_twin(tmp_path, TWIN_A, "Mic", extra=_audio_pin(core, MIC))
 
     core._detect_and_select_audio_devices()
 
-    assert asked == []
-    assert confirms == ["Keep these existing audio bindings?"]
+    assert asked == [] and confirms == []  # one device: nothing to keep or redo
     assert pinned == {}
 
 
@@ -832,14 +839,14 @@ def test_camera_manual_answers_settle_the_remaining_twin(monkeypatch, tmp_path):
 
 def test_audio_verified_pin_settles_the_other_microphone(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
-    _write_audio_twin(tmp_path, TWIN_A, "Mic A", serial=MIC)
-    _write_audio_twin(tmp_path, TWIN_B, "Mic B")
     asked, confirms, pinned = _audio_env(
         monkeypatch,
         core,
         tmp_path,
         [_card(CARD_MIC, MIC), _card(CARD_HEADSET, HEADSET)],
     )
+    _write_audio_twin(tmp_path, TWIN_A, "Mic A", extra=_audio_pin(core, MIC))
+    _write_audio_twin(tmp_path, TWIN_B, "Mic B")
 
     core._detect_and_select_audio_devices()
 
@@ -910,52 +917,7 @@ def test_remapping_to_an_unpinnable_camera_clears_the_old_pin(monkeypatch, tmp_p
     assert data["twin_to_device"] == {TWIN_A: 1}
 
 
-# ---- compatibility with what edge-core and the microphone driver accept ------
 
-
-def test_microphone_driver_selection_mirrors_edge_core(monkeypatch, tmp_path):
-    core = load_core_module(monkeypatch)
-    _audio_env(
-        monkeypatch,
-        core,
-        tmp_path,
-        [_card(CARD_MIC, MIC), _card(CARD_HEADSET, HEADSET)],
-    )
-    assert core._microphone_driver_can_select(MIC)
-    assert core._microphone_driver_can_select(HEADSET)
-    assert not core._microphone_driver_can_select("usb-Weird-00")  # no serial-like part
-    assert not core._microphone_driver_can_select("usb-Absent_Thing_1-00")  # not attached
-
-
-def test_microphone_driver_cannot_tell_two_units_apart_by_serial_token(monkeypatch, tmp_path):
-    """Edge-core refuses such a pin and would hold the twin, so never offer it."""
-    core = load_core_module(monkeypatch)
-    _write_audio_twin(tmp_path, TWIN_A, "Mic")
-    asked, _c, pinned = _audio_env(
-        monkeypatch,
-        core,
-        tmp_path,
-        [
-            _card(CARD_MIC, "usb-A_Generic_USB_Audio-00"),
-            _card(CARD_HEADSET, "usb-B_Generic_USB_Audio-00"),
-        ],
-    )
-
-    core._detect_and_select_audio_devices()
-
-    assert asked == [] and pinned == {}
-
-
-def test_speaker_twin_does_not_need_the_microphone_serial_token(monkeypatch, tmp_path):
-    core = load_core_module(monkeypatch)
-    _write_audio_twin(tmp_path, TWIN_A, "Speaker", sensor="speaker")
-    _a, _c, pinned = _audio_env(
-        monkeypatch, core, tmp_path, [_card(CARD_SPEAKER, "usb-Weird-00")]
-    )
-
-    core._detect_and_select_audio_devices()
-
-    assert pinned == {TWIN_A: core._audio_pin_metadata("usb-Weird-00")}
 
 
 def test_declined_substitute_warns_that_edge_core_will_hold_the_twin(monkeypatch, tmp_path):
@@ -1160,3 +1122,226 @@ def test_remapping_a_pinned_twin_writes_one_update_with_clear_and_new_pin(monkey
 
     assert calls == [{TWIN_A: core._camera_pin_metadata(BRIO)}]
     assert core._camera_pin_metadata(BRIO)["serial_number"] == ""
+
+
+# ---- a hardware serial typed into the twin forces the bind -------------------
+
+C920_SERIAL = "8E3A1B2F"
+C920_WITH_SERIAL = f"usb-046d_HD_Pro_Webcam_C920_{C920_SERIAL}-video-index0"
+
+
+def _forced_serial_setup(monkeypatch, tmp_path, *, serial):
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    node0, node1 = _node(tmp_path, "video0"), _node(tmp_path, "video1")
+    _tree(
+        monkeypatch,
+        core,
+        tmp_path,
+        "_V4L_BY_ID_DIR",
+        {C920_WITH_SERIAL: node1, BRIO: node0},
+    )
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True, serial=serial)
+    cams = [_FakeCam(0, "Brio", node0), _FakeCam(1, "C920", node1)]
+    _patch_camera_helpers(monkeypatch, core, cams, prompt_inputs=[])
+
+    def _boom(*_a, **_k):
+        raise AssertionError("a serial typed into the twin must bind without a question")
+
+    monkeypatch.setattr(core, "_prompt_camera_index", _boom)
+    return core
+
+
+def test_raw_hardware_serial_in_the_twin_binds_the_matching_camera(monkeypatch, tmp_path):
+    core = _forced_serial_setup(monkeypatch, tmp_path, serial=C920_SERIAL)
+
+    core._detect_and_select_cameras()
+
+    data = json.loads((tmp_path / "cameras.json").read_text())
+    assert data["twin_to_device"] == {TWIN_A: 1}
+
+
+def test_raw_serial_is_matched_exactly_like_the_driver_does(monkeypatch, tmp_path):
+    core = _forced_serial_setup(monkeypatch, tmp_path, serial="8e3a1b2f")
+    cams = [
+        _FakeCam(0, "Brio", str(tmp_path / "video0")),
+        _FakeCam(1, "C920", str(tmp_path / "video1")),
+    ]
+    assert core._camera_index_for_serial(cams, C920_SERIAL) == 1
+    assert core._camera_index_for_serial(cams, "8e3a1b2f") is None
+    assert core._camera_index_for_serial(cams, "") is None
+    assert core._camera_index_for_serial(cams, "8E3A1B") is None  # not a delimited field
+
+
+def test_blank_serial_with_a_by_id_video_device_still_binds(monkeypatch, tmp_path):
+    """Twin metadata as shipped: serial_number empty, video_device a serial-less by-id path."""
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    node0, node1 = _node(tmp_path, "video0"), _node(tmp_path, "video1")
+    serial_less = "usb-046d_HD_Pro_Webcam_C920-video-index0"
+    _tree(monkeypatch, core, tmp_path, "_V4L_BY_ID_DIR", {serial_less: node1, BRIO: node0})
+    _write_twin_json(
+        tmp_path,
+        TWIN_A,
+        "Cam A",
+        camera=True,
+        serial="",
+        video_device=f"{core._V4L_BY_ID_DIR}/{serial_less}",
+    )
+    cams = [_FakeCam(0, "Brio", node0), _FakeCam(1, "C920", node1)]
+    _patch_camera_helpers(monkeypatch, core, cams, prompt_inputs=[])
+    monkeypatch.setattr(core, "_prompt_camera_index", lambda *a, **k: 1 / 0)
+
+    core._detect_and_select_cameras()
+
+    data = json.loads((tmp_path / "cameras.json").read_text())
+    assert data["twin_to_device"] == {TWIN_A: f"{core._V4L_BY_ID_DIR}/{serial_less}"}
+
+
+# ---- audio follows the camera contract: a serial first, then the by-id link --
+
+
+def test_audio_by_id_name_left_in_serial_number_is_moved_to_audio_device(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    asked, confirms, pinned = _audio_env(monkeypatch, core, tmp_path, [_card(CARD_MIC, MIC)])
+    _write_audio_twin(
+        tmp_path, TWIN_A, "Mic", serial=MIC, extra={"audio_device": f"{core._ALSA_BY_ID_DIR}/{MIC}"}
+    )
+
+    core._detect_and_select_audio_devices()
+
+    assert asked == [] and confirms == []
+    assert pinned == {TWIN_A: _audio_pin(core, MIC)}
+
+
+def test_audio_operator_serial_binds_without_a_question_and_is_kept(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    asked, confirms, pinned = _audio_env(
+        monkeypatch, core, tmp_path, [_card(CARD_HEADSET, HEADSET), _card(CARD_MIC, MIC)]
+    )
+    _write_audio_twin(tmp_path, TWIN_A, "Mic", serial="00026")
+
+    core._detect_and_select_audio_devices()
+
+    assert asked == []
+    assert confirms == ["Keep these existing audio bindings?"]
+    assert pinned == {}  # the operator's serial is never rewritten
+
+
+def test_audio_single_device_with_an_operator_serial_asks_nothing(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    asked, confirms, pinned = _audio_env(monkeypatch, core, tmp_path, [_card(CARD_MIC, MIC)])
+    _write_audio_twin(tmp_path, TWIN_A, "Mic", serial="00026")
+
+    core._detect_and_select_audio_devices()
+
+    assert asked == [] and confirms == [] and pinned == {}
+
+
+def test_audio_declining_to_keep_a_serial_binding_remaps_it(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    asked, _c, pinned = _audio_env(
+        monkeypatch,
+        core,
+        tmp_path,
+        [_card(CARD_HEADSET, HEADSET), _card(CARD_MIC, MIC)],
+        confirm=False,
+        answers=["0"],
+    )
+    _write_audio_twin(tmp_path, TWIN_A, "Mic", serial="00026")
+
+    core._detect_and_select_audio_devices()
+
+    assert asked == ["Audio device for Mic"]
+    assert pinned == {TWIN_A: _audio_pin(core, HEADSET)}
+
+
+def test_audio_declining_to_keep_never_calls_a_connected_device_missing(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    spk_link = "usb-Acme_Boombox_55-00"
+    asked, confirms, pinned = _audio_env(
+        monkeypatch,
+        core,
+        tmp_path,
+        [_card(CARD_MIC, MIC), _card(CARD_SPEAKER, spk_link)],
+        confirm=False,
+    )
+    _write_audio_twin(tmp_path, TWIN_A, "Mic", extra=_audio_pin(core, MIC))
+
+    core._detect_and_select_audio_devices()
+
+    assert confirms == ["Keep these existing audio bindings?"]
+    assert asked == []
+    assert pinned == {TWIN_A: _audio_pin(core, MIC)}
+
+
+def test_audio_unmatched_operator_serial_is_reported_and_kept_unless_replaced(
+    monkeypatch, tmp_path
+):
+    core = load_core_module(monkeypatch)
+    asked, confirms, pinned = _audio_env(
+        monkeypatch, core, tmp_path, [_card(CARD_MIC, MIC)], confirm=False
+    )
+    _write_audio_twin(tmp_path, TWIN_A, "Mic", serial="99999")
+    printed: list[str] = []
+    monkeypatch.setattr(
+        core.console, "print", lambda *a, **k: printed.append(str(a[0]) if a else "")
+    )
+
+    core._detect_and_select_audio_devices()
+
+    assert any("99999" in line and "no attached" in line for line in printed)
+    assert confirms[0] == f"Mic's serial 99999 matches no attached device. Use {MIC} instead?"
+    assert pinned == {}  # declined: the serial stays
+
+    monkeypatch.setattr(core.Confirm, "ask", lambda *a, **k: True)
+    core._detect_and_select_audio_devices()
+    assert pinned == {TWIN_A: _audio_pin(core, MIC)}
+
+
+def test_audio_serial_matched_device_settles_the_other_microphone(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    asked, _c, pinned = _audio_env(
+        monkeypatch, core, tmp_path, [_card(CARD_MIC, MIC), _card(CARD_HEADSET, HEADSET)]
+    )
+    _write_audio_twin(tmp_path, TWIN_A, "Mic A", serial="00026")
+    _write_audio_twin(tmp_path, TWIN_B, "Mic B")
+
+    core._detect_and_select_audio_devices()
+
+    assert asked == []
+    assert pinned == {TWIN_B: _audio_pin(core, HEADSET)}
+
+
+def test_audio_serial_matching_uses_the_microphone_driver_rule(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    _audio_env(monkeypatch, core, tmp_path, [_card(CARD_MIC, MIC), _card(CARD_HEADSET, HEADSET)])
+    cards = core._discover_usb_audio_cards()
+
+    def link(serial):
+        card = core._audio_card_for_serial(cards, serial)
+        return card.link if card else None
+
+    assert link("00026") == MIC
+    assert link("UMA16v2_00026") == MIC
+    assert link(" 00026 ") == MIC
+    assert link("ABC123") == HEADSET
+    assert [link(s) for s in ("0026", "000260", "UMA16v2", "99999", "")] == [None] * 5
+
+
+def test_microphone_link_without_a_serial_token_is_still_a_pin(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    first, second = "usb-A_Generic_USB_Audio-00", "usb-B_Generic_USB_Audio-00"
+    asked, _c, pinned = _audio_env(
+        monkeypatch,
+        core,
+        tmp_path,
+        [_card(CARD_MIC, first), _card(CARD_HEADSET, second)],
+        answers=["1"],
+    )
+    _write_audio_twin(tmp_path, TWIN_A, "Mic")
+
+    core._detect_and_select_audio_devices()
+
+    assert asked == ["Audio device for Mic"]
+    assert pinned == {TWIN_A: _audio_pin(core, second)}
