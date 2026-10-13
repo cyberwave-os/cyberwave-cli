@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 import time
 
+import pytest
+
 from tests._core_module_loader import load_core_module
 from tests.test_camera_mapping import (
     SERIAL_A,
@@ -37,9 +39,6 @@ def _node(tmp_path, name: str) -> str:
     node = tmp_path / name
     node.write_text("")
     return str(node)
-
-
-# ---- listing -----------------------------------------------------------------
 
 
 def test_list_v4l_by_id_keeps_live_links_of_every_node(monkeypatch, tmp_path):
@@ -103,9 +102,6 @@ def test_udev_pin_is_connected_accepts_name_or_full_path(monkeypatch, tmp_path):
     assert not core._udev_pin_is_connected(HEADSET, directory)
     assert not core._udev_pin_is_connected("../escape", directory)
     assert not core._udev_pin_is_connected("", directory)
-
-
-# ---- cameras -----------------------------------------------------------------
 
 
 def test_manual_camera_choice_is_pinned_as_its_by_id_name(monkeypatch, tmp_path):
@@ -210,9 +206,6 @@ def test_depth_twin_with_absent_by_id_pin_is_not_waved_through(monkeypatch, tmp_
     assert data["twin_to_device"] == {TWIN_A: 0}  # it was asked, not deferred
 
 
-# ---- identical cameras ------------------------------------------------------
-
-
 def test_identical_cameras_sharing_one_link_are_unidentifiable(monkeypatch, tmp_path):
     """Two C920s without a USB serial collapse onto a single by-id link."""
     core = load_core_module(monkeypatch)
@@ -249,9 +242,6 @@ def test_unidentifiable_camera_is_selectable_but_never_pinned(monkeypatch, tmp_p
     assert pinned == {}  # nothing written for a coin-flip identity
     data = json.loads((tmp_path / "cameras.json").read_text())
     assert data["twin_to_device"] == {TWIN_A: 1}  # positional, this run only
-
-
-# ---- what gets written -------------------------------------------------------
 
 
 def test_camera_pin_metadata_uses_video_device_and_blanks_a_stale_serial(monkeypatch):
@@ -328,9 +318,6 @@ def test_manual_camera_choice_stores_the_stable_path_in_cameras_json(monkeypatch
     assert pinned == {TWIN_A: core._camera_pin_metadata(C920)}
 
 
-# ---- automatic association (cameras) -----------------------------------------
-
-
 def test_one_twin_one_camera_is_associated_and_pinned_without_asking(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
@@ -389,8 +376,6 @@ def test_stale_pin_with_one_camera_needs_approval_to_substitute(monkeypatch, tmp
     core._detect_and_select_cameras()
     assert pinned == {TWIN_A: core._camera_pin_metadata(C920)}
 
-
-# ---- audio -------------------------------------------------------------------
 
 CARD_MIC = ("046d:0825", "UMA16v2", True, False)
 CARD_HEADSET = ("0b0e:245e", "Evolve65", True, True)
@@ -754,9 +739,6 @@ def test_audio_is_a_no_op_off_linux_and_without_audio_twins(monkeypatch, tmp_pat
     assert asked == [] and pinned == {}
 
 
-# ---- the evidence settles multi-sensor installs ------------------------------
-
-
 def test_camera_verified_pin_settles_the_other_twin_among_two_cameras(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
@@ -853,9 +835,6 @@ def test_audio_verified_pin_settles_the_other_microphone(monkeypatch, tmp_path):
     assert asked == []
     assert confirms == ["Keep these existing audio bindings?"]
     assert pinned == {TWIN_B: core._audio_pin_metadata(HEADSET)}
-
-
-# ---- the reinstall scenario that started all this ----------------------------
 
 
 def test_reinstall_with_saved_pins_is_never_silent(monkeypatch, tmp_path):
@@ -972,9 +951,6 @@ def test_keeping_a_by_id_serial_pin_queues_its_migration_only_when_used(monkeypa
     monkeypatch.setattr(core, "_persist_twin_pins", lambda p: pinned.update(p) or 0)
     core._detect_and_select_cameras()
     assert pinned == {TWIN_A: core._camera_pin_metadata(C920)}
-
-
-# ---- generic matching --------------------------------------------------------
 
 
 def _any(_twin, _device):
@@ -1124,8 +1100,6 @@ def test_remapping_a_pinned_twin_writes_one_update_with_clear_and_new_pin(monkey
     assert core._camera_pin_metadata(BRIO)["serial_number"] == ""
 
 
-# ---- a hardware serial typed into the twin forces the bind -------------------
-
 C920_SERIAL = "8E3A1B2F"
 C920_WITH_SERIAL = f"usb-046d_HD_Pro_Webcam_C920_{C920_SERIAL}-video-index0"
 
@@ -1196,9 +1170,6 @@ def test_blank_serial_with_a_by_id_video_device_still_binds(monkeypatch, tmp_pat
 
     data = json.loads((tmp_path / "cameras.json").read_text())
     assert data["twin_to_device"] == {TWIN_A: f"{core._V4L_BY_ID_DIR}/{serial_less}"}
-
-
-# ---- audio follows the camera contract: a serial first, then the by-id link --
 
 
 def test_audio_by_id_name_left_in_serial_number_is_moved_to_audio_device(monkeypatch, tmp_path):
@@ -1345,3 +1316,81 @@ def test_microphone_link_without_a_serial_token_is_still_a_pin(monkeypatch, tmp_
 
     assert asked == ["Audio device for Mic"]
     assert pinned == {TWIN_A: _audio_pin(core, second)}
+
+
+def _answer_by_prompt(monkeypatch, core, answers):
+    """Confirm.ask answering per prompt substring; anything else is a loud failure."""
+
+    def _ask(prompt, **_k):
+        for needle, value in answers.items():
+            if needle in prompt:
+                return value
+        raise AssertionError(f"unexpected confirm: {prompt}")
+
+    monkeypatch.setattr(core.Confirm, "ask", _ask)
+
+
+def test_audio_declined_substitute_keeps_the_operator_serial_without_a_menu(
+    monkeypatch, tmp_path
+):
+    core = load_core_module(monkeypatch)
+    asked, _c, pinned = _audio_env(
+        monkeypatch,
+        core,
+        tmp_path,
+        [_card(CARD_HEADSET, HEADSET), _card(CARD_SPEAKER, "usb-Acme_Boombox_55-00")],
+    )
+    _write_audio_twin(tmp_path, TWIN_A, "Mic", serial="99999")
+    _answer_by_prompt(monkeypatch, core, {"matches no attached device": False})
+
+    core._detect_and_select_audio_devices()
+
+    assert asked == []  # declining must not fall through to the manual menu
+    assert pinned == {}
+
+
+def test_audio_menu_asks_before_replacing_an_unmatched_operator_serial(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    asked, _c, pinned = _audio_env(
+        monkeypatch,
+        core,
+        tmp_path,
+        [_card(CARD_HEADSET, HEADSET), _card(CARD_MIC, MIC)],
+        answers=["0"],
+    )
+    _write_audio_twin(tmp_path, TWIN_A, "Mic", serial="99999")
+
+    _answer_by_prompt(monkeypatch, core, {"Replace it with a device you choose": False})
+    core._detect_and_select_audio_devices()
+    assert asked == []
+    assert pinned == {}
+
+    _answer_by_prompt(monkeypatch, core, {"Replace it with a device you choose": True})
+    core._detect_and_select_audio_devices()
+    assert asked == ["Audio device for Mic"]
+    assert pinned == {TWIN_A: _audio_pin(core, HEADSET)}
+
+
+@pytest.mark.parametrize("kind", ["serial", "video_device"])
+def test_declined_rebind_records_the_twins_own_pin_in_cameras_json(monkeypatch, tmp_path, kind):
+    """cameras.json would otherwise point the twin at the camera the operator refused."""
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    node = _node(tmp_path, "video0")
+    _tree(monkeypatch, core, tmp_path, "_V4L_BY_ID_DIR", {C920: node})
+    if kind == "serial":
+        pin, expected = {"serial": BRIO}, f"serial:{BRIO}"
+    else:
+        expected = f"{core._V4L_BY_ID_DIR}/usb-Gone_Cam_1-video-index0"
+        pin = {"video_device": expected}
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True, **pin)
+    _patch_camera_helpers(monkeypatch, core, [_FakeCam(0, "C920", node)], prompt_inputs=[])
+    monkeypatch.setattr(core.Confirm, "ask", lambda *a, **k: False)
+    pinned: dict = {}
+    monkeypatch.setattr(core, "_persist_twin_pins", lambda p: pinned.update(p) or 0)
+
+    core._detect_and_select_cameras()
+
+    data = json.loads((tmp_path / "cameras.json").read_text())
+    assert data["twin_to_device"] == {TWIN_A: expected}
+    assert pinned == {}

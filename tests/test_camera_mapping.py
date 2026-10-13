@@ -263,7 +263,6 @@ def test_detect_and_select_cameras_invalid_selection_aborts_without_file(
     assert not (tmp_path / "cameras.json").exists()
 
 
-# ---- serial-driven binding ---------------------------------------------------
 #
 # A twin carrying ``metadata.serial_number`` already names its physical camera,
 # and discovery reports the same serial per device, so the installer must
@@ -420,7 +419,6 @@ def test_manual_mapping_without_discoverable_serial_pins_nothing(monkeypatch, tm
     assert data["twin_to_device"] == {TWIN_A: 0, TWIN_B: 1}
 
 
-# ---- device-path binding -----------------------------------------------------
 #
 # Cameras whose USB descriptor carries no serial (the Logitech C920 reports
 # ``iSerial 0``) can never be pinned by ``metadata.serial_number``. udev still

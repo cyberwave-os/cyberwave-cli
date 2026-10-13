@@ -2902,18 +2902,12 @@ _CAMERA_STREAM_SCHEMES = ("rtsp://", "rtsps://", "http://", "https://")
 # source. Kept in sync with edge-core's ``_SERIAL_SOURCE_PREFIX``.
 _SERIAL_PIN_PREFIX = "serial:"
 _ALSA_BY_ID_DIR = "/dev/snd/by-id"
-# A V4L by-id link ends with the node index within one physical device.
 _V4L_NODE_RE = re.compile(r"-video-index(\d+)$")
-# ID_BUS prefixes udev puts on by-id names (same set as edge-core); tells a
-# stable name from a raw hardware serial.
 _UDEV_NAME_PREFIXES = ("usb-", "pci-", "platform-")
 
 
-# ---- sensor-agnostic twin <-> device matching ---------------------------------
-
-
 class _Inference(NamedTuple):
-    assigned: dict[str, tuple[Any, str]]  # twin -> (device, why it is certain)
+    assigned: dict[str, tuple[Any, str]]
     unresolved: list[str]
 
 
@@ -2995,12 +2989,9 @@ def _infer_associations(
     return _Inference(assigned, [t for t in twins if t not in assigned])
 
 
-# ---- udev by-id helpers -------------------------------------------------------
-
-
 class _UdevDevice(NamedTuple):
     name: str
-    target: str  # resolved node, e.g. /dev/video0
+    target: str
 
 
 def _looks_like_udev_name(value: str) -> bool:
@@ -3164,7 +3155,6 @@ class _CameraPin(NamedTuple):
     label: str
     index: int | None
     device: int | str
-    # Set when the saved pin should move to video_device once the operator keeps it.
     migrate: str | None = None
 
 
@@ -3407,7 +3397,6 @@ def _camera_index_for_serial(cameras: list[Any], serial: str) -> int | None:
     name = _udev_pin_name(serial, _V4L_BY_ID_DIR)
     if name is not None:
         return _camera_index_for_device(cameras, os.path.join(_V4L_BY_ID_DIR, name))
-    # Like the driver: a raw serial is the delimited field of a by-id name, index0 first.
     field = re.compile(rf"_{re.escape(serial.strip())}-video-index(\d+)$")
     matches = sorted(
         (int(m.group(1)), d.name)
@@ -3506,7 +3495,7 @@ def _persist_twin_pins(pins: dict[str, dict[str, str]]) -> int:
 
     Cameras and audio alike get their by-id path (``video_device`` / ``audio_device``)
     and a blanked ``serial_number``: a serial outranks the device field in both
-    drivers. A serial the operator set is never written here.
+    drivers. Callers blank an operator's serial only after the operator agrees.
     """
     pins = {u: m for u, m in pins.items() if u and m}
     if not pins:
@@ -3705,8 +3694,6 @@ def _detect_and_select_cameras() -> None:
                     return _CameraPin(
                         f"serial {serial}", matched, f"{_V4L_BY_ID_DIR}/{name}", migrate=name
                     )
-                # The driver resolves the twin's raw serial first, so the index
-                # here is never the one it opens.
                 return _CameraPin(f"serial {serial}", matched, matched)
             if _twin_has_depth_sensor(twin_uuid) and not _looks_like_udev_name(serial):
                 # A depth camera reports two unrelated serials: the USB
@@ -3792,6 +3779,12 @@ def _detect_and_select_cameras() -> None:
         )
         return {t: (d, why) for t, (d, why) in result.assigned.items() if _identity_of(d)}
 
+    def _saved_pin_source(twin_uuid: str) -> str:
+        """The twin's own pin in cameras.json form; a serial outranks a device."""
+        if twin_uuid in twin_serials:
+            return f"{_SERIAL_PIN_PREFIX}{twin_serials[twin_uuid]}"
+        return twin_devices[twin_uuid]
+
     def _bind_inferred(twin_uuid: str, twin_name: str, index: int, why: str) -> bool:
         """Announce an automatic pairing and queue its pin; False if refused.
 
@@ -3829,16 +3822,22 @@ def _detect_and_select_cameras() -> None:
             pin = _pinned_camera(twin_uuid, twin_name)
             _accept_pin(twin_uuid, pin)
             # A stream-pinned twin needs no local device, but it cannot simply
-            # be left out of the mapping: edge-core falls back to the global
-            # ``selected_device`` for any twin it cannot find there.
+            # be left out of the mapping either: edge-core falls back to the
+            # global ``selected_device`` for any twin it cannot find there, so
+            # omitting it injects /dev/video0 ahead of the twin's own
+            # metadata. Recording the source pins it explicitly.
             if pin is not None and pin.index is None:
                 console.print(f"[dim]{twin_name} is served by {pin.label}.[/dim]")
                 twin_to_device[twin_uuid] = pin.device
                 continue
+            if pin is None and twin_uuid in inferred:
+                if not _bind_inferred(twin_uuid, twin_name, *inferred[twin_uuid]):
+                    # edge-core injects this value over the twin's own pin and falls
+                    # back to selected_device when a twin is absent, so record its pin.
+                    twin_to_device[twin_uuid] = _saved_pin_source(twin_uuid)
+                    continue
             twin_to_device[twin_uuid] = pin.device if pin is not None else _device_for(selected)
             shared += 1
-            if pin is None and twin_uuid in inferred:
-                _bind_inferred(twin_uuid, twin_name, *inferred[twin_uuid])
         if shared > 1:
             console.print(f"[dim]All {shared} camera twin(s) will share this device.[/dim]")
         elif shared == 1 and not pins and not _identity_of(selected):
@@ -3859,8 +3858,6 @@ def _detect_and_select_cameras() -> None:
             _save_cameras(selected, None)
         return
 
-    # Saved pins are trusted silently otherwise, which is wrong after cameras are
-    # swapped or replugged: ask once whether to keep them.
     pinned_twins = [(u, n) for u, n in camera_twins if u in had_pin]
     if pinned_twins:
         console.print("\n[bold]Existing camera bindings found:[/bold]")
@@ -3913,8 +3910,8 @@ def _detect_and_select_cameras() -> None:
         pin = _pinned_camera(twin_uuid, twin_name)
         _accept_pin(twin_uuid, pin)
         if pin is not None:
-            # Recorded even without a local node: an absent mapping inherits the
-            # global ``selected_device``.
+            # Recorded, not skipped -- see the single-camera branch: an
+            # absent mapping inherits the global ``selected_device``.
             twin_to_device[twin_uuid] = pin.device
             if pin.index is None:
                 console.print(f"[green]Served by[/green] [cyan]{pin.label}[/cyan]\n")
@@ -3963,7 +3960,6 @@ def _detect_and_select_cameras() -> None:
     _save_cameras(first_selected, twin_to_device)
 
 
-# cardN/usbid exists only for USB audio; pcm*c / pcm*p mean capture / playback.
 _PROC_ASOUND_DIR = "/proc/asound"
 
 
@@ -3971,9 +3967,9 @@ class _AudioCard(NamedTuple):
     """One USB audio card and the stable name (if any) udev gave it."""
 
     index: int
-    usbid: str  # vid:pid, shared by identical units
+    usbid: str
     label: str
-    link: str | None  # by-id name, None when udev gave it none
+    link: str | None
     capture: bool
     playback: bool
 
@@ -3997,7 +3993,7 @@ def _discover_usb_audio_cards() -> list[_AudioCard]:
             with open(os.path.join(card_dir, "usbid"), encoding="utf-8") as fh:
                 usbid = fh.read().strip()
         except OSError:
-            continue  # not USB audio: udev publishes no by-id link for it
+            continue
         try:
             with open(os.path.join(card_dir, "id"), encoding="utf-8") as fh:
                 label = fh.read().strip() or entry
@@ -4097,7 +4093,6 @@ def _detect_and_select_audio_devices() -> None:
     if platform.system() != "Linux":
         return
 
-    # uuid -> (name, needs capture, needs playback)
     twins: dict[str, tuple[str, bool, bool]] = {}
     for uuid_, name in _list_microphone_twins():
         twins[uuid_] = (name, True, False)
@@ -4148,7 +4143,6 @@ def _detect_and_select_audio_devices() -> None:
                 f"  {twins[uuid_][0]}: [yellow]saved device {name} is not connected "
                 f"— it must be selected again[/yellow]"
             )
-    # With a single device there is nothing to re-map, so nothing to ask.
     if (
         (connected or by_serial)
         and len(cards) > 1
@@ -4167,7 +4161,6 @@ def _detect_and_select_audio_devices() -> None:
     by_index = {c.index: c for c in cards}
     cached = _cached_twin_metadata()
 
-    # Bring twins written by an older installer (link name in serial_number) to the new shape.
     for uuid_, name in connected.items():
         metadata = cached.get(uuid_, {})
         current = metadata.get("audio_device") == f"{_ALSA_BY_ID_DIR}/{name}"
@@ -4187,7 +4180,6 @@ def _detect_and_select_audio_devices() -> None:
 
     for uuid_ in pending:
         name = twins[uuid_][0]
-        # Unpinnable cards stay in the pool as rivals but are never paired automatically.
         result = _infer_associations(
             [u for u in pending if u not in pins],
             list(by_index),
@@ -4213,6 +4205,9 @@ def _detect_and_select_audio_devices() -> None:
                 )
                 _assign(uuid_, card)
                 continue
+            if uuid_ in serials:
+                console.print(f"[yellow]{name} keeps its serial {serials[uuid_]}.[/yellow]")
+                continue
 
         pool = [c for c in cards if _pinnable(c) and _can_serve(uuid_, c)]
         if not pool:
@@ -4221,6 +4216,13 @@ def _detect_and_select_audio_devices() -> None:
                 f"{name} (it needs a distinct udev id). "
                 f"Plug one in and run: cyberwave edge install[/yellow]"
             )
+            continue
+        if uuid_ in serials and not _ask_yes_no(
+            f"{name} pins serial {serials[uuid_]}, which no attached device reports. "
+            f"Replace it with a device you choose?",
+            on_eof=False,
+        ):
+            console.print(f"[yellow]{name} keeps its serial {serials[uuid_]}.[/yellow]")
             continue
         pool = [c for c in pool if c.link not in taken] or pool
         if len(pool) == 1:
