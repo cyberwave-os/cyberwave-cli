@@ -92,7 +92,7 @@ def test_audio_pin_is_written_then_read_back(env):
 
     assert env.backend.metadata[TWIN_A] == {"audio_device": STABLE_AUDIO, "serial_number": ""}
     env.backend.download(env.dir)
-    assert core._load_twin_audio_pins() == {TWIN_A: MIC}
+    assert core._load_twin_audio_pins() == {TWIN_A: STABLE_AUDIO}
 
 
 def test_repinning_replaces_a_legacy_serial_and_keeps_other_metadata(env):
@@ -128,7 +128,7 @@ def test_clearing_a_pin_removes_it_for_every_reader(env):
     serials, devices, audio = _read_all(env)
     assert serials == {} and devices == {}
     # audio_device was not in the cleared keys, so an audio-only pin keeps it.
-    assert audio == {TWIN_B: MIC}
+    assert audio == {TWIN_B: STABLE_AUDIO}
 
 
 def test_by_id_name_in_serial_number_is_read_and_moved_to_video_device(env):
@@ -253,7 +253,7 @@ def test_audio_by_id_name_in_serial_number_is_read_and_moved_to_audio_device(env
     core = env.core
     env.backend.metadata[TWIN_A] = {"serial_number": MIC, "audio_device": STABLE_AUDIO}
     env.backend.download(env.dir)
-    assert core._load_twin_audio_pins() == {TWIN_A: MIC}
+    assert core._load_twin_audio_pins() == {TWIN_A: STABLE_AUDIO}
     assert core._load_twin_audio_serials() == {}
 
     core._persist_twin_pins({TWIN_A: core._audio_pin_metadata(MIC)})

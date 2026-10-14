@@ -21,6 +21,7 @@ import tempfile
 import textwrap
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -2902,6 +2903,7 @@ _CAMERA_STREAM_SCHEMES = ("rtsp://", "rtsps://", "http://", "https://")
 # source. Kept in sync with edge-core's ``_SERIAL_SOURCE_PREFIX``.
 _SERIAL_PIN_PREFIX = "serial:"
 _ALSA_BY_ID_DIR = "/dev/snd/by-id"
+_ALSA_BY_PATH_DIR = "/dev/snd/by-path"
 _V4L_NODE_RE = re.compile(r"-video-index(\d+)$")
 _UDEV_NAME_PREFIXES = ("usb-", "pci-", "platform-")
 
@@ -3006,8 +3008,8 @@ def _ask_yes_no(prompt: str, *, default: bool = True, on_eof: bool = True) -> bo
         return on_eof
 
 
-def _list_udev_by_id(directory: str) -> list[_UdevDevice]:
-    """Live (non-dangling) entries of a udev by-id tree; udev removes the link on unplug."""
+def _list_udev_links(directory: str) -> list[_UdevDevice]:
+    """Live (non-dangling) entries of a udev stable-name tree; udev removes the link on unplug."""
     try:
         names = sorted(os.listdir(directory))
     except OSError:
@@ -3017,11 +3019,23 @@ def _list_udev_by_id(directory: str) -> list[_UdevDevice]:
 
 
 def _list_v4l_by_id() -> list[_UdevDevice]:
-    return _list_udev_by_id(_V4L_BY_ID_DIR)
+    return _list_udev_links(_V4L_BY_ID_DIR)
 
 
 def _list_alsa_by_id() -> list[_UdevDevice]:
-    return _list_udev_by_id(_ALSA_BY_ID_DIR)
+    return _list_udev_links(_ALSA_BY_ID_DIR)
+
+
+def _best_link(directory: str, nodes: set[str]) -> str | None:
+    """Name of the link in *directory* resolving to one of *nodes*, lowest node index first."""
+    best: tuple[int, str] | None = None
+    for device in _list_udev_links(directory):
+        if device.target not in nodes:
+            continue
+        match = _V4L_NODE_RE.search(device.name)
+        rank = (int(match.group(1)) if match else sys.maxsize, device.name)
+        best = min(best, rank) if best else rank
+    return best[1] if best else None
 
 
 def _udev_pin_name(value: str, directory: str) -> str | None:
@@ -3037,9 +3051,89 @@ def _udev_pin_name(value: str, directory: str) -> str | None:
     return candidate
 
 
+def _udev_link_path(value: str, directories: tuple[str, ...]) -> str | None:
+    """Full path of a udev pin: a full path under one of *directories*, or a bare
+    link name (in whichever directory holds it, else the first). A raw hardware
+    serial yields None.
+    """
+    candidate = value.strip()
+    for directory in directories:
+        if candidate.startswith(directory.rstrip("/") + "/"):
+            name = _udev_pin_name(candidate, directory)
+            return candidate if name else None
+    name = _udev_pin_name(candidate, directories[0])
+    if not name:
+        return None
+    holder = next(
+        (d for d in directories if os.path.lexists(os.path.join(d, name))), directories[0]
+    )
+    return f"{holder.rstrip('/')}/{name}"
+
+
+def _v4l_trees() -> tuple[str, str]:
+    return (_V4L_BY_ID_DIR, _V4L_BY_PATH_DIR)
+
+
+def _alsa_trees() -> tuple[str, str]:
+    return (_ALSA_BY_ID_DIR, _ALSA_BY_PATH_DIR)
+
+
 def _udev_pin_is_connected(value: str, directory: str) -> bool:
     name = _udev_pin_name(value, directory)
     return name is not None and os.path.exists(os.path.realpath(os.path.join(directory, name)))
+
+
+def _udev_properties(node: str) -> dict[str, str]:
+    """udev properties of a device node (ID_SERIAL, ...); empty when udevadm is unavailable."""
+    try:
+        result = subprocess.run(
+            ["udevadm", "info", "--query=property", f"--name={node}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=clean_subprocess_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0:
+        return {}
+    props: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            props[key] = value
+    return props
+
+
+def _collided(keys: list[str | None], fallback: list[tuple[Hashable, bool]]) -> list[bool]:
+    """For each unit, True when an identical unit is attached.
+
+    A unit is identified by its udev ID_SERIAL (vendor, model, USB serial); units
+    sharing one cannot be told apart by any by-id name. Units udev has no ID_SERIAL
+    for (no udevadm, or not USB) are judged by the link-count rule among
+    themselves on (model, has its own by-id link).
+    """
+    known = Counter(k for k in keys if k)
+    legacy = _ambiguous_groups(fallback[i] for i, k in enumerate(keys) if not k)
+    return [known[k] > 1 if k else fallback[i][0] in legacy for i, k in enumerate(keys)]
+
+
+class _UsbUnit(NamedTuple):
+    """The stable link a USB device can be pinned by."""
+
+    pin: str | None  # full path: by-id for a unique unit, by-path when identical units collide
+    by_port: bool  # pinned by USB port rather than by id
+    collided: bool  # an identical unit is attached
+
+
+def _usb_unit(
+    by_id: str | None, by_path: str | None, collided: bool, trees: tuple[str, str]
+) -> _UsbUnit:
+    if by_id and not collided:
+        return _UsbUnit(f"{trees[0]}/{by_id}", False, collided)
+    if by_path:
+        return _UsbUnit(f"{trees[1]}/{by_path}", True, collided)
+    return _UsbUnit(None, False, collided)
 
 
 def _stable_camera_device_prefixes() -> tuple[str, ...]:
@@ -3172,24 +3266,19 @@ def _camera_device_nodes(cam: Any) -> list[str]:
     return [str(primary)] if primary else []
 
 
-def _udev_name_for_camera(cam: Any) -> str | None:
-    """The by-id name of *cam*: among the links to any of its nodes, the lowest node index."""
-    nodes = set(_camera_device_nodes(cam))
-    best: tuple[int, str] | None = None
-    for device in _list_v4l_by_id():
-        if device.target not in nodes:
-            continue
-        match = _V4L_NODE_RE.search(device.name)
-        rank = (int(match.group(1)), device.name) if match else (sys.maxsize, device.name)
-        best = min(best, rank) if best else rank
-    return best[1] if best else None
-
-
-def _ambiguous_camera_cards(cameras: list[Any]) -> set[Any]:
-    """Models whose identical units udev collapsed onto fewer by-id links."""
-    return _ambiguous_groups(
-        (str(cam.card or ""), _udev_name_for_camera(cam) is not None) for cam in cameras
-    )
+def _camera_units(cameras: list[Any]) -> list[_UsbUnit]:
+    """How each discovered camera can be pinned, aligned with *cameras*."""
+    nodes = [set(_camera_device_nodes(cam)) for cam in cameras]
+    by_id = [_best_link(_V4L_BY_ID_DIR, n) for n in nodes]
+    keys = [
+        _udev_properties(cam.primary_path).get("ID_SERIAL") if cam.primary_path else None
+        for cam in cameras
+    ]
+    collided = _collided(keys, [(str(c.card or ""), b is not None) for c, b in zip(cameras, by_id)])
+    return [
+        _usb_unit(by_id[i], _best_link(_V4L_BY_PATH_DIR, nodes[i]), collided[i], _v4l_trees())
+        for i in range(len(cameras))
+    ]
 
 
 def _camera_index_for_device(cameras: list[Any], device: str) -> int | None:
@@ -3315,7 +3404,7 @@ def _any_twin_has_speaker_sensor() -> bool:
     return bool(_list_speaker_twins())
 
 
-def _camera_identity_hint(cam: Any) -> str:
+def _camera_identity_hint(cam: Any, unit: _UsbUnit | None = None) -> str:
     """The field that tells this camera apart from an identical sibling.
 
     Two cameras of the same model render identical ``card`` strings, so the
@@ -3330,9 +3419,9 @@ def _camera_identity_hint(cam: Any) -> str:
     port, the only thing distinguishing two identical such cameras -- and a
     hint that this twin needs a ``video_device`` pin rather than a serial.
     """
-    udev_name = _udev_name_for_camera(cam)
-    if udev_name:
-        return f"id {udev_name}"
+    unit = unit or _camera_units([cam])[0]
+    if unit.pin:
+        return f"{'port' if unit.by_port else 'id'} {os.path.basename(unit.pin)}"
     serial = (getattr(cam, "serial", None) or "").strip()
     if serial:
         return f"serial {serial}"
@@ -3355,7 +3444,7 @@ def _render_camera_menu(
     from .device_utils import camera_likelihood_score
 
     assignments = assignments or {}
-    ambiguous = _ambiguous_camera_cards(cameras)
+    units = _camera_units(cameras)
     valid_indices: dict[int, Any] = {}
     for i, cam in enumerate(cameras):
         idx = cam.index if cam.index is not None else i
@@ -3363,9 +3452,13 @@ def _render_camera_menu(
         score = camera_likelihood_score(cam)
         assigned_to = assignments.get(idx)
         suffix = f"  [yellow](assigned to {assigned_to})[/yellow]" if assigned_to else ""
-        if str(cam.card or "") in ambiguous:
-            suffix += "  [red](identical unit, cannot be pinned)[/red]"
-        hint = _camera_identity_hint(cam)
+        if units[i].collided:
+            suffix += (
+                "  [yellow](identical unit: pinned by USB port)[/yellow]"
+                if units[i].pin
+                else "  [red](identical unit, cannot be pinned)[/red]"
+            )
+        hint = _camera_identity_hint(cam, units[i])
         hint_text = f"  {hint}" if hint else ""
         if score >= 40:
             label = (
@@ -3418,7 +3511,11 @@ def _prompt_camera_index(
     default_index: int,
 ) -> int | None:
     """Prompt for a single camera index. Returns ``None`` on invalid input."""
-    raw = Prompt.ask(prompt, default=str(default_index))
+    try:
+        raw = Prompt.ask(prompt, default=str(default_index))
+    except EOFError:
+        console.print("[yellow]No input available — skipping camera config.[/yellow]")
+        return None
     try:
         chosen = int(raw)
     except ValueError:
@@ -3536,9 +3633,9 @@ def _persist_twin_pins(pins: dict[str, dict[str, str]]) -> int:
 
 def _camera_pin_metadata(identity: str) -> dict[str, str]:
     """Twin metadata that pins a camera to the identity the installer learned."""
-    name = _udev_pin_name(identity, _V4L_BY_ID_DIR)
-    if name is not None:
-        return {"video_device": f"{_V4L_BY_ID_DIR}/{name}", "serial_number": ""}
+    path = _udev_link_path(identity, _v4l_trees())
+    if path is not None:
+        return {"video_device": path, "serial_number": ""}
     return {"serial_number": identity}
 
 
@@ -3577,38 +3674,36 @@ def _detect_and_select_cameras() -> None:
         (cam.index if cam.index is not None else i): cam for i, cam in enumerate(cameras)
     }
     pins: dict[str, dict[str, str]] = {}
-    ambiguous_cards = _ambiguous_camera_cards(cameras)
-
-    def _is_ambiguous(index: int) -> bool:
-        cam = cameras_by_index.get(index)
-        return cam is not None and str(cam.card or "") in ambiguous_cards
+    units = _camera_units(cameras)
+    unit_by_index = {
+        (cam.index if cam.index is not None else i): units[i] for i, cam in enumerate(cameras)
+    }
+    no_unit = _UsbUnit(None, False, False)
+    pin_problem: dict[str, str] = {}
 
     def _identity_of(index: int) -> str | None:
-        """The identity to pin for a menu index, or None.
-
-        Prefers the by-id name (it exists even without a USB serial). A camera
-        udev cannot tell from an identical sibling is refused.
+        """The link to pin for a menu index (by-id, or by-path when identical units
+        collide), else a raw hardware serial, else None.
         """
         cam = cameras_by_index.get(index)
-        if cam is None or _is_ambiguous(index):
+        if cam is None:
             return None
-        return _udev_name_for_camera(cam) or (getattr(cam, "serial", None) or "").strip() or None
+        unit = unit_by_index.get(index, no_unit)
+        return unit.pin or (getattr(cam, "serial", None) or "").strip() or None
 
     def _device_for(index: int) -> int | str:
-        """What cameras.json stores for a camera: its by-id path when it has one.
+        """What cameras.json stores for a camera: its pin path when it has one.
 
         Edge-core injects this ahead of the twin's own video_device, so an index
-        would undo a by-id pin.
+        would undo a pin.
         """
-        cam = cameras_by_index.get(index)
-        name = None if cam is None or _is_ambiguous(index) else _udev_name_for_camera(cam)
-        return f"{_V4L_BY_ID_DIR}/{name}" if name else index
+        return unit_by_index.get(index, no_unit).pin or index
 
     def _explain_unpinnable(index: int) -> None:
         reason = (
-            "is identical to another attached unit and udev gives them no distinct id"
-            if _is_ambiguous(index)
-            else "exposes no stable udev name or serial"
+            "is identical to another attached unit and has no USB port link either"
+            if unit_by_index.get(index, no_unit).collided
+            else "exposes no stable udev name, USB port link or serial"
         )
         console.print(
             f"[yellow]This camera {reason}, so it cannot be pinned; "
@@ -3620,6 +3715,11 @@ def _detect_and_select_cameras() -> None:
         identity = _identity_of(index)
         if identity:
             pins[twin_uuid] = _camera_pin_metadata(identity)
+            if unit_by_index.get(index, no_unit).by_port:
+                console.print(
+                    "[yellow]No distinct udev id for this camera (identical units or none): "
+                    "pinned by USB port, keep it plugged into the same port.[/yellow]"
+                )
         return bool(identity)
 
     def _record_choice(twin_uuid: str, index: int) -> None:
@@ -3660,6 +3760,17 @@ def _detect_and_select_cameras() -> None:
             f"camera. Check the twin's metadata.video_device.[/dim]"
         )
 
+    def _warn_shared_name(twin_name: str, twin_uuid: str, path: str) -> None:
+        pin_problem[twin_uuid] = "is pinned by a name identical cameras share"
+        console.print(
+            f"[yellow]{twin_name} is pinned by {path}, a name shared by identical "
+            f"cameras: after a replug it may point at either.[/yellow]\n"
+            f"[dim]Choose the camera again; it will be pinned by USB port.[/dim]"
+        )
+
+    def _shared_by_id(path: str, index: int) -> bool:
+        return path.startswith(_V4L_BY_ID_DIR + "/") and unit_by_index.get(index, no_unit).collided
+
     pin_cache: dict[str, _CameraPin | None] = {}
 
     def _pinned_camera(twin_uuid: str, twin_name: str) -> _CameraPin | None:
@@ -3689,11 +3800,13 @@ def _detect_and_select_cameras() -> None:
             matched = _camera_index_for_serial(cameras, serial)
             if matched is not None:
                 name = _udev_pin_name(serial, _V4L_BY_ID_DIR)
-                if name is not None and _looks_like_udev_name(name):
+                if name is not None:
+                    path = f"{_V4L_BY_ID_DIR}/{name}"
+                    if _shared_by_id(path, matched):
+                        _warn_shared_name(twin_name, twin_uuid, path)
+                        return None
                     # The camera driver cannot resolve a by-id name given as a serial.
-                    return _CameraPin(
-                        f"serial {serial}", matched, f"{_V4L_BY_ID_DIR}/{name}", migrate=name
-                    )
+                    return _CameraPin(f"serial {serial}", matched, path, migrate=name)
                 return _CameraPin(f"serial {serial}", matched, matched)
             if _twin_has_depth_sensor(twin_uuid) and not _looks_like_udev_name(serial):
                 # A depth camera reports two unrelated serials: the USB
@@ -3729,7 +3842,10 @@ def _detect_and_select_cameras() -> None:
                 return _CameraPin(f"source {device}", None, device)
             matched = _camera_index_for_device(cameras, device)
             if matched is not None:
-                return _CameraPin(f"device {device}", matched, device)
+                if _shared_by_id(device, matched):
+                    _warn_shared_name(twin_name, twin_uuid, device)
+                    return None
+                return _CameraPin(device, matched, device)
             _warn_unmatched_device(twin_name, device)
         return None
 
@@ -3794,7 +3910,7 @@ def _detect_and_select_cameras() -> None:
         if twin_uuid in twin_serials or twin_uuid in twin_devices:
             cam = cameras_by_index[index]
             if not _ask_yes_no(
-                f"{twin_name}'s saved camera is not attached. "
+                f"{twin_name}'s saved camera {pin_problem.get(twin_uuid, 'is not attached')}. "
                 f"Bind it to {cam.card} ({_identity_of(index)}) instead?",
                 on_eof=False,
             ):
@@ -3910,8 +4026,7 @@ def _detect_and_select_cameras() -> None:
         pin = _pinned_camera(twin_uuid, twin_name)
         _accept_pin(twin_uuid, pin)
         if pin is not None:
-            # Recorded, not skipped -- see the single-camera branch: an
-            # absent mapping inherits the global ``selected_device``.
+            # Always recorded: an absent mapping inherits the global selected_device.
             twin_to_device[twin_uuid] = pin.device
             if pin.index is None:
                 console.print(f"[green]Served by[/green] [cyan]{pin.label}[/cyan]\n")
@@ -3964,26 +4079,35 @@ _PROC_ASOUND_DIR = "/proc/asound"
 
 
 class _AudioCard(NamedTuple):
-    """One USB audio card and the stable name (if any) udev gave it."""
+    """One USB audio card and the stable links udev gave it."""
 
     index: int
     usbid: str
     label: str
-    link: str | None
+    link: str | None  # by-id name
+    path_link: str | None  # by-path name
+    unit: _UsbUnit
     capture: bool
     playback: bool
 
+    @property
+    def pin(self) -> str | None:
+        return self.unit.pin
+
 
 def _discover_usb_audio_cards() -> list[_AudioCard]:
-    """USB audio cards on this host, each matched to its by-id link."""
-    links: dict[str, str] = {}
+    """USB audio cards on this host, each with its by-id and by-path links."""
+    by_id: dict[str, str] = {}
     for device in _list_alsa_by_id():
-        links.setdefault(os.path.basename(device.target), device.name)
+        by_id.setdefault(os.path.basename(device.target), device.name)
+    by_path: dict[str, str] = {}
+    for device in _list_udev_links(_ALSA_BY_PATH_DIR):
+        by_path.setdefault(os.path.basename(device.target), device.name)
     try:
         entries = sorted(os.listdir(_PROC_ASOUND_DIR))
     except OSError:
         return []
-    cards: list[_AudioCard] = []
+    found: list[tuple[int, str, str, bool, bool]] = []
     for entry in entries:
         match = re.fullmatch(r"card(\d+)", entry)
         if not match:
@@ -4003,18 +4127,34 @@ def _discover_usb_audio_cards() -> list[_AudioCard]:
             pcms = os.listdir(card_dir)
         except OSError:
             pcms = []
-        index = int(match.group(1))
-        cards.append(
-            _AudioCard(
-                index=index,
-                usbid=usbid,
-                label=label,
-                link=links.get(f"controlC{index}"),
-                capture=any(re.fullmatch(r"pcm\d+c", n) for n in pcms),
-                playback=any(re.fullmatch(r"pcm\d+p", n) for n in pcms),
+        found.append(
+            (
+                int(match.group(1)),
+                usbid,
+                label,
+                any(re.fullmatch(r"pcm\d+c", n) for n in pcms),
+                any(re.fullmatch(r"pcm\d+p", n) for n in pcms),
             )
         )
-    return cards
+    keys = [_udev_properties(f"/dev/snd/controlC{i}").get("ID_SERIAL") for i, *_ in found]
+    collided = _collided(
+        keys, [(usbid, f"controlC{i}" in by_id) for i, usbid, *_ in found]
+    )
+    return [
+        _AudioCard(
+            index=i,
+            usbid=usbid,
+            label=label,
+            link=by_id.get(f"controlC{i}"),
+            path_link=by_path.get(f"controlC{i}"),
+            unit=_usb_unit(
+                by_id.get(f"controlC{i}"), by_path.get(f"controlC{i}"), collided[n], _alsa_trees()
+            ),
+            capture=capture,
+            playback=playback,
+        )
+        for n, (i, usbid, label, capture, playback) in enumerate(found)
+    ]
 
 
 def _cached_twin_metadata() -> dict[str, dict[str, Any]]:
@@ -4034,29 +4174,29 @@ def _cached_twin_metadata() -> dict[str, dict[str, Any]]:
 
 
 def _load_twin_audio_pins() -> dict[str, str]:
-    """{twin_uuid: by-id name} for cached twins whose serial_number or audio_device
-    names a /dev/snd/by-id link; raw hardware serials are not audio pins.
+    """{twin_uuid: link path} for cached twins whose serial_number or audio_device
+    names a /dev/snd by-id or by-path link; raw hardware serials are not audio pins.
     """
     pins: dict[str, str] = {}
     for uuid_, metadata in _cached_twin_metadata().items():
         for key in ("serial_number", "audio_device"):
             value = metadata.get(key)
-            name = _udev_pin_name(value, _ALSA_BY_ID_DIR) if isinstance(value, str) else None
-            if name is not None:
-                pins[uuid_] = name
+            path = _udev_link_path(value, _alsa_trees()) if isinstance(value, str) else None
+            if path is not None:
+                pins[uuid_] = path
                 break
     return pins
 
 
 def _load_twin_audio_serials() -> dict[str, str]:
     """{twin_uuid: serial} for twins whose serial_number is a hardware serial an
-    operator set; a by-id link name there is a legacy pin, not a serial.
+    operator set; a udev link name there is a legacy pin, not a serial.
     """
     serials: dict[str, str] = {}
     for uuid_, metadata in _cached_twin_metadata().items():
         value = metadata.get("serial_number")
         if isinstance(value, str) and value.strip():
-            if _udev_pin_name(value, _ALSA_BY_ID_DIR) is None:
+            if _udev_link_path(value, _alsa_trees()) is None:
                 serials[uuid_] = value.strip()
     return serials
 
@@ -4075,24 +4215,30 @@ def _audio_card_for_serial(cards: list[_AudioCard], serial: str) -> _AudioCard |
     return matches[0] if len(matches) == 1 else None
 
 
-def _audio_pin_metadata(name: str) -> dict[str, str]:
-    """Pin an audio device to its by-id link, as cameras pin theirs."""
-    return {"audio_device": f"{_ALSA_BY_ID_DIR}/{name}", "serial_number": ""}
+def _audio_card_for_pin(cards: list[_AudioCard], path: str) -> _AudioCard | None:
+    """The attached card a by-id or by-path link currently resolves to."""
+    match = re.fullmatch(r"controlC(\d+)", os.path.basename(os.path.realpath(path)))
+    return next((c for c in cards if match and c.index == int(match.group(1))), None)
+
+
+def _audio_pin_metadata(value: str) -> dict[str, str]:
+    """Pin an audio device to its by-id or by-path link, as cameras pin theirs."""
+    return {"audio_device": _udev_link_path(value, _alsa_trees()) or value, "serial_number": ""}
 
 
 def _detect_and_select_audio_devices() -> None:
-    """Associate each microphone/speaker twin with a /dev/snd/by-id device (Linux).
+    """Associate each microphone/speaker twin with a /dev/snd link (Linux).
 
-    Same contract as cameras. A serial an operator set on the twin is checked
-    first and kept; a saved by-id link is reused when connected. A new choice is
-    written as audio_device plus a blank serial. Anything whose device is missing
-    is replaced only with approval; unambiguous pairings are automatic, the rest
-    is a menu. Identical units udev collapsed onto one link are never pinned.
+    Same contract as cameras: an operator serial is kept, a saved link is reused
+    when it resolves and is not a by-id name identical units share, and a new
+    choice is written as audio_device plus a blank serial (by-id, or by-path when
+    identical units collide). A missing device is replaced only with approval.
     Best-effort.
     """
     if platform.system() != "Linux":
         return
 
+    # uuid -> (name, needs capture, needs playback)
     twins: dict[str, tuple[str, bool, bool]] = {}
     for uuid_, name in _list_microphone_twins():
         twins[uuid_] = (name, True, False)
@@ -4103,22 +4249,44 @@ def _detect_and_select_audio_devices() -> None:
         return
 
     cards = _discover_usb_audio_cards()
-    ambiguous = _ambiguous_groups((c.usbid, bool(c.link)) for c in cards)
     serials = {u: s for u, s in _load_twin_audio_serials().items() if u in twins}
-    saved = {u: n for u, n in _load_twin_audio_pins().items() if u in twins and u not in serials}
-    connected = {u: n for u, n in saved.items() if _udev_pin_is_connected(n, _ALSA_BY_ID_DIR)}
-    by_serial: dict[str, str] = {}
+    saved = {u: p for u, p in _load_twin_audio_pins().items() if u in twins and u not in serials}
+    by_serial: dict[str, _AudioCard] = {}
     for uuid_, serial in serials.items():
         card = _audio_card_for_serial(cards, serial)
-        if card is not None and card.link:
-            by_serial[uuid_] = card.link
+        if card is not None:
+            by_serial[uuid_] = card
+    connected: dict[str, _AudioCard] = {}
+    problem: dict[str, str] = {}
+    for uuid_, path in saved.items():
+        card = _audio_card_for_pin(cards, path)
+        if card is None:
+            problem[uuid_] = f"saved device {os.path.basename(path)} is not connected"
+        elif path.startswith(_ALSA_BY_ID_DIR + "/") and card.unit.collided:
+            problem[uuid_] = (
+                f"saved device {os.path.basename(path)} is a name identical units share"
+            )
+        else:
+            connected[uuid_] = card
 
     console.print("\n[bold]Audio devices[/bold]")
+    for card in cards:
+        if card.unit.collided:
+            console.print(
+                f"  [yellow]{card.label}: identical to another attached unit, so its udev id "
+                f"is shared — "
+                + (
+                    "pinned by USB port, keep it in the same port"
+                    if card.pin
+                    else "no USB port link either, cannot be pinned"
+                )
+                + "[/yellow]"
+            )
     for uuid_, serial in serials.items():
         if uuid_ in by_serial:
             console.print(
                 f"  {twins[uuid_][0]}: pinned by serial {serial} -> "
-                f"[cyan]{by_serial[uuid_]}[/cyan] (connected)"
+                f"[cyan]{by_serial[uuid_].link}[/cyan] (connected)"
             )
         else:
             console.print(
@@ -4127,22 +4295,18 @@ def _detect_and_select_audio_devices() -> None:
                 f"[dim]Its driver will refuse to start rather than open a different "
                 f"device. Check the twin's metadata.serial_number.[/dim]"
             )
-    for card in cards:
-        if card.usbid in ambiguous:
-            console.print(
-                f"  [yellow]{card.label}: identical to another attached unit and udev "
-                f"gives them no distinct id — cannot be pinned[/yellow]"
-            )
-    for uuid_, name in saved.items():
+    for uuid_, path in saved.items():
         if uuid_ in connected:
             console.print(
-                f"  {twins[uuid_][0]}: using saved device [cyan]{name}[/cyan] (connected)"
+                f"  {twins[uuid_][0]}: using saved device "
+                f"[cyan]{os.path.basename(path)}[/cyan] (connected)"
             )
         else:
             console.print(
-                f"  {twins[uuid_][0]}: [yellow]saved device {name} is not connected "
-                f"— it must be selected again[/yellow]"
+                f"  {twins[uuid_][0]}: [yellow]{problem[uuid_]} — "
+                f"it must be selected again[/yellow]"
             )
+    # With a single device there is nothing to re-map, so nothing to ask.
     if (
         (connected or by_serial)
         and len(cards) > 1
@@ -4152,56 +4316,61 @@ def _detect_and_select_audio_devices() -> None:
         by_serial.clear()
         serials.clear()
         saved.clear()
+        problem.clear()
 
     pending = [u for u in twins if u not in connected and u not in by_serial]
-    taken: dict[str, str] = {
-        link: twins[u][0] for u, link in {**connected, **by_serial}.items()
+    owner: dict[int, str] = {
+        c.index: twins[u][0] for u, c in {**connected, **by_serial}.items()
     }
     pins: dict[str, dict[str, str]] = {}
     by_index = {c.index: c for c in cards}
     cached = _cached_twin_metadata()
 
-    for uuid_, name in connected.items():
+    # Bring twins written by an older installer (link name in serial_number) to the new shape.
+    for uuid_, card in connected.items():
         metadata = cached.get(uuid_, {})
-        current = metadata.get("audio_device") == f"{_ALSA_BY_ID_DIR}/{name}"
-        if not current or str(metadata.get("serial_number") or "").strip():
-            pins[uuid_] = _audio_pin_metadata(name)
+        path = saved[uuid_]
+        if metadata.get("audio_device") != path or str(metadata.get("serial_number") or "").strip():
+            pins[uuid_] = _audio_pin_metadata(path)
 
     def _can_serve(uuid_: str, card: _AudioCard) -> bool:
         _name, needs_capture, needs_playback = twins[uuid_]
         return (card.capture or not needs_capture) and (card.playback or not needs_playback)
 
-    def _pinnable(card: _AudioCard) -> bool:
-        return bool(card.link) and card.usbid not in ambiguous
-
     def _assign(uuid_: str, card: _AudioCard) -> None:
-        pins[uuid_] = _audio_pin_metadata(card.link or "")
-        taken[card.link or ""] = twins[uuid_][0]
+        pins[uuid_] = _audio_pin_metadata(card.pin or "")
+        owner[card.index] = twins[uuid_][0]
+        if card.unit.by_port:
+            console.print(
+                "[yellow]No distinct udev id for this device (identical units or none): "
+                "pinned by USB port, keep it plugged into the same port.[/yellow]"
+            )
 
     for uuid_ in pending:
         name = twins[uuid_][0]
+        # Unpinnable cards stay in the pool as rivals but are never paired automatically.
         result = _infer_associations(
             [u for u in pending if u not in pins],
             list(by_index),
-            claimed={c.index for c in cards if c.link in taken},
+            claimed=set(owner),
             compatible=lambda t, i: _can_serve(t, by_index[i]),
         )
         decided = result.assigned.get(uuid_)
-        if decided and _pinnable(by_index[decided[0]]):
+        if decided and by_index[decided[0]].pin:
             card = by_index[decided[0]]
             missing = (
-                f"saved device {saved[uuid_]} is not connected"
+                problem.get(uuid_)
                 if uuid_ in saved
                 else f"serial {serials[uuid_]} matches no attached device"
                 if uuid_ in serials
                 else None
             )
             if missing is None or _ask_yes_no(
-                f"{name}'s {missing}. Use {card.link} instead?", on_eof=False
+                f"{name}'s {missing}. Use {os.path.basename(card.pin)} instead?", on_eof=False
             ):
                 console.print(
                     f"[green]{name}[/green]: associated automatically with "
-                    f"[cyan]{card.link}[/cyan] — {decided[1]}."
+                    f"[cyan]{os.path.basename(card.pin)}[/cyan] — {decided[1]}."
                 )
                 _assign(uuid_, card)
                 continue
@@ -4209,11 +4378,11 @@ def _detect_and_select_audio_devices() -> None:
                 console.print(f"[yellow]{name} keeps its serial {serials[uuid_]}.[/yellow]")
                 continue
 
-        pool = [c for c in cards if _pinnable(c) and _can_serve(uuid_, c)]
+        pool = [c for c in cards if c.pin and _can_serve(uuid_, c)]
         if not pool:
             console.print(
-                f"[yellow]No USB audio device that can be pinned reliably was found for "
-                f"{name} (it needs a distinct udev id). "
+                f"[yellow]No USB audio device that can be pinned was found for {name} "
+                f"(it needs a udev id or a USB port link). "
                 f"Plug one in and run: cyberwave edge install[/yellow]"
             )
             continue
@@ -4224,18 +4393,35 @@ def _detect_and_select_audio_devices() -> None:
         ):
             console.print(f"[yellow]{name} keeps its serial {serials[uuid_]}.[/yellow]")
             continue
-        pool = [c for c in pool if c.link not in taken] or pool
+        pool = [c for c in pool if c.index not in owner] or pool
         if len(pool) == 1:
-            if _ask_yes_no(f"Only one device ({pool[0].link}) is available for {name}. Use it?"):
-                _assign(uuid_, pool[0])
+            card = pool[0]
+            holder = owner.get(card.index)
+            if holder:
+                use = _ask_yes_no(
+                    f"{os.path.basename(card.pin)} is already used by {holder}. "
+                    f"Also use it for {name}?",
+                    default=False,
+                    on_eof=False,
+                )
+            else:
+                use = _ask_yes_no(
+                    f"Only one device ({os.path.basename(card.pin)}) is available for "
+                    f"{name}. Use it?"
+                )
+            if use:
+                _assign(uuid_, card)
             continue
 
         console.print(f"\n[bold]Audio device for {name}[/bold] [dim]({uuid_[:8]}...)[/dim]")
         for i, card in enumerate(pool):
-            owner = taken.get(card.link or "")
-            suffix = f"  [yellow](assigned to {owner})[/yellow]" if owner else ""
+            holder = owner.get(card.index)
+            suffix = f"  [yellow](assigned to {holder})[/yellow]" if holder else ""
+            if card.unit.collided:
+                suffix += "  [yellow](identical unit: pinned by USB port)[/yellow]"
             console.print(
-                f"  [bold cyan]{i}[/bold cyan])  {card.link}  [dim]card {card.index}[/dim]{suffix}"
+                f"  [bold cyan]{i}[/bold cyan])  {os.path.basename(card.pin or '')}  "
+                f"[dim]{card.label}, card {card.index}[/dim]{suffix}"
             )
         try:
             raw = Prompt.ask(f"Audio device for {name}", default="0")

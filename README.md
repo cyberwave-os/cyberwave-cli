@@ -506,6 +506,13 @@ Some cameras have no serial to pin — the Logitech C920, for instance, reports 
 
 Pick `by-id` when the model is unique on the host, `by-path` when you may attach a second identical camera and care which port it is in. An `rtsp://` or `http://` URL in the same field marks the twin as a network camera, which is likewise never asked about and consumes no local device. A positional value (`0`, `/dev/video6`) is **not** identity — it means "whatever enumerated there this boot" — so those twins are still prompted. `serial_number` wins when a twin carries both.
 
+**How the installer pins USB cameras and microphones on Linux.** Each camera or microphone twin is pinned to a stable udev link, written to the twin as `metadata.video_device` (cameras) or `metadata.audio_device` (microphones and speakers) with `metadata.serial_number` left blank; a serial you set on the twin yourself is honoured and never rewritten. A single device such as a Logitech C920 is both a camera and a microphone, and each sensor is pinned on its own, so the camera driver and the microphone driver can use the same hardware.
+
+- A device whose udev `ID_SERIAL` (vendor, model and USB serial) is unique on the host is pinned by `by-id` (`/dev/v4l/by-id`, `/dev/snd/by-id`).
+- Identical units share one `ID_SERIAL` (two C920s without a USB serial), so no `by-id` name can tell them apart and udev may hand the name to either unit after a reboot. Those units are pinned by `by-path` instead (`/dev/v4l/by-path`, `/dev/snd/by-path`), which follows the USB port: keep each unit plugged into the same port. The menu marks them "identical unit: pinned by USB port". A saved `by-id` pin that points at such a unit is not trusted and the twin is asked again.
+- A unit with neither a unique `by-id` name nor a `by-path` link cannot be pinned and is asked again on the next install.
+- When udev data is not available the installer falls back to counting links: identical models where only some units own a `by-id` link are treated as identical.
+
 ```bash
 sudo cyberwave edge install
 sudo cyberwave edge install -y   # skip prompts

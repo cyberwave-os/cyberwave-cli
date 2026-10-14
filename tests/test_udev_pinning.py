@@ -71,8 +71,7 @@ def test_camera_name_comes_from_the_lowest_node_index_it_owns(monkeypatch, tmp_p
         "_V4L_BY_ID_DIR",
         {f"{rs}-video-index3": meta, f"{rs}-video-index2": depth, f"{rs}-video-index0": colour},
     )
-    cam = _FakeCam(0, "RealSense", colour, paths=[colour, depth, meta])
-    assert core._udev_name_for_camera(cam) == f"{rs}-video-index0"
+    assert core._best_link(core._V4L_BY_ID_DIR, {colour, depth, meta}) == f"{rs}-video-index0"
 
 
 def test_camera_is_named_even_when_capture_is_not_index_zero(monkeypatch, tmp_path):
@@ -80,7 +79,7 @@ def test_camera_is_named_even_when_capture_is_not_index_zero(monkeypatch, tmp_pa
     core = load_core_module(monkeypatch)
     node = _node(tmp_path, "video4")
     _tree(monkeypatch, core, tmp_path, "_V4L_BY_ID_DIR", {"usb-Acme_Cam_77-video-index2": node})
-    assert core._udev_name_for_camera(_FakeCam(4, "Cam", node)) == "usb-Acme_Cam_77-video-index2"
+    assert core._best_link(core._V4L_BY_ID_DIR, {node}) == "usb-Acme_Cam_77-video-index2"
 
 
 def test_list_alsa_by_id_and_missing_directory(monkeypatch, tmp_path):
@@ -204,25 +203,6 @@ def test_depth_twin_with_absent_by_id_pin_is_not_waved_through(monkeypatch, tmp_
 
     data = json.loads((tmp_path / "cameras.json").read_text())
     assert data["twin_to_device"] == {TWIN_A: 0}  # it was asked, not deferred
-
-
-def test_identical_cameras_sharing_one_link_are_unidentifiable(monkeypatch, tmp_path):
-    """Two C920s without a USB serial collapse onto a single by-id link."""
-    core = load_core_module(monkeypatch)
-    node0, node1 = _node(tmp_path, "video0"), _node(tmp_path, "video1")
-    _tree(monkeypatch, core, tmp_path, "_V4L_BY_ID_DIR", {C920: node1})  # video0 lost
-
-    cams = [_FakeCam(0, "C920", node0), _FakeCam(1, "C920", node1)]
-    assert core._ambiguous_camera_cards(cams) == {"C920"}
-
-
-def test_identical_cameras_with_distinct_links_are_fine(monkeypatch, tmp_path):
-    core = load_core_module(monkeypatch)
-    node0, node1 = _node(tmp_path, "video0"), _node(tmp_path, "video1")
-    _tree(monkeypatch, core, tmp_path, "_V4L_BY_ID_DIR", {C920: node0, BRIO: node1})
-
-    cams = [_FakeCam(0, "C920", node0), _FakeCam(1, "C920", node1)]
-    assert core._ambiguous_camera_cards(cams) == set()
 
 
 def test_unidentifiable_camera_is_selectable_but_never_pinned(monkeypatch, tmp_path):
@@ -552,7 +532,8 @@ def test_audio_two_twins_one_device_asks_to_share(monkeypatch, tmp_path):
 
     core._detect_and_select_audio_devices()
 
-    assert len(confirms) == 2 and all("Only one device" in c for c in confirms)
+    assert len(confirms) == 2
+    assert "Only one device" in confirms[0] and "already used by Mic A" in confirms[1]
     assert set(pinned) == {TWIN_A, TWIN_B}
 
 
@@ -609,7 +590,7 @@ def test_audio_pin_in_audio_device_field_is_recognised(monkeypatch, tmp_path):
     _write_audio_twin(
         tmp_path, TWIN_A, "Mic", extra={"audio_device": f"{core._ALSA_BY_ID_DIR}/{MIC}"}
     )
-    assert core._load_twin_audio_pins() == {TWIN_A: MIC}
+    assert core._load_twin_audio_pins() == {TWIN_A: f"{core._ALSA_BY_ID_DIR}/{MIC}"}
 
 
 def test_audio_declining_connected_pin_reasks(monkeypatch, tmp_path):
