@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from tests._core_module_loader import load_core_module
+from tests._core_module_loader import load_core_module, use_production_device_paths
 from tests.test_camera_mapping import (
     SERIAL_A,
     TWIN_A,
@@ -226,6 +226,7 @@ def test_unidentifiable_camera_is_selectable_but_never_pinned(monkeypatch, tmp_p
 
 def test_camera_pin_metadata_uses_video_device_and_blanks_a_stale_serial(monkeypatch):
     core = load_core_module(monkeypatch)
+    use_production_device_paths(monkeypatch, core)
     assert core._camera_pin_metadata(C920) == {
         "video_device": f"/dev/v4l/by-id/{C920}",
         "serial_number": "",
@@ -235,6 +236,7 @@ def test_camera_pin_metadata_uses_video_device_and_blanks_a_stale_serial(monkeyp
 
 def test_audio_pin_metadata_matches_the_camera_shape(monkeypatch):
     core = load_core_module(monkeypatch)
+    use_production_device_paths(monkeypatch, core)
     assert core._audio_pin_metadata(MIC) == {
         "audio_device": f"/dev/snd/by-id/{MIC}",
         "serial_number": "",
@@ -250,6 +252,7 @@ def test_persist_twin_pins_sends_exactly_the_given_metadata(monkeypatch):
     from types import SimpleNamespace
 
     core = load_core_module(monkeypatch)
+    use_production_device_paths(monkeypatch, core)
     import cyberwave_cli.credentials as credentials
     import cyberwave_cli.utils as utils
 
@@ -688,19 +691,20 @@ def test_audio_no_devices_pins_nothing(monkeypatch, tmp_path):
     assert asked == [] and pinned == {}
 
 
-def test_audio_invalid_answer_skips_the_twin(monkeypatch, tmp_path):
+def test_audio_invalid_answer_is_asked_again_and_s_leaves_the_twin_unbound(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
     _write_audio_twin(tmp_path, TWIN_A, "Mic")
-    _a, _c, pinned = _audio_env(
+    asked, _c, pinned = _audio_env(
         monkeypatch,
         core,
         tmp_path,
         [_card(CARD_HEADSET, HEADSET), _card(CARD_MIC, MIC)],
-        answers=["9"],
+        answers=["9", "x", "s"],
     )
 
     core._detect_and_select_audio_devices()
 
+    assert asked == ["Audio device for Mic"] * 3
     assert pinned == {}
 
 
@@ -1036,20 +1040,23 @@ def test_ambiguous_groups_flags_only_partially_linked_groups(monkeypatch):
     assert core._ambiguous_groups(units) == {"a"}
 
 
-def test_audio_negative_index_is_not_a_listed_device(monkeypatch, tmp_path):
+def test_audio_negative_index_is_not_a_listed_device_and_a_card_number_then_works(
+    monkeypatch, tmp_path
+):
     core = load_core_module(monkeypatch)
     _write_audio_twin(tmp_path, TWIN_A, "Mic")
-    _a, _c, pinned = _audio_env(
+    asked, _c, pinned = _audio_env(
         monkeypatch,
         core,
         tmp_path,
         [_card(CARD_HEADSET, HEADSET), _card(CARD_MIC, MIC)],
-        answers=["-1"],
+        answers=["-1", "1"],  # cards are numbered 0 and 1 in this fixture
     )
 
     core._detect_and_select_audio_devices()
 
-    assert pinned == {}
+    assert asked == ["Audio device for Mic"] * 2
+    assert pinned == {TWIN_A: _audio_pin(core, MIC)}
 
 
 def test_video_device_pin_with_parent_components_is_not_a_pin(monkeypatch, tmp_path):

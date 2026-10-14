@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from .config import get_api_url
+from .url_utils import require_valid_url
 
 # Auth-specific endpoints — these are not part of the Cyberwave Python SDK
 # because the SDK assumes a token/api_key is already available.  The CLI
@@ -140,6 +141,7 @@ class AuthClient:
         import httpx
 
         self.base_url = base_url or get_api_url()
+        require_valid_url(self.base_url, "CYBERWAVE_BASE_URL")
         self._client = httpx.Client(
             base_url=self.base_url,
             headers={

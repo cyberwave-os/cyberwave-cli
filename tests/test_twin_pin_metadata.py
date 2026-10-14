@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests._core_module_loader import load_core_module
+from tests._core_module_loader import load_core_module, use_production_device_paths
 from tests.test_camera_mapping import (
     SERIAL_A,
     TWIN_A,
@@ -48,6 +48,7 @@ class _Backend:
 @pytest.fixture
 def env(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
+    use_production_device_paths(monkeypatch, core)
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
     import cyberwave_cli.credentials as credentials
     import cyberwave_cli.utils as utils
@@ -268,3 +269,74 @@ def test_operator_audio_serial_is_a_serial_not_a_pin(env):
 
     assert core._load_twin_audio_serials() == {TWIN_A: "00026"}
     assert core._load_twin_audio_pins() == {}
+
+
+def _write_local(env, uuid_, metadata):
+    (env.dir / f"{uuid_}.json").write_text(
+        json.dumps({"uuid": uuid_, "name": "T", "metadata": metadata})
+    )
+
+
+def _read_local(env, uuid_):
+    return json.loads((env.dir / f"{uuid_}.json").read_text())
+
+
+def test_a_saved_pin_is_mirrored_into_the_local_twin_file(env):
+    """A running edge-core would otherwise push the stale downloaded file over the new pin."""
+    core = env.core
+    old = {"video_device": "/dev/v4l/by-id/usb-old-video-index0", "serial_number": "", "keep": 1}
+    _write_local(env, TWIN_A, old)
+
+    core._persist_twin_pins({TWIN_A: core._camera_pin_metadata(C920)})
+
+    local = _read_local(env, TWIN_A)
+    assert local["metadata"] == {"video_device": STABLE_VIDEO, "serial_number": "", "keep": 1}
+    assert local["uuid"] == TWIN_A and local["name"] == "T"
+    assert list(env.dir.glob(".*.tmp")) == []
+
+
+def test_every_ordering_of_download_pin_and_edge_core_push_ends_on_the_new_pin(env):
+    core = env.core
+    _write_local(env, TWIN_A, {"video_device": "/dev/v4l/by-id/usb-old-video-index0"})
+    core._persist_twin_pins({TWIN_A: core._camera_pin_metadata(C920)})
+
+    env.backend.metadata[TWIN_A].update(_read_local(env, TWIN_A)["metadata"])
+
+    assert env.backend.metadata[TWIN_A]["video_device"] == STABLE_VIDEO
+
+
+def test_a_failed_update_leaves_the_local_twin_file_untouched(env):
+    core = env.core
+    old = {"video_device": "/dev/v4l/by-id/usb-old-video-index0"}
+    _write_local(env, TWIN_A, old)
+    before = (env.dir / f"{TWIN_A}.json").read_text()
+    env.backend.fail_for = {TWIN_A}
+
+    assert core._persist_twin_pins({TWIN_A: core._camera_pin_metadata(C920)}) == 0
+
+    assert (env.dir / f"{TWIN_A}.json").read_text() == before
+
+
+def test_a_missing_or_corrupt_local_twin_file_never_blocks_the_pin(env):
+    core = env.core
+    (env.dir / f"{TWIN_B}.json").write_text("{not json")
+
+    count = core._persist_twin_pins(
+        {TWIN_A: core._camera_pin_metadata(C920), TWIN_B: core._audio_pin_metadata(MIC)}
+    )
+
+    assert count == 2
+    assert not (env.dir / f"{TWIN_A}.json").exists()  # nothing invented
+    assert (env.dir / f"{TWIN_B}.json").read_text() == "{not json"
+
+
+def test_a_local_twin_file_without_metadata_gets_the_pin(env):
+    core = env.core
+    (env.dir / f"{TWIN_A}.json").write_text(json.dumps({"uuid": TWIN_A}))
+
+    core._persist_twin_pins({TWIN_A: core._audio_pin_metadata(MIC)})
+
+    assert _read_local(env, TWIN_A)["metadata"] == {
+        "audio_device": STABLE_AUDIO,
+        "serial_number": "",
+    }

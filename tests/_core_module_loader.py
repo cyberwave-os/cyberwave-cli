@@ -140,4 +140,39 @@ def load_core_module(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     sys.modules["cyberwave_cli.core"] = module
     spec.loader.exec_module(module)
+    _seal_host_hardware(monkeypatch, module)
     return module
+
+
+def _seal_host_hardware(monkeypatch, module: ModuleType) -> None:
+    """Keep a fresh core module away from this machine's devices.
+
+    Without it the udev trees, /proc/asound and udevadm of whatever host runs the
+    tests leak into every test. Tests that need device data patch their own
+    fixtures after loading, so theirs win.
+    """
+    for name in (
+        "_V4L_BY_ID_DIR",
+        "_V4L_BY_PATH_DIR",
+        "_ALSA_BY_ID_DIR",
+        "_ALSA_BY_PATH_DIR",
+        "_PROC_ASOUND_DIR",
+    ):
+        monkeypatch.setattr(module, name, "/nonexistent/cw-test", raising=False)
+    module._real_udev_properties = getattr(module, "_udev_properties", None)
+    monkeypatch.setattr(module, "_udev_properties", lambda node: {}, raising=False)
+
+
+def use_production_device_paths(monkeypatch, module: ModuleType) -> None:
+    """Point the udev trees back at /dev/... for tests that only check path strings.
+
+    Such tests never touch the filesystem; they assert on the literal values the
+    installer writes. Do not use it in a test that lists or resolves links.
+    """
+    for name, value in (
+        ("_V4L_BY_ID_DIR", "/dev/v4l/by-id"),
+        ("_V4L_BY_PATH_DIR", "/dev/v4l/by-path"),
+        ("_ALSA_BY_ID_DIR", "/dev/snd/by-id"),
+        ("_ALSA_BY_PATH_DIR", "/dev/snd/by-path"),
+    ):
+        monkeypatch.setattr(module, name, value)

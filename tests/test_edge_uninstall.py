@@ -5,6 +5,8 @@ from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
 
+import pytest
+
 rich_module = ModuleType("rich")
 rich_console_module = ModuleType("rich.console")
 rich_prompt_module = ModuleType("rich.prompt")
@@ -136,6 +138,7 @@ def test_stop_edge_worker_containers_stops_matching_containers(monkeypatch):
     ]
 
 
+@pytest.mark.usefixtures("host_commands_missing")
 def test_uninstall_edge_stops_driver_and_worker_containers(monkeypatch, tmp_path):
     config_dir = tmp_path / "cyberwave-config"
     config_dir.mkdir()

@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests._core_module_loader import load_core_module
+from tests._core_module_loader import load_core_module, use_production_device_paths
 from tests.test_camera_mapping import TWIN_A, TWIN_B, TWIN_C, _FakeCam, _write_twin_json
 from tests.test_udev_pinning import _node, _tree, _write_audio_twin
 
@@ -264,11 +264,13 @@ def test_usb_unit_prefers_by_id_and_uses_by_path_when_units_collide(monkeypatch)
 )
 def test_udev_link_path_accepts_both_trees_and_rejects_serials(monkeypatch, value, expected):
     core = load_core_module(monkeypatch)
+    use_production_device_paths(monkeypatch, core)
     assert core._udev_link_path(value, core._alsa_trees()) == expected
 
 
 def test_pin_metadata_for_either_tree(monkeypatch):
     core = load_core_module(monkeypatch)
+    use_production_device_paths(monkeypatch, core)
     port = "/dev/v4l/by-path/platform-xhci-hcd.1-usb-0:2:1.0-video-index0"
     assert core._camera_pin_metadata(port) == {"video_device": port, "serial_number": ""}
     assert core._camera_pin_metadata(RS_SERIAL) == {"serial_number": RS_SERIAL}
@@ -279,6 +281,7 @@ def test_pin_metadata_for_either_tree(monkeypatch):
 
 def test_udev_properties_parses_udevadm_and_survives_its_absence(monkeypatch):
     core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "_udev_properties", core._real_udev_properties)
     out = "DEVNAME=/dev/video0\nID_SERIAL=046d_HD_Pro_Webcam_C920\nID_PATH=pci-0\n"
     monkeypatch.setattr(
         subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout=out)
@@ -296,9 +299,11 @@ def test_udev_properties_parses_udevadm_and_survives_its_absence(monkeypatch):
     assert core._udev_properties("/dev/video0") == {}
 
 
+@pytest.mark.allow_host_commands
 def test_udev_properties_runs_udevadm_with_the_expected_arguments(monkeypatch, tmp_path):
     """Exercise the real subprocess call against a stand-in udevadm on PATH."""
     core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "_udev_properties", core._real_udev_properties)
     script = tmp_path / "bin" / "udevadm"
     script.parent.mkdir()
     script.write_text(
@@ -346,9 +351,12 @@ def test_camera_menu_marks_identical_units_and_shows_the_port(rig):
     rig.build()
     rig.core._render_camera_menu([rs, a, b])
     text = "\n".join(rig.printed)
-    assert text.count("identical unit: pinned by USB port") == 2
-    assert f"id {RS_VIDEO_BY_ID}" in text
-    assert f"port {PORT_1}.0-video-index0" in text and f"port {PORT_2}.0-video-index0" in text
+    assert text.count(" *") == 2  # the two identical C920s
+    assert text.count("identical units, pinned by USB port") == 1  # one footnote, not one per line
+    assert "id 926223022293" in text  # the RealSense, by its USB serial
+    assert f"port {PORT_1.removeprefix('platform-')}.0" in text
+    assert f"port {PORT_2.removeprefix('platform-')}.0" in text
+    assert "video-index" not in text and "/dev/" not in text
 
 
 def test_two_identical_c920_cameras_are_pinned_by_port_not_by_name(rig):
@@ -527,7 +535,7 @@ def test_a_saved_by_id_name_shared_by_identical_cameras_is_not_trusted(rig):
 
     rig.run_cameras()
 
-    assert any("name shared by identical cameras" in line for line in rig.printed)
+    assert any("shared by identical cameras" in line for line in rig.printed)
     assert rig.prompts, "the operator must choose again"
     assert rig.pinned[TWIN_A]["video_device"] == rig.path(
         "_V4L_BY_PATH_DIR", f"{PORT_1}.0-video-index0"
@@ -594,7 +602,7 @@ def test_the_c920_microphones_are_offered_to_the_generic_microphone(rig):
     uma = rig.path("_ALSA_BY_ID_DIR", UMA_AUDIO_BY_ID)
     rig.mic_twin(TWIN_A, "UMA-16 v2", extra={"audio_device": uma})
     rig.mic_twin(TWIN_B, "Generic Microphone")
-    rig.answers = ["1"]
+    rig.answers = ["4"]  # the menu is numbered by ALSA card: C920_1 is card 4
 
     rig.run_audio()
 
@@ -645,7 +653,7 @@ def test_two_microphone_twins_on_two_identical_c920s_are_pinned_by_port(rig):
     rig.build()
     rig.mic_twin(TWIN_A, "Mic A")
     rig.mic_twin(TWIN_B, "Mic B")
-    rig.answers = ["1"]
+    rig.answers = ["4"]
 
     rig.run_audio()
 
@@ -709,7 +717,7 @@ def test_a_saved_by_id_microphone_name_shared_by_identical_units_is_not_trusted(
     rig.build()
     shared = rig.path("_ALSA_BY_ID_DIR", C920_AUDIO_BY_ID)
     rig.mic_twin(TWIN_A, "Mic", extra={"audio_device": shared})
-    rig.answers = ["1"]  # the pool is UMA-16, C920, C920_1
+    rig.answers = ["3"]  # the pool is card 2 (UMA-16), 3 (C920), 4 (C920_1)
 
     rig.run_audio()
 
@@ -771,7 +779,7 @@ def test_a_c920_is_pinned_as_a_camera_and_as_a_microphone_by_two_drivers(rig):
     two_c920_hardware(rig)
     rig.camera_twin(TWIN_A, "Generic Camera")
     rig.mic_twin(TWIN_B, "Generic Microphone")
-    rig.answers = ["9", "1"]
+    rig.answers = ["9", "4"]
 
     rig.run_cameras().run_audio()
 
@@ -788,7 +796,7 @@ def test_a_c920_is_pinned_as_a_camera_and_as_a_microphone_by_two_drivers(rig):
 def test_one_twin_with_both_sensors_gets_both_pins_without_clobbering_either(rig):
     two_c920_hardware(rig)
     rig.combo_twin(TWIN_A, "C920 twin")
-    rig.answers = ["9", "1"]
+    rig.answers = ["9", "4"]
 
     rig.run_cameras().run_audio()
 
@@ -805,7 +813,7 @@ def test_camera_and_microphone_of_the_same_hardware_do_not_have_to_match(rig):
     two_c920_hardware(rig)
     rig.camera_twin(TWIN_A, "Generic Camera")
     rig.mic_twin(TWIN_B, "Generic Microphone")
-    rig.answers = ["0", "1"]
+    rig.answers = ["0", "4"]
 
     rig.run_cameras().run_audio()
 
@@ -822,7 +830,7 @@ def test_the_reported_installation_end_to_end(rig):
     rig.camera_twin(TWIN_B, "Logitech C920")
     rig.mic_twin(TWIN_C, "UMA-16 v2")
     rig.mic_twin(TWIN_D, "Generic Microphone")
-    rig.answers = ["2", "9", "0", "1"]  # D455, C920 at port 2, UMA-16, C920 microphone at port 2
+    rig.answers = ["2", "9", "2", "4"]  # D455, C920 at port 2, UMA-16 (card 2), C920 mic (card 4)
 
     rig.run_cameras().run_audio()
 
@@ -1006,7 +1014,7 @@ def test_cameras_one_sensor_serves_one_twin_and_the_mismatch_is_warned(rig, unit
     assert len(set(pins)) == len(pins), "a camera was given to two twins"
     listing = "\n".join(rig.printed)
     for i in range(units):
-        assert f"pci-port{i}-video-index0" in listing or units == 1
+        assert f"port port{i}" in listing or units == 1
     assert _count(rig, "have no physical camera") == (1 if twins > units else 0)
     assert _count(rig, "are not used by any twin") == (1 if units > twins else 0)
     if twins > units:
@@ -1235,8 +1243,8 @@ def test_every_attached_sensor_is_printed_even_when_they_are_the_same_hardware(r
     assert "Detected 3 camera(s) and 1 camera twin(s)" in text
     assert "Detected 3 USB audio device(s)" in text
     for i in range(3):
-        assert f"port pci-port{i}-video-index0" in text
-        assert f"pci-port{i}.2" in text
+        assert f"port port{i}" in text
+        assert f"port{i}.2" in text
 
 
 # ---- more situations ---------------------------------------------------------------------------
@@ -1420,3 +1428,152 @@ def test_no_microphone_ends_up_bound_to_two_twins(rig, seed):
             final.pop(uuid_, None)
     nodes = [os.path.realpath(p) for p in final.values() if os.path.exists(os.path.realpath(p))]
     assert len(nodes) == len(set(nodes)), (seed, labels, rig.printed)
+
+
+# ---- menus: defaults that fit the twin, and honest wording ---------------------------------
+
+
+def _record_defaults(rig, answer="default"):
+    seen: list[tuple[str, int | None]] = []
+
+    def prompt(_cameras, valid, *, prompt, default_index):
+        seen.append((prompt, default_index))
+        return default_index if default_index is not None else next(iter(valid))
+
+    rig.mp.setattr(rig.core, "_prompt_camera_index", prompt)
+    return seen
+
+
+def test_a_depth_twin_defaults_to_the_realsense_and_a_c920_twin_to_a_c920(rig):
+    rig.camera(8, "C920", id_serial=C920_ID_A, by_id=f"usb-{C920_ID_A}-video-index0")
+    rig.camera(0, "C920", id_serial=C920_ID_B, by_id=f"usb-{C920_ID_B}-video-index0")
+    rig.camera(2, "Intel RealSense D455", id_serial=RS_ID, by_id=RS_VIDEO_BY_ID)
+    rig.build()
+    rig.camera_twin(TWIN_A, "Realsense D455", depth=True)
+    rig.camera_twin(TWIN_B, "Logitech C920")
+    seen = _record_defaults(rig)
+
+    rig.run_cameras()
+
+    assert seen == [("Camera for Realsense D455", 2), ("Camera for Logitech C920", 8)]
+
+
+def test_the_default_follows_the_twins_model_not_the_discovery_order(rig):
+    rig.camera(1, "Brio 100", id_serial="046d_Brio", by_id="usb-046d_Brio-video-index0")
+    rig.camera(5, "HD Pro Webcam C920", id_serial=C920_ID_A, by_id=f"usb-{C920_ID_A}-video-index0")
+    rig.camera(6, "Other", id_serial="x_Other", by_id="usb-x_Other-video-index0")
+    rig.build()
+    rig.camera_twin(TWIN_A, "Camera")
+    path = rig.tmp / f"{TWIN_A}.json"
+    data = json.loads(path.read_text())
+    data["asset"]["name"] = "Logitech C920"
+    path.write_text(json.dumps(data))
+    seen = _record_defaults(rig)
+
+    rig.run_cameras()
+
+    assert seen == [("Camera for Camera", 5)]
+
+
+def test_with_no_fitting_camera_there_is_no_default(rig):
+    rig.camera(1, "C920", id_serial=C920_ID_A, by_id=f"usb-{C920_ID_A}-video-index0")
+    rig.camera(2, "C920", id_serial=C920_ID_B, by_id=f"usb-{C920_ID_B}-video-index0")
+    rig.build()
+    rig.camera_twin(TWIN_A, "Realsense", depth=True)  # depth twin, no depth camera attached
+    seen = _record_defaults(rig)
+
+    rig.run_cameras()
+
+    assert seen == [("Camera for Realsense", None)]
+
+
+def test_enter_without_a_default_asks_again_instead_of_choosing(rig):
+    rig.camera(1, "C920", id_serial=C920_ID_A, by_id=f"usb-{C920_ID_A}-video-index0")
+    rig.camera(2, "C920", id_serial=C920_ID_B, by_id=f"usb-{C920_ID_B}-video-index0")
+    rig.build()
+    answers = iter(["", "  ", "2"])
+    asked: list[dict] = []
+
+    def ask(prompt, **kwargs):
+        asked.append(kwargs)
+        return next(answers)
+
+    rig.mp.setattr(rig.core.Prompt, "ask", ask)
+
+    picked = rig.core._prompt_camera_index(
+        rig.cams, {1: rig.cams[0], 2: rig.cams[1]}, prompt="Camera", default_index=None
+    )
+
+    assert picked == 2
+    assert len(asked) == 3 and all("default" not in kw for kw in asked)
+    assert any("Choose a camera number" in line for line in rig.printed)
+
+
+def test_a_shared_by_id_pin_is_listed_with_its_reason_not_as_not_attached(rig):
+    pi_cameras(rig)
+    rig.build()
+    shared = rig.path("_V4L_BY_ID_DIR", C920_VIDEO_BY_ID)
+    rig.camera_twin(TWIN_A, "Logitech C920", video_device=shared)
+    rig.answers = ["0"]
+
+    rig.run_cameras()
+
+    listed = [line for line in rig.printed if "Logitech C920:" in line]
+    assert any("shared by identical cameras" in line and "choose again" in line for line in listed)
+    assert not any("pinned camera not attached" in line for line in listed)
+
+
+def test_a_truly_missing_camera_is_still_listed_as_not_attached(rig):
+    pi_cameras(rig)
+    rig.build()
+    gone = rig.path("_V4L_BY_PATH_DIR", "platform-gone.0-video-index0")
+    rig.camera_twin(TWIN_A, "Logitech C920", video_device=gone)
+    rig.answers = ["0"]
+
+    rig.run_cameras()
+
+    assert any(
+        "Logitech C920:" in line and "pinned camera not attached" in line for line in rig.printed
+    )
+
+
+def test_audio_menu_numbers_follow_the_alsa_card_and_stay_the_same_between_twins(rig):
+    pi_audio(rig)
+    rig.build()
+    rig.mic_twin(TWIN_A, "Mic A")
+    rig.mic_twin(TWIN_B, "Mic B")
+    rig.answers = ["3", "4"]
+
+    rig.run_audio()
+
+    listed = [line for line in rig.printed if line.startswith(("  2)", "  3)", "  4)"))]
+    assert len(listed) == 3  # every card, numbered by its ALSA card, printed once
+    assert any("free: 2, 3, 4" in line for line in rig.printed)
+    assert any("free: 2, 4" in line for line in rig.printed)  # same numbers for the next twin
+    assert rig.pinned[TWIN_A]["audio_device"].endswith(f"{PORT_1}.2")
+
+
+def test_a_bad_audio_answer_is_asked_again_with_the_valid_choices(rig):
+    pi_audio(rig)
+    rig.build()
+    rig.mic_twin(TWIN_A, "Mic A")
+    rig.answers = ["7", "zero", "4"]
+
+    rig.run_audio()
+
+    assert rig.prompts == ["Audio device for Mic A"] * 3
+    assert any("choose 2, 3, 4 or s" in line for line in rig.printed)
+    assert rig.pinned[TWIN_A]["audio_device"].endswith(f"{PORT_2}.2")
+
+
+def test_closed_stdin_at_the_audio_menu_skips_the_remaining_twins(rig):
+    pi_audio(rig)
+    rig.build()
+    rig.mic_twin(TWIN_A, "Mic A")
+    rig.mic_twin(TWIN_B, "Mic B")
+    rig.closed_stdin = True
+
+    rig.run_audio()
+
+    assert rig.pinned == {}
+    assert rig.prompts == ["Audio device for Mic A"]  # the second twin is never asked

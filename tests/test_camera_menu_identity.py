@@ -118,7 +118,7 @@ def test_camera_with_neither_serial_nor_port_still_renders(monkeypatch):
 
     _, lines, _ = _render(monkeypatch, cameras)
 
-    assert "/dev/video3" in lines[0]
+    assert "video3" in lines[0]
     assert "serial" not in lines[0]
     assert "port " not in lines[0]
 

@@ -44,7 +44,7 @@ from .credentials import (
     load_credentials,
     save_credentials,
 )
-
+from .io_utils import atomic_write_json
 from .macos import (
     AUDIO_STREAMS_FILENAME,
     CAMERA_STREAMS_FILENAME,
@@ -1391,8 +1391,9 @@ def _download_twin_json_files(client: Any, twin_uuids: list[str]) -> int:
             twin_data["asset"] = asset_data
             twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            with open(twin_json_file, "w") as f:
-                json.dump(twin_data, f, indent=2, default=_json_default)
+            atomic_write_json(
+                twin_json_file, json.loads(json.dumps(twin_data, default=_json_default)), mode=0o644
+            )
             chown_to_sudo_user(CONFIG_DIR, twin_json_file)
             written += 1
         except Exception as exc:
@@ -3078,6 +3079,25 @@ def _alsa_trees() -> tuple[str, str]:
     return (_ALSA_BY_ID_DIR, _ALSA_BY_PATH_DIR)
 
 
+_PORT_FOOTNOTE = (
+    "[dim]* identical units, pinned by USB port: keep each one in the same port.[/dim]"
+)
+
+
+def _short_link(value: str) -> str:
+    """Compact name of a udev link for menus: ``id <unit>`` or ``port <USB port>``.
+
+    The device model is printed next to it, so the by-id name keeps only its
+    unique tail (the USB serial, or the model when there is none).
+    """
+    name = os.path.basename(value.strip())
+    if "/by-path/" in value or name.startswith(("platform-", "pci-")):
+        core = re.sub(r"-video-index\d+$", "", re.sub(r"^(platform|pci)-", "", name))
+        return f"port {core}"
+    core = re.sub(r"-(video-index\d+|\d+)$", "", re.sub(r"^usb-", "", name))
+    return f"id {core.rsplit('_', 1)[-1]}"
+
+
 def _udev_pin_is_connected(value: str, directory: str) -> bool:
     name = _udev_pin_name(value, directory)
     return name is not None and os.path.exists(os.path.realpath(os.path.join(directory, name)))
@@ -3303,6 +3323,21 @@ def _camera_index_for_device(cameras: list[Any], device: str) -> int | None:
     return None
 
 
+def _twin_model_words(twin_uuid: str) -> list[str]:
+    """Lower-case words (3+ chars) naming the twin's asset, to match against a camera name."""
+    path = CONFIG_DIR / f"{twin_uuid}.json"
+    if not _is_twin_object_file(path):
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    asset = data.get("asset") if isinstance(data.get("asset"), dict) else {}
+    names = (asset.get("name"), asset.get("registry_id"), data.get("name"))
+    text = " ".join(str(v) for v in names if v)
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) >= 3]
+
+
 def _twin_has_depth_sensor(twin_uuid: str) -> bool:
     """True when the cached twin declares a depth sensor.
 
@@ -3446,31 +3481,32 @@ def _render_camera_menu(
     assignments = assignments or {}
     units = _camera_units(cameras)
     valid_indices: dict[int, Any] = {}
+    any_port = False
     for i, cam in enumerate(cameras):
         idx = cam.index if cam.index is not None else i
         valid_indices[idx] = cam
-        score = camera_likelihood_score(cam)
-        assigned_to = assignments.get(idx)
-        suffix = f"  [yellow](assigned to {assigned_to})[/yellow]" if assigned_to else ""
-        if units[i].collided:
-            suffix += (
-                "  [yellow](identical unit: pinned by USB port)[/yellow]"
-                if units[i].pin
-                else "  [red](identical unit, cannot be pinned)[/red]"
-            )
-        hint = _camera_identity_hint(cam, units[i])
-        hint_text = f"  {hint}" if hint else ""
-        if score >= 40:
-            label = (
-                f"  [bold cyan]{idx}[/bold cyan])  {cam.card}  "
-                f"[dim]{cam.primary_path}{hint_text}[/dim]{suffix}"
+        unit = units[i]
+        where = _short_link(unit.pin) if unit.pin else _camera_identity_hint(cam, unit)
+        node = os.path.basename(cam.primary_path or "")
+        suffix = ""
+        if unit.collided and unit.pin:
+            suffix += " *"
+            any_port = True
+        elif unit.collided:
+            suffix += "  [red](identical unit, cannot be pinned)[/red]"
+        if assignments.get(idx):
+            suffix += f"  [yellow](assigned to {assignments[idx]})[/yellow]"
+        detail = " · ".join(x for x in (node, where) if x)
+        if camera_likelihood_score(cam) >= 40:
+            console.print(
+                f"  [bold cyan]{idx}[/bold cyan])  {cam.card}  [dim]{detail}[/dim]{suffix}"
             )
         else:
-            label = (
-                f"  [dim]{idx})  {cam.card}  {cam.primary_path}{hint_text}  "
-                f"(probably not a camera)[/dim]{suffix}"
+            console.print(
+                f"  [dim]{idx})  {cam.card}  {detail}  (probably not a camera)[/dim]{suffix}"
             )
-        console.print(label)
+    if any_port:
+        console.print(_PORT_FOOTNOTE)
     return valid_indices
 
 
@@ -3511,14 +3547,23 @@ def _prompt_camera_index(
     valid_indices: dict[int, Any],
     *,
     prompt: str,
-    default_index: int,
+    default_index: int | None,
 ) -> int | None:
-    """Prompt for a camera index; ``_SKIP`` for "no camera", ``None`` on invalid input."""
-    try:
-        raw = Prompt.ask(prompt, default=str(default_index))
-    except EOFError:
-        console.print("[yellow]No input available — skipping camera config.[/yellow]")
-        return None
+    """Prompt for a camera index; ``_SKIP`` for "no camera", ``None`` on invalid input.
+
+    With no default, an empty answer asks again instead of choosing for the operator.
+    """
+    while True:
+        try:
+            raw = Prompt.ask(
+                prompt, **({} if default_index is None else {"default": str(default_index)})
+            )
+        except EOFError:
+            console.print("[yellow]No input available — skipping camera config.[/yellow]")
+            return None
+        if default_index is not None or str(raw).strip():
+            break
+        console.print("[yellow]Choose a camera number, or s.[/yellow]")
     if str(raw).strip().lower() in ("s", "skip"):
         return _SKIP
     try:
@@ -3538,7 +3583,6 @@ def _upload_cameras_to_edge_metadata(cameras_data: dict) -> bool:
     Best-effort: logs a warning and returns False on any failure.
     """
     from .credentials import load_credentials
-    from .io_utils import atomic_write_json
     from .utils import resolve_api_url
 
     creds = load_credentials()
@@ -3585,11 +3629,31 @@ def _upload_cameras_to_edge_metadata(cameras_data: dict) -> bool:
         else:
             edge_dict = dict(updated_edge)
         atomic_write_json(CONFIG_DIR / "edge.json", edge_dict, mode=0o644)
+        chown_to_sudo_user(CONFIG_DIR / "edge.json")
         console.print(f"[dim]Saved to {CONFIG_DIR / 'edge.json'}[/dim]")
         return True
     except Exception as exc:
         console.print(f"[dim]Camera metadata upload skipped: {exc}[/dim]")
         return False
+
+
+def _write_local_twin_pin(twin_uuid: str, metadata: dict[str, str]) -> None:
+    """Mirror a pin just saved to the backend into the downloaded twin file.
+
+    A running edge-core treats a stale local file as an edit and pushes it back
+    over the backend, undoing the new pin. Best-effort.
+    """
+    path = CONFIG_DIR / f"{twin_uuid}.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+        current = data.get("metadata")
+        data["metadata"] = {**(current if isinstance(current, dict) else {}), **metadata}
+        atomic_write_json(path, data, mode=0o644)
+        chown_to_sudo_user(path)
+    except (OSError, ValueError):
+        return
 
 
 def _persist_twin_pins(pins: dict[str, dict[str, str]]) -> int:
@@ -3623,6 +3687,7 @@ def _persist_twin_pins(pins: dict[str, dict[str, str]]) -> int:
         try:
             client.twins.update(twin_uuid, metadata=metadata)
             updated += 1
+            _write_local_twin_pin(twin_uuid, metadata)
         except Exception as exc:
             console.print(
                 f"[yellow]Could not pin device on twin {twin_uuid[:8]}…: {exc}. "
@@ -3630,8 +3695,7 @@ def _persist_twin_pins(pins: dict[str, dict[str, str]]) -> int:
             )
     if updated:
         console.print(
-            f"[dim]Pinned device id on {updated} twin(s) — "
-            f"future installs resolve them without prompting.[/dim]"
+            f"[dim]Pinned {updated} twin(s); a reinstall reuses the pins without asking.[/dim]"
         )
     return updated
 
@@ -3686,6 +3750,22 @@ def _detect_and_select_cameras() -> None:
     no_unit = _UsbUnit(None, False, False)
     pin_problem: dict[str, str] = {}
 
+    def _default_camera_for(twin_uuid: str, free: list[int]) -> int | None:
+        """The free camera that best fits the twin: depth with depth, else the one whose
+        name shares most words with the twin's asset; None when nothing fits.
+        """
+        want_depth = _twin_has_depth_sensor(twin_uuid)
+        words = _twin_model_words(twin_uuid)
+        best: tuple[int, int] | None = None
+        for position, idx in enumerate(free):
+            card = (cameras_by_index[idx].card or "").lower()
+            if (("realsense" in card) or ("depth" in card)) != want_depth:
+                continue
+            score = sum(1 for w in words if w in card)
+            if best is None or score > best[0]:
+                best = (score, position)
+        return free[best[1]] if best else None
+
     def _identity_of(index: int) -> str | None:
         """The link to pin for a menu index (by-id, or by-path when identical units
         collide), else a raw hardware serial, else None.
@@ -3720,11 +3800,6 @@ def _detect_and_select_cameras() -> None:
         identity = _identity_of(index)
         if identity:
             pins[twin_uuid] = _camera_pin_metadata(identity)
-            if unit_by_index.get(index, no_unit).by_port:
-                console.print(
-                    "[yellow]No distinct udev id for this camera (identical units or none): "
-                    "pinned by USB port, keep it plugged into the same port.[/yellow]"
-                )
         return bool(identity)
 
     def _record_choice(twin_uuid: str, index: int) -> None:
@@ -3766,11 +3841,8 @@ def _detect_and_select_cameras() -> None:
         )
 
     def _warn_shared_name(twin_name: str, twin_uuid: str, path: str) -> None:
-        pin_problem[twin_uuid] = "is pinned by a name identical cameras share"
-        console.print(
-            f"[yellow]{twin_name} is pinned by {path}, a name shared by identical "
-            f"cameras: after a replug it may point at either.[/yellow]\n"
-            f"[dim]Choose the camera again; it will be pinned by USB port.[/dim]"
+        pin_problem[twin_uuid] = (
+            "saved id is shared by identical cameras and may point at either after a replug"
         )
 
     def _shared_by_id(path: str, index: int) -> bool:
@@ -3982,13 +4054,19 @@ def _detect_and_select_cameras() -> None:
         for uuid_, name in pinned_twins:
             pin = _pinned_camera(uuid_, name)
             if pin is None:
-                console.print(f"  {name}: [yellow]pinned camera not attached[/yellow]")
+                reason = pin_problem.get(uuid_)
+                console.print(
+                    f"  {name}: [yellow]{reason}; choose again (it will be pinned by USB "
+                    f"port)[/yellow]"
+                    if reason
+                    else f"  {name}: [yellow]pinned camera not attached[/yellow]"
+                )
             elif pin.index is None:
                 console.print(f"  {name}: served by {pin.label}")
             else:
-                console.print(
-                    f"  {name}: {pin.label} -> {cameras_by_index[pin.index].primary_path}"
-                )
+                how = _short_link(pin.device) if isinstance(pin.device, str) else pin.label
+                node = os.path.basename(cameras_by_index[pin.index].primary_path or "")
+                console.print(f"  {name}: {how} -> {node}")
         if not _ask_yes_no("Keep these existing camera bindings?"):
             twin_serials.clear()
             twin_devices.clear()
@@ -3999,13 +4077,11 @@ def _detect_and_select_cameras() -> None:
 
     console.print(
         f"\n[bold]Detected {len(cameras)} camera(s) and {len(camera_twins)} "
-        f"camera twin(s).[/bold]"
+        f"camera twin(s).[/bold] "
+        "[dim]Each camera serves one twin; answer s to leave a twin without one.[/dim]"
     )
-    _render_camera_menu(cameras)
-    console.print(
-        "[dim]Each camera serves one twin. Pick a camera for each twin, or s to leave a "
-        "twin without one.[/dim]\n"
-    )
+    menu_indices = _render_camera_menu(cameras)
+    console.print()
 
     twin_to_device = {}
     # One camera, one twin: verified pins reserve theirs up front; a duplicate loses its pin.
@@ -4020,17 +4096,15 @@ def _detect_and_select_cameras() -> None:
                 reserved[saved_pin.index] = name
     assignments_label: dict[int, str] = dict(reserved)
     first_selected: int | None = None
-    remaining_default = default_idx
+    bound: dict[str, int] = {}
 
     def _claim(twin_uuid: str, twin_name: str, index: int) -> None:
-        """Record that *twin_uuid* uses camera *index* and advance the menu default."""
-        nonlocal first_selected, remaining_default
+        """Record that *twin_uuid* uses camera *index*."""
+        nonlocal first_selected
         assignments_label.setdefault(index, twin_name)
+        bound[twin_uuid] = index
         if first_selected is None:
             first_selected = index
-        free = [idx for idx in cameras_by_index if idx not in assignments_label]
-        if free:
-            remaining_default = free[0]
 
     for twin_uuid, twin_name in camera_twins:
         console.print(f"[bold]Twin:[/bold] {twin_name} [dim]({twin_uuid[:8]}...)[/dim]")
@@ -4069,14 +4143,14 @@ def _detect_and_select_cameras() -> None:
 
         free = [i for i in cameras_by_index if i not in assignments_label]
         if free:
-            valid_indices = _render_camera_menu(cameras, assignments=assignments_label)
-            console.print("  [dim]s) no camera for this twin[/dim]\n")
+            valid_indices = menu_indices
+            console.print(f"  [dim]free: {', '.join(map(str, free))}  (s = none)[/dim]")
             while True:
                 selected = _prompt_camera_index(
                     cameras,
                     valid_indices,
                     prompt=f"Camera for {twin_name}",
-                    default_index=free[0],
+                    default_index=_default_camera_for(twin_uuid, free),
                 )
                 if selected is None or selected == _SKIP or selected in free:
                     break
@@ -4109,7 +4183,7 @@ def _detect_and_select_cameras() -> None:
         twin_to_device[twin_uuid] = _device_for(selected)
         _claim(twin_uuid, twin_name, selected)
         _record_choice(twin_uuid, selected)
-        console.print(f"[green]Selected:[/green] {valid_indices[selected].card}\n")
+        console.print()
 
     without = [n for u, n in camera_twins if u not in twin_to_device]
     if without:
@@ -4118,8 +4192,22 @@ def _detect_and_select_cameras() -> None:
             f"{', '.join(without)}. They are not pinned; edge-core may fall back to "
             f"/dev/video0 for them.[/yellow]"
         )
+    def _where(i: int, cam: Any) -> str:
+        unit = unit_by_index.get(i, no_unit)
+        return _short_link(unit.pin) if unit.pin else _camera_identity_hint(cam, unit)
+
+    if bound:
+        console.print("\n[bold]Cameras[/bold]")
+        for uuid_, index in bound.items():
+            cam, unit = cameras_by_index[index], unit_by_index.get(index, no_unit)
+            how = _where(index, cam)
+            note = "  [yellow](pinned by USB port)[/yellow]" if unit.by_port else ""
+            console.print(
+                f"  {dict(camera_twins)[uuid_]} → {cam.card}  "
+                f"[dim]{os.path.basename(cam.primary_path or '')} · {how}[/dim]{note}"
+            )
     unused = [
-        f"{c.card} ({_camera_identity_hint(c, unit_by_index[i])})"
+        f"{c.card} ({_where(i, c)})"
         for i, c in cameras_by_index.items()
         if i not in assignments_label
     ]
@@ -4331,27 +4419,29 @@ def _detect_and_select_audio_devices() -> None:
         else:
             connected[uuid_] = card
 
-    console.print(f"\n[bold]Detected {len(cards)} USB audio device(s):[/bold]")
+    console.print(
+        f"\n[bold]Detected {len(cards)} USB audio device(s).[/bold] "
+        "[dim]Each device serves one twin; answer s to leave a twin without one.[/dim]"
+    )
     for card in cards:
         modes = (("capture", card.capture), ("playback", card.playback))
         kinds = "/".join(name for name, on in modes if on)
+        where = _short_link(card.pin) if card.pin else "no stable link"
         note = ""
-        if card.unit.collided:
-            note = (
-                "  [yellow]identical to another unit: pinned by USB port, keep it in the "
-                "same port[/yellow]"
-                if card.pin
-                else "  [red]identical to another unit and no USB port link: cannot be pinned[/red]"
-            )
+        if card.unit.collided and card.pin:
+            note = " *"
+        elif card.unit.collided:
+            note = "  [red](identical unit, cannot be pinned)[/red]"
         elif not card.pin:
-            note = "  [red]no stable udev link: cannot be pinned[/red]"
-        link = os.path.basename(card.pin) if card.pin else card.label
-        console.print(f"  {card.label}: [cyan]{link}[/cyan] [dim]({kinds})[/dim]{note}")
+            note = "  [red](cannot be pinned)[/red]"
+        console.print(f"  {card.index})  {card.label}  [dim]{kinds} · {where}[/dim]{note}")
+    if any(c.unit.collided and c.pin for c in cards):
+        console.print(_PORT_FOOTNOTE)
     for uuid_, serial in serials.items():
         if uuid_ in by_serial:
             console.print(
                 f"  {twins[uuid_][0]}: pinned by serial {serial} -> "
-                f"[cyan]{by_serial[uuid_].link}[/cyan] (connected)"
+                f"[cyan]{_short_link(by_serial[uuid_].link or '')}[/cyan] (connected)"
             )
         else:
             console.print(
@@ -4364,7 +4454,7 @@ def _detect_and_select_audio_devices() -> None:
         if uuid_ in connected:
             console.print(
                 f"  {twins[uuid_][0]}: using saved device "
-                f"[cyan]{os.path.basename(path)}[/cyan] (connected)"
+                f"[cyan]{_short_link(path)}[/cyan] (connected)"
             )
         else:
             console.print(
@@ -4420,11 +4510,6 @@ def _detect_and_select_audio_devices() -> None:
     def _assign(uuid_: str, card: _AudioCard) -> None:
         pins[uuid_] = _audio_pin_metadata(card.pin or "")
         owner[card.index] = twins[uuid_][0]
-        if card.unit.by_port:
-            console.print(
-                "[yellow]No distinct udev id for this device (identical units or none): "
-                "pinned by USB port, keep it plugged into the same port.[/yellow]"
-            )
 
     for uuid_ in pending:
         name = twins[uuid_][0]
@@ -4488,32 +4573,34 @@ def _detect_and_select_audio_devices() -> None:
             continue
 
         console.print(f"\n[bold]Audio device for {name}[/bold] [dim]({uuid_[:8]}...)[/dim]")
-        console.print("  [dim]s) no device for this twin[/dim]")
-        for i, card in enumerate(pool):
-            suffix = ""
-            if card.unit.collided:
-                suffix += "  [yellow](identical unit: pinned by USB port)[/yellow]"
-            console.print(
-                f"  [bold cyan]{i}[/bold cyan])  {os.path.basename(card.pin or '')}  "
-                f"[dim]{card.label}, card {card.index}[/dim]{suffix}"
-            )
-        try:
-            raw = Prompt.ask(f"Audio device for {name}", default="0")
-        except EOFError:
-            console.print("[yellow]No input available — skipping audio pinning.[/yellow]")
+        by_card = {c.index: c for c in pool}
+        console.print(f"  [dim]free: {', '.join(map(str, by_card))}  (s = none)[/dim]")
+        chosen: _AudioCard | None = None
+        no_input = False
+        while True:
+            try:
+                raw = Prompt.ask(f"Audio device for {name}", default=str(next(iter(by_card))))
+            except EOFError:
+                console.print("[yellow]No input available — skipping audio pinning.[/yellow]")
+                no_input = True
+                break
+            text = str(raw).strip().lower()
+            if text in ("s", "skip"):
+                break
+            try:
+                chosen = by_card[int(text)]
+                break
+            except (ValueError, KeyError):
+                console.print(
+                    f"[yellow]'{raw}' is not a listed device; choose "
+                    f"{', '.join(map(str, by_card))} or s.[/yellow]"
+                )
+        if no_input:
             break
-        if str(raw).strip().lower() in ("s", "skip"):
+        if chosen is None:
             continue
-        try:
-            choice = int(raw)
-            if choice < 0:
-                raise IndexError(choice)
-            card = pool[choice]
-        except (ValueError, IndexError):
-            console.print(f"[yellow]'{raw}' is not a listed device — skipping {name}.[/yellow]")
-            continue
+        card = chosen
         _assign(uuid_, card)
-        console.print(f"[green]Selected:[/green] {pins[uuid_]['audio_device']}")
 
     for uuid_ in conflicted:
         if uuid_ in saved and uuid_ not in pins:
@@ -4529,8 +4616,16 @@ def _detect_and_select_audio_devices() -> None:
             f"[yellow]{len(without)} audio twin(s) have no physical device: "
             f"{', '.join(without)}. They are not pinned.[/yellow]"
         )
+    if owner:
+        console.print("\n[bold]Audio[/bold]")
+        for index, twin_name in owner.items():
+            card = by_index[index]
+            note = "  [yellow](pinned by USB port)[/yellow]" if card.unit.by_port else ""
+            console.print(
+                f"  {twin_name} → {card.label}  [dim]{_short_link(card.pin or '')}[/dim]{note}"
+            )
     unused = [
-        f"{c.label} ({os.path.basename(c.pin)})"
+        f"{c.label} ({_short_link(c.pin)})"
         for c in cards
         if c.pin and c.index not in owner and any(_can_serve(u, c) for u in twins)
     ]
@@ -4734,12 +4829,6 @@ def setup_service(
                     "driver will not receive a host audio bridge URL.[/yellow]\n"
                     "[dim]Retry: cyberwave edge install --reconfigure-microphone[/dim]"
                 )
-        else:
-            console.print(
-                "[dim]Linux microphone twins bind-mount /dev/snd into Docker with "
-                "--group-add audio and ALSA cgroup rule c 116:* rmw (edge-core "
-                "adds this automatically).[/dim]"
-            )
 
     if spec.requires_docker and _any_twin_has_speaker_sensor():
         if is_macos():
@@ -4752,12 +4841,6 @@ def setup_service(
                     "driver will not receive a host playback sink URL.[/yellow]\n"
                     "[dim]Retry: cyberwave edge install --reconfigure-speaker[/dim]"
                 )
-        else:
-            console.print(
-                "[dim]Linux speaker twins bind-mount /dev/snd into Docker with "
-                "--group-add audio and ALSA cgroup rule c 116:* rmw (edge-core "
-                "adds this automatically).[/dim]"
-            )
 
     if (
         spec.requires_docker

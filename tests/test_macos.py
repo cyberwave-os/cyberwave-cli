@@ -68,6 +68,7 @@ def test_paths_fall_back_to_home_without_sudo(monkeypatch):
 # ---- _install_usbip_server --------------------------------------------------
 
 
+@pytest.mark.usefixtures("host_commands_missing")
 def test_install_skips_when_already_built(monkeypatch):
     macos = _load_macos(monkeypatch)
     monkeypatch.setattr(macos, "_has_git", lambda: True)
@@ -173,7 +174,7 @@ def test_install_fails_without_git(monkeypatch):
     assert macos._install_usbip_server() is False
 
 
-def test_install_usbip_invokes_rust_auto_install_when_cargo_missing(monkeypatch):
+def test_install_usbip_invokes_rust_auto_install_when_cargo_missing(monkeypatch, tmp_path):
     """A missing cargo must trigger the new rustup auto-install path,
     not abort with a hint like the legacy behavior did. The
     skip_confirm flag must propagate through so ``cyberwave edge install -y``
@@ -191,7 +192,11 @@ def test_install_usbip_invokes_rust_auto_install_when_cargo_missing(monkeypatch)
 
     monkeypatch.setattr(macos, "_install_rust_toolchain", fake_rust_install)
     monkeypatch.setattr(macos, "_usbip_binary_path", lambda: Path("/fake/host"))
+    monkeypatch.setattr(macos, "_usbip_install_dir", lambda: tmp_path / "usbip")
     monkeypatch.setattr(Path, "is_file", lambda self: True)
+    monkeypatch.setattr(
+        macos.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, "", "")
+    )
 
     assert macos._install_usbip_server(skip_confirm=True) is True
     assert rust_install_calls == [{"skip_confirm": True}], (
@@ -329,6 +334,7 @@ def test_setup_usbip_force_skips_running_check(monkeypatch):
     assert macos.setup_usbip_server(force=True) is True
 
 
+@pytest.mark.usefixtures("host_commands_missing")
 def test_setup_camera_stream_force_calls_teardown(monkeypatch):
     macos = _load_macos(monkeypatch)
     calls: list[str] = []

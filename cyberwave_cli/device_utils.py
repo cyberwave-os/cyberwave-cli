@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .config import clean_subprocess_env
+from .config import chown_to_sudo_user, clean_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -485,6 +485,7 @@ def write_cameras_json(
             for twin_uuid, value in twin_to_device.items()
         }
     atomic_write_json(cameras_file, data, mode=0o644)
+    chown_to_sudo_user(cameras_file)
     logger.info("Wrote cameras.json to %s (%d devices)", cameras_file, len(cameras))
     return cameras_file
 

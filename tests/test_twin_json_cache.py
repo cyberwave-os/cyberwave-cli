@@ -149,3 +149,23 @@ def test_cached_serial_is_visible_to_the_mapping_reader(monkeypatch, tmp_path):
     core, _, _ = _run_writer(monkeypatch, tmp_path)
 
     assert core._load_twin_camera_serials() == {TWIN_UUID: "A260203000509667"}
+
+
+def test_cached_twin_is_written_atomically_and_world_readable(monkeypatch, tmp_path):
+    """A watcher reading the file must never see a half-written twin JSON."""
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(core, "chown_to_sudo_user", lambda *a, **k: None)
+    seen: list[tuple[Any, int]] = []
+    real = core.atomic_write_json
+
+    def spy(path, data, *, mode=0o600):
+        seen.append((path, mode))
+        real(path, data, mode=mode)
+
+    monkeypatch.setattr(core, "atomic_write_json", spy)
+
+    assert core._download_twin_json_files(_FakeClient(), [TWIN_UUID]) == 1
+
+    assert seen == [(tmp_path / f"{TWIN_UUID}.json", 0o644)]
+    assert list(tmp_path.glob(".*.tmp")) == []

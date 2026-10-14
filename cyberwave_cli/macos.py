@@ -491,20 +491,24 @@ def _chown_to_real_user(path: Path, *, recursive: bool = False) -> None:
 
 
 def _fix_user_dir_ownership(dir_path: Path) -> None:
-    """Reclaim ownership of *dir_path* if it was left root-owned by a prior sudo run."""
-    username, real_uid, _ = _resolve_real_user()
+    """Reclaim ownership of *dir_path* if it was left root-owned by a prior sudo run.
+
+    Only root can give a directory back, and it does so directly; a non-root
+    process never shells out to sudo for it.
+    """
+    _username, real_uid, real_gid = _resolve_real_user()
     if real_uid is None:
         return
     try:
         stat = dir_path.stat()
-        if stat.st_uid != real_uid:
-            logger.debug("Reclaiming ownership of %s (uid %d -> %d)", dir_path, stat.st_uid, real_uid)
-            subprocess.run(
-                ["sudo", "chown", username or str(real_uid), str(dir_path)],
-                check=True,
-                capture_output=True,
-            )
-    except (OSError, subprocess.CalledProcessError):
+        if stat.st_uid == real_uid:
+            return
+        if os.geteuid() != 0:
+            logger.debug("Not root: leaving ownership of %s (uid %d) as is", dir_path, stat.st_uid)
+            return
+        logger.debug("Reclaiming ownership of %s (uid %d -> %d)", dir_path, stat.st_uid, real_uid)
+        os.chown(dir_path, real_uid, real_gid if real_gid is not None else -1)
+    except OSError:
         pass
 
 

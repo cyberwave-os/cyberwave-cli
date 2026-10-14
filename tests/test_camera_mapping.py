@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from tests._core_module_loader import load_core_module
+from tests._core_module_loader import load_core_module, use_production_device_paths
 
 # Twin object files are UUID-named by contract, and `_is_twin_object_file`
 # enforces that shape, so these fixtures have to be real UUIDs.
@@ -448,6 +448,7 @@ def _by_id(monkeypatch, core, tmp_path, name: str, target: str | None) -> str:
 
 def test_is_stable_camera_device_rejects_positional_values(monkeypatch):
     core = load_core_module(monkeypatch)
+    use_production_device_paths(monkeypatch, core)
     assert core._is_stable_camera_device(BY_ID_C920) is True
     assert core._is_stable_camera_device(BY_PATH_C920) is True
     assert core._is_stable_camera_device("rtsp://10.0.0.2/avc") is True
@@ -459,6 +460,7 @@ def test_is_stable_camera_device_rejects_positional_values(monkeypatch):
 
 def test_load_twin_camera_devices_reads_only_stable_pins(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
+    use_production_device_paths(monkeypatch, core)
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
 
     _write_twin_json(
@@ -759,6 +761,7 @@ def test_stable_camera_device_mirrors_the_driver_classification(monkeypatch):
     driver would have honoured.
     """
     core = load_core_module(monkeypatch)
+    use_production_device_paths(monkeypatch, core)
 
     # Non-RTSP transports are just as much a pinned source.
     assert core._is_stable_camera_device("udp://239.0.0.1:5000") is True
