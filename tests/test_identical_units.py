@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import subprocess
 from types import SimpleNamespace
 
@@ -57,6 +58,7 @@ class Rig:
         self.confirm_default = True
         self.closed_stdin = False
         self.accept_defaults = False
+        self.enter_for_confirms = False
         monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(core, "ENVIRONMENT_FILE", tmp_path / "environment.json")
         monkeypatch.setattr(core.platform, "system", lambda: "Linux")
@@ -152,7 +154,7 @@ class Rig:
         for needle, value in self.confirm_answers.items():
             if needle in prompt:
                 return value
-        return self.confirm_default
+        return kw.get("default", True) if self.enter_for_confirms else self.confirm_default
 
     # ---- twins ------------------------------------------------------------------------
 
@@ -204,7 +206,6 @@ def pi_audio(rig):
     """The reported host: the UMA-16 and the microphones of the same two C920s."""
     rig.audio(2, "UMA16v2", "2752:0016", id_serial=UMA_ID, by_id=UMA_AUDIO_BY_ID,
               by_path=f"{PORT_3}.1")
-    # Only one of the two shares the by-id name: the other lost it.
     rig.audio(3, "C920", "046d:08e5", id_serial=C920_ID, by_id=C920_AUDIO_BY_ID,
               by_path=f"{PORT_1}.2")
     rig.audio(4, "C920_1", "046d:08e5", id_serial=C920_ID, by_path=f"{PORT_2}.2")
@@ -215,9 +216,7 @@ def pi_audio(rig):
 
 def test_collision_is_decided_by_udev_id_serial_not_by_counting_links(monkeypatch):
     core = load_core_module(monkeypatch)
-    # Equal ID_SERIAL: identical, whatever the links look like.
     assert core._collided(["a", "a", "b"], [("m", True)] * 3) == [True, True, False]
-    # Distinct ID_SERIAL (USB serials differ): nobody collides, even with one model.
     assert core._collided(["a", "b"], [("m", True), ("m", False)]) == [False, False]
     assert core._collided(["a"], [("m", True)]) == [False]
 
@@ -228,7 +227,6 @@ def test_collision_falls_back_to_link_counting_only_for_units_without_udev_data(
     assert core._collided([None, None], [("m", True), ("m", False)]) == [True, True]
     assert core._collided([None, None], [("m", True), ("m", True)]) == [False, False]
     assert core._collided([], []) == []
-    # A unit udev knows is judged by its ID_SERIAL; the unknown ones only among themselves.
     mixed = [("m", True), ("m", False), ("n", True), ("n", False)]
     assert core._collided(["a", None, None, None], mixed) == [False, False, True, True]
     assert core._collided(["a", "a", None, None], mixed) == [True, True, True, True]
@@ -623,19 +621,21 @@ def test_closed_stdin_never_binds_the_microphone_to_a_device_another_twin_uses(r
     assert rig.pinned == {}
 
 
-def test_sharing_a_microphone_names_the_twin_that_uses_it_and_defaults_to_no(rig):
+def test_a_microphone_used_by_another_twin_is_never_offered_again(rig):
     rig.audio(2, "UMA16v2", "2752:0016", id_serial=UMA_ID, by_id=UMA_AUDIO_BY_ID)
     rig.build()
     uma = rig.path("_ALSA_BY_ID_DIR", UMA_AUDIO_BY_ID)
     rig.mic_twin(TWIN_A, "UMA-16 v2", extra={"audio_device": uma})
     rig.mic_twin(TWIN_B, "Generic Microphone")
-    rig.confirm_default = False
+    rig.confirm_default = True
 
     rig.run_audio()
 
-    share = [c for c in rig.confirms if "already used by UMA-16 v2" in c[0]]
-    assert share and share[0][1] is False
     assert rig.pinned == {}
+    assert rig.prompts == [] and not any("Use it" in c[0] for c in rig.confirms)
+    assert any(
+        "No free audio device is left for Generic Microphone" in line for line in rig.printed
+    )
 
 
 def test_two_microphone_twins_on_two_identical_c920s_are_pinned_by_port(rig):
@@ -831,7 +831,6 @@ def test_the_reported_installation_end_to_end(rig):
     assert rig.pinned[TWIN_C]["audio_device"].endswith(UMA_AUDIO_BY_ID)
     assert rig.pinned[TWIN_D]["audio_device"].endswith(f"{PORT_2}.2")
 
-    # Reinstall: the pins come back from the backend, nothing silent, nothing shared.
     for uuid_, metadata in rig.pinned.items():
         path = rig.tmp / f"{uuid_}.json"
         data = json.loads(path.read_text())
@@ -969,3 +968,455 @@ def test_every_microphone_layout_pins_unique_by_id_and_identical_by_port(rig, la
         if n == len(labels):
             assert len(rig.prompts) == n - 1  # the last twin is the one device left
         assert [c.unit.collided for c in cards] == collided
+
+
+# ---- twins versus physical sensors -----------------------------------------------------------
+
+
+def _identical_hardware(rig, units, *, cameras=True, audio=True):
+    """*units* identical C920s without a USB serial, each a camera and a microphone."""
+    for i in range(units):
+        if cameras:
+            rig.camera(10 + i, "C920", id_serial=C920_ID,
+                       by_id=C920_VIDEO_BY_ID if i == 0 else None,
+                       by_path=f"pci-port{i}-video-index0")
+        if audio:
+            rig.audio(20 + i, f"C920_{i}", "046d:08e5", id_serial=C920_ID,
+                      by_id=C920_AUDIO_BY_ID if i == 0 else None, by_path=f"pci-port{i}.2")
+    rig.build()
+    rig.accept_defaults = True
+    rig.enter_for_confirms = True  # Enter at every prompt, as an operator who just accepts
+
+
+def _count(rig, needle):
+    return sum(needle in line for line in rig.printed)
+
+
+@pytest.mark.parametrize("units", [1, 2, 3, 4])
+@pytest.mark.parametrize("twins", [1, 2, 3, 4])
+def test_cameras_one_sensor_serves_one_twin_and_the_mismatch_is_warned(rig, units, twins):
+    _identical_hardware(rig, units, audio=False)
+    for t in range(twins):
+        rig.camera_twin(_twin_uuid(t), f"Cam{t}")
+
+    rig.run_cameras()
+
+    pins = [m["video_device"] for m in rig.pinned.values()]
+    assert len(pins) == min(units, twins)
+    assert len(set(pins)) == len(pins), "a camera was given to two twins"
+    listing = "\n".join(rig.printed)
+    for i in range(units):
+        assert f"pci-port{i}-video-index0" in listing or units == 1
+    assert _count(rig, "have no physical camera") == (1 if twins > units else 0)
+    assert _count(rig, "are not used by any twin") == (1 if units > twins else 0)
+    if twins > units:
+        assert f"{twins - units} camera twin(s) have no physical camera" in listing
+    if units > twins:
+        assert f"{units - twins} camera(s) are not used by any twin" in listing
+    mapped = rig.cameras_json()["twin_to_device"]
+    assert len(mapped) == min(units, twins)
+
+
+@pytest.mark.parametrize("units", [1, 2, 3, 4])
+@pytest.mark.parametrize("twins", [1, 2, 3, 4])
+def test_microphones_one_sensor_serves_one_twin_and_the_mismatch_is_warned(rig, units, twins):
+    _identical_hardware(rig, units, cameras=False)
+    for t in range(twins):
+        rig.mic_twin(_twin_uuid(t), f"Mic{t}")
+
+    rig.run_audio()
+
+    pins = [m["audio_device"] for m in rig.pinned.values()]
+    assert len(pins) == min(units, twins)
+    assert len(set(pins)) == len(pins), "a microphone was given to two twins"
+    listing = "\n".join(rig.printed)
+    assert f"Detected {units} USB audio device(s)" in listing
+    for card in rig.core._discover_usb_audio_cards():
+        assert card.label in listing
+    assert _count(rig, "have no physical device") == (1 if twins > units else 0)
+    assert _count(rig, "are not used by any twin") == (1 if units > twins else 0)
+    if twins > units:
+        assert f"{twins - units} audio twin(s) have no physical device" in listing
+    if units > twins:
+        assert f"{units - twins} audio device(s) are not used by any twin" in listing
+
+
+@pytest.mark.parametrize("units", [1, 2, 3])
+@pytest.mark.parametrize(
+    ("cam_twins", "mic_twins"), [(1, 1), (2, 2), (3, 1), (1, 3), (0, 2), (2, 0)]
+)
+def test_each_c920_is_a_camera_and_a_microphone_pinned_separately(
+    rig, units, cam_twins, mic_twins
+):
+    _identical_hardware(rig, units)
+    for t in range(cam_twins):
+        rig.camera_twin(_twin_uuid(t), f"Cam{t}")
+    for t in range(mic_twins):
+        rig.mic_twin(_twin_uuid(100 + t), f"Mic{t}")
+
+    rig.run_cameras().run_audio()
+
+    cams = [m["video_device"] for m in rig.pinned.values() if "video_device" in m]
+    mics = [m["audio_device"] for m in rig.pinned.values() if "audio_device" in m]
+    assert len(cams) == (min(units, cam_twins) if cam_twins else 0)
+    assert len(mics) == min(units, mic_twins)
+    assert len(set(cams)) == len(cams) and len(set(mics)) == len(mics)
+    for line in rig.printed:
+        assert not ("camera twin" in line and "audio" in line)
+    assert _count(rig, "camera twin(s) have no physical camera") == int(cam_twins > units)
+    assert _count(rig, "audio twin(s) have no physical device") == int(mic_twins > units)
+
+
+def test_the_operator_decides_which_twin_gets_the_only_camera(rig):
+    _identical_hardware(rig, 1, audio=False)
+    for t in range(3):
+        rig.camera_twin(_twin_uuid(t), f"Cam{t}")
+    rig.accept_defaults = False
+    rig.answers = ["s", "s", "10"]  # the third twin gets it
+
+    rig.run_cameras()
+
+    assert set(rig.pinned) == {_twin_uuid(2)}
+    assert "2 camera twin(s) have no physical camera: Cam0, Cam1" in "\n".join(rig.printed)
+
+
+def test_the_operator_decides_which_twin_gets_the_only_microphone(rig):
+    _identical_hardware(rig, 1, cameras=False)
+    for t in range(3):
+        rig.mic_twin(_twin_uuid(t), f"Mic{t}")
+    rig.accept_defaults = False
+    rig.confirm_answers = {"Only one device": False}
+    answers = iter([False, False, True])
+    rig.mp.setattr(
+        rig.core.Confirm, "ask",
+        lambda prompt, **kw: next(answers) if "Only one device" in prompt else False,
+    )
+
+    rig.run_audio()
+
+    assert set(rig.pinned) == {_twin_uuid(2)}
+    assert "2 audio twin(s) have no physical device: Mic0, Mic1" in "\n".join(rig.printed)
+
+
+def test_a_camera_is_never_shared_even_when_the_operator_insists(rig):
+    _identical_hardware(rig, 1, audio=False)
+    for t in range(2):
+        rig.camera_twin(_twin_uuid(t), f"Cam{t}")
+    rig.accept_defaults = False
+    rig.answers = ["10"]
+    rig.confirm_default = True
+
+    rig.run_cameras()
+
+    assert set(rig.pinned) == {_twin_uuid(0)}
+    assert rig.prompts == ["Camera for Cam0"]  # Cam1 is not even offered a taken camera
+    assert not any("already used" in c[0] for c in rig.confirms)
+    assert any("No free camera is left for Cam1" in line for line in rig.printed)
+
+
+def test_typing_the_index_of_a_taken_camera_is_refused_and_asked_again(rig):
+    _identical_hardware(rig, 3, audio=False)
+    for t in range(3):
+        rig.camera_twin(_twin_uuid(t), f"Cam{t}")
+    rig.accept_defaults = False
+    rig.answers = ["10", "10", "11"]  # the second twin first tries camera 10 again
+
+    rig.run_cameras()
+
+    assert rig.prompts == ["Camera for Cam0", "Camera for Cam1", "Camera for Cam1"]
+    assert any("already bound to Cam0" in line for line in rig.printed)
+    assert rig.pinned[_twin_uuid(1)]["video_device"].endswith("pci-port1-video-index0")
+
+
+def test_an_earlier_twin_cannot_take_the_camera_a_later_twin_is_pinned_to(rig):
+    _identical_hardware(rig, 3, audio=False)
+    rig.camera_twin(_twin_uuid(0), "Cam0")
+    rig.camera_twin(
+        _twin_uuid(1), "Cam1", video_device=rig.path("_V4L_BY_PATH_DIR", "pci-port0-video-index0")
+    )
+    rig.accept_defaults = False
+    rig.answers = ["10", "11"]  # Cam0 first tries the camera Cam1 owns
+
+    rig.run_cameras()
+
+    assert any("already bound to Cam1" in line for line in rig.printed)
+    assert rig.pinned[_twin_uuid(0)]["video_device"].endswith("pci-port1-video-index0")
+
+
+def test_two_camera_twins_saved_on_the_same_camera_keep_it_for_the_first_only(rig):
+    _identical_hardware(rig, 2, audio=False)
+    port0 = rig.path("_V4L_BY_PATH_DIR", "pci-port0-video-index0")
+    rig.camera_twin(_twin_uuid(0), "Cam0", video_device=port0)
+    rig.camera_twin(_twin_uuid(1), "Cam1", video_device=port0)
+    rig.accept_defaults = True
+
+    rig.run_cameras()
+
+    assert any("already bound to Cam0" in line for line in rig.printed)
+    mapped = rig.cameras_json()["twin_to_device"]
+    assert mapped[_twin_uuid(0)] == port0
+    assert mapped[_twin_uuid(1)] != port0  # it was moved to the free camera
+    assert rig.pinned[_twin_uuid(1)]["video_device"].endswith("pci-port1-video-index0")
+
+
+def test_a_duplicate_camera_pin_is_cleared_when_no_other_camera_is_free(rig):
+    _identical_hardware(rig, 1, audio=False)
+    port0 = rig.path("_V4L_BY_PATH_DIR", "pci-port0-video-index0")
+    rig.camera_twin(_twin_uuid(0), "Cam0", video_device=port0)
+    rig.camera_twin(_twin_uuid(1), "Cam1", video_device=port0)
+
+    rig.run_cameras()
+
+    assert rig.pinned[_twin_uuid(1)] == {"serial_number": "", "video_device": ""}
+    assert _twin_uuid(1) not in rig.cameras_json()["twin_to_device"]
+    assert "1 camera twin(s) have no physical camera: Cam1" in "\n".join(rig.printed)
+
+
+def test_two_microphone_twins_saved_on_the_same_device_keep_it_for_the_first_only(rig):
+    _identical_hardware(rig, 2, cameras=False)
+    port0 = rig.path("_ALSA_BY_PATH_DIR", "pci-port0.2")
+    rig.mic_twin(_twin_uuid(0), "Mic0", extra={"audio_device": port0})
+    rig.mic_twin(_twin_uuid(1), "Mic1", extra={"audio_device": port0})
+
+    rig.run_audio()
+
+    assert any("already bound to Mic0" in line for line in rig.printed)
+    assert _twin_uuid(0) not in rig.pinned  # the first twin's pin is already current
+    assert rig.pinned[_twin_uuid(1)]["audio_device"].endswith("pci-port1.2")
+
+
+def test_a_duplicate_microphone_pin_is_cleared_when_no_other_device_is_free(rig):
+    _identical_hardware(rig, 1, cameras=False)
+    path = rig.path("_ALSA_BY_ID_DIR", C920_AUDIO_BY_ID)
+    rig.mic_twin(_twin_uuid(0), "Mic0", extra={"audio_device": path})
+    rig.mic_twin(_twin_uuid(1), "Mic1", extra={"audio_device": path})
+
+    rig.run_audio()
+
+    assert rig.pinned[_twin_uuid(1)] == {"audio_device": "", "serial_number": ""}
+    assert "1 audio twin(s) have no physical device: Mic1" in "\n".join(rig.printed)
+
+
+def test_two_twins_typed_with_the_same_serial_do_not_both_bind_the_device(rig):
+    rig.audio(3, "C920", "046d:08e5", id_serial=C920_ID_A, by_id=f"usb-{C920_ID_A}-02")
+    rig.build()
+    rig.mic_twin(_twin_uuid(0), "Mic0", serial="8E3A1B2F")
+    rig.mic_twin(_twin_uuid(1), "Mic1", serial="8E3A1B2F")
+
+    rig.run_audio()
+
+    assert any("already bound to Mic0" in line for line in rig.printed)
+    assert rig.pinned == {}  # the operator's own serials are never rewritten
+
+
+def test_closed_stdin_leaves_the_surplus_twins_without_a_sensor(rig):
+    _identical_hardware(rig, 1)
+    rig.camera_twin(_twin_uuid(0), "Cam0")
+    rig.camera_twin(_twin_uuid(1), "Cam1")
+    rig.mic_twin(_twin_uuid(100), "Mic0")
+    rig.mic_twin(_twin_uuid(101), "Mic1")
+    rig.accept_defaults = False
+    rig.answers = []
+    rig.closed_stdin = True
+
+    rig.run_cameras().run_audio()
+
+    assert rig.pinned == {}
+
+
+def test_every_attached_sensor_is_printed_even_when_they_are_the_same_hardware(rig):
+    _identical_hardware(rig, 3)
+    rig.camera_twin(_twin_uuid(0), "Cam0")
+    rig.mic_twin(_twin_uuid(100), "Mic0")
+
+    rig.run_cameras().run_audio()
+
+    text = "\n".join(rig.printed)
+    assert "Detected 3 camera(s) and 1 camera twin(s)" in text
+    assert "Detected 3 USB audio device(s)" in text
+    for i in range(3):
+        assert f"port pci-port{i}-video-index0" in text
+        assert f"pci-port{i}.2" in text
+
+
+# ---- more situations ---------------------------------------------------------------------------
+
+
+def test_microphone_twins_without_any_usb_audio_device_get_a_clear_message(rig):
+    rig.build()
+    rig.mic_twin(_twin_uuid(0), "Mic0")
+
+    rig.run_audio()
+
+    assert rig.pinned == {}
+    assert rig.prompts == []
+    assert any("have no physical device" in line for line in rig.printed) or any(
+        "No USB audio device" in line for line in rig.printed
+    )
+
+
+def test_camera_twins_with_cameras_missing_ask_nothing_and_map_nothing(rig):
+    rig.build()
+    rig.camera_twin(_twin_uuid(0), "Cam0")
+
+    rig.run_cameras()
+
+    assert rig.prompts == [] and rig.pinned == {}
+    assert any("No cameras detected" in line for line in rig.printed)
+
+
+def test_a_playback_only_device_is_not_reported_unused_when_only_microphones_exist(rig):
+    rig.audio(3, "C920", "046d:08e5", id_serial=C920_ID_A, by_id=f"usb-{C920_ID_A}-02")
+    rig.audio(5, "Boombox", "1234:5678", id_serial="Acme_Boombox_55",
+              by_id="usb-Acme_Boombox_55-00", capture=False, playback=True)
+    rig.build()
+    rig.mic_twin(_twin_uuid(0), "Mic0")
+
+    rig.run_audio()
+
+    assert not any("not used by any twin" in line for line in rig.printed)
+
+
+def test_garbage_at_the_camera_menu_leaves_the_remaining_twins_without_a_camera(rig):
+    _identical_hardware(rig, 3, audio=False)
+    for t in range(3):
+        rig.camera_twin(_twin_uuid(t), f"Cam{t}")
+    rig.accept_defaults = False
+    rig.answers = ["10", "banana"]
+
+    rig.run_cameras()
+
+    assert set(rig.pinned) == {_twin_uuid(0)}
+    assert "2 camera twin(s) have no physical camera: Cam1, Cam2" in "\n".join(rig.printed)
+
+
+def test_skipping_every_camera_twin_maps_nothing(rig):
+    _identical_hardware(rig, 2, audio=False)
+    for t in range(2):
+        rig.camera_twin(_twin_uuid(t), f"Cam{t}")
+    rig.accept_defaults = False
+    rig.answers = ["s", "s"]
+
+    rig.run_cameras()
+
+    assert rig.pinned == {} and not (rig.tmp / "cameras.json").exists()
+    assert any("No cameras mapped" in line for line in rig.printed)
+
+
+def test_reinstall_with_every_twin_pinned_has_nothing_to_warn_about(rig):
+    _identical_hardware(rig, 2)
+    for t in range(2):
+        port = rig.path("_V4L_BY_PATH_DIR", f"pci-port{t}-video-index0")
+        rig.camera_twin(_twin_uuid(t), f"Cam{t}", video_device=port)
+        rig.mic_twin(
+            _twin_uuid(100 + t), f"Mic{t}",
+            extra={"audio_device": rig.path("_ALSA_BY_PATH_DIR", f"pci-port{t}.2")},
+        )
+
+    rig.run_cameras().run_audio()
+
+    assert rig.prompts == [] and rig.pinned == {}
+    for needle in ("have no physical", "not used by any twin", "left without"):
+        assert not any(needle in line for line in rig.printed)
+
+
+def test_reinstall_with_one_surplus_twin_warns_only_about_that_twin(rig):
+    _identical_hardware(rig, 2)
+    for t in range(2):
+        port = rig.path("_V4L_BY_PATH_DIR", f"pci-port{t}-video-index0")
+        rig.camera_twin(_twin_uuid(t), f"Cam{t}", video_device=port)
+    rig.camera_twin(_twin_uuid(2), "Cam2")
+    rig.accept_defaults = False
+    rig.answers = ["s"]  # the extra twin is offered the two taken cameras and skips
+
+    rig.run_cameras()
+
+    text = "\n".join(rig.printed)
+    assert "1 camera twin(s) have no physical camera: Cam2" in text
+    assert "not used by any twin" not in text
+
+
+def test_an_unplugged_identical_camera_leaves_its_twin_on_its_saved_port_pin(rig):
+    _identical_hardware(rig, 1, audio=False)  # only the first of two C920s is attached
+    port0 = rig.path("_V4L_BY_PATH_DIR", "pci-port0-video-index0")
+    port1 = rig.path("_V4L_BY_PATH_DIR", "pci-port1-video-index0")
+    rig.camera_twin(_twin_uuid(0), "Cam0", video_device=port0)
+    rig.camera_twin(_twin_uuid(1), "Cam1", video_device=port1)  # that camera is unplugged
+    rig.accept_defaults = False
+    rig.answers = ["s"]
+
+    rig.run_cameras()
+
+    assert rig.cameras_json()["twin_to_device"] == {_twin_uuid(0): port0, _twin_uuid(1): port1}
+    assert "keeps its saved camera pin" in "\n".join(rig.printed)
+    assert rig.pinned == {}
+
+
+# ---- a sensor serves exactly one twin, whatever the starting point --------------------------
+
+
+def _random_labels(r):
+    return [r.choice("ghab") for _ in range(r.randint(1, 4))]
+
+
+@pytest.mark.parametrize("seed", range(80))
+def test_no_camera_ends_up_bound_to_two_twins(rig, seed):
+    r = random.Random(seed)
+    labels = _random_labels(r)
+    _build_cameras(rig, labels)
+    rig.build()
+    rig.accept_defaults = True
+    rig.enter_for_confirms = True
+    for t in range(r.randint(1, 5)):
+        pin = r.choice(["none", "unit", "gone"])
+        port = r.randrange(len(labels)) if pin == "unit" else 9
+        device = rig.path("_V4L_BY_PATH_DIR", f"pci-port{port}-video-index0")
+        extra = {} if pin == "none" else {"video_device": device}
+        rig.camera_twin(_twin_uuid(t), f"Cam{t}", **extra)
+
+    rig.run_cameras()
+
+    if not (rig.tmp / "cameras.json").exists():
+        return
+    nodes = []
+    for value in rig.cameras_json()["twin_to_device"].values():
+        if isinstance(value, int):
+            node = next(c.primary_path for c in rig.cams if c.index == value)
+        elif isinstance(value, str) and value.startswith("/"):
+            node = os.path.realpath(value)
+        else:
+            continue
+        if os.path.exists(node):
+            nodes.append(node)
+    assert len(nodes) == len(set(nodes)), (seed, labels, rig.printed)
+
+
+@pytest.mark.parametrize("seed", range(80))
+def test_no_microphone_ends_up_bound_to_two_twins(rig, seed):
+    r = random.Random(seed)
+    labels = _random_labels(r)
+    _build_audio(rig, labels)
+    rig.build()
+    rig.accept_defaults = True
+    rig.enter_for_confirms = True
+    original: dict[str, str] = {}
+    for t in range(r.randint(1, 5)):
+        pin = r.choice(["none", "unit", "gone"])
+        port = r.randrange(len(labels)) if pin == "unit" else 9
+        path = rig.path("_ALSA_BY_PATH_DIR", f"pci-port{port}.2")
+        if pin == "none":
+            rig.mic_twin(_twin_uuid(t), f"Mic{t}")
+        else:
+            rig.mic_twin(_twin_uuid(t), f"Mic{t}", extra={"audio_device": path})
+            original[_twin_uuid(t)] = path
+
+    rig.run_audio()
+
+    final = dict(original)
+    for uuid_, metadata in rig.pinned.items():
+        if metadata.get("audio_device"):
+            final[uuid_] = metadata["audio_device"]
+        else:
+            final.pop(uuid_, None)
+    nodes = [os.path.realpath(p) for p in final.values() if os.path.exists(os.path.realpath(p))]
+    assert len(nodes) == len(set(nodes)), (seed, labels, rig.printed)

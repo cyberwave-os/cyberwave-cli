@@ -3503,6 +3503,9 @@ def _camera_index_for_serial(cameras: list[Any], serial: str) -> int | None:
     return None
 
 
+_SKIP = -1
+
+
 def _prompt_camera_index(
     cameras: list[Any],
     valid_indices: dict[int, Any],
@@ -3510,12 +3513,14 @@ def _prompt_camera_index(
     prompt: str,
     default_index: int,
 ) -> int | None:
-    """Prompt for a single camera index. Returns ``None`` on invalid input."""
+    """Prompt for a camera index; ``_SKIP`` for "no camera", ``None`` on invalid input."""
     try:
         raw = Prompt.ask(prompt, default=str(default_index))
     except EOFError:
         console.print("[yellow]No input available — skipping camera config.[/yellow]")
         return None
+    if str(raw).strip().lower() in ("s", "skip"):
+        return _SKIP
     try:
         chosen = int(raw)
     except ValueError:
@@ -3877,8 +3882,8 @@ def _detect_and_select_cameras() -> None:
     ) -> dict[str, tuple[int, str]]:
         """Twins the evidence pairs with exactly one camera, {twin: (index, why)}.
 
-        *done*/*taken* carry answers given earlier in this run. A camera that cannot
-        be pinned is never paired automatically.
+        *done*/*taken* carry answers given earlier in this run. A camera with no
+        stable link is still mapped this run, but its pairing writes no pin.
         """
         claimed: set[int] = set(taken)
         pending: list[str] = []
@@ -3893,7 +3898,7 @@ def _detect_and_select_cameras() -> None:
         result = _infer_associations(
             pending, list(cameras_by_index), claimed=claimed, compatible=lambda _t, _i: True
         )
-        return {t: (d, why) for t, (d, why) in result.assigned.items() if _identity_of(d)}
+        return dict(result.assigned.items())
 
     def _saved_pin_source(twin_uuid: str) -> str:
         """The twin's own pin in cameras.json form; a serial outranks a device."""
@@ -3920,14 +3925,14 @@ def _detect_and_select_cameras() -> None:
                     f"re-run install.[/yellow]"
                 )
                 return False
-        _record(twin_uuid, index)
+        _record_choice(twin_uuid, index)
         console.print(
             f"[green]{twin_name}[/green]: associated automatically with "
-            f"[cyan]{_identity_of(index)}[/cyan] — {why}."
+            f"[cyan]{_identity_of(index) or cameras_by_index[index].card}[/cyan] — {why}."
         )
         return True
 
-    if len(cameras) == 1:
+    if len(cameras) == 1 and len(camera_twins) <= 1:
         cam = cameras[0]
         selected = cam.index if cam.index is not None else 0
         console.print(f"\n[cyan]Detected camera:[/cyan] {cam.card} ({cam.primary_path})")
@@ -3948,15 +3953,12 @@ def _detect_and_select_cameras() -> None:
                 continue
             if pin is None and twin_uuid in inferred:
                 if not _bind_inferred(twin_uuid, twin_name, *inferred[twin_uuid]):
-                    # edge-core injects this value over the twin's own pin and falls
-                    # back to selected_device when a twin is absent, so record its pin.
+                    # edge-core injects this over the twin's own pin, so record the pin.
                     twin_to_device[twin_uuid] = _saved_pin_source(twin_uuid)
                     continue
             twin_to_device[twin_uuid] = pin.device if pin is not None else _device_for(selected)
             shared += 1
-        if shared > 1:
-            console.print(f"[dim]All {shared} camera twin(s) will share this device.[/dim]")
-        elif shared == 1 and not pins and not _identity_of(selected):
+        if shared and not pins and not _identity_of(selected):
             _explain_unpinnable(selected)
         _persist_twin_pins(pins)
         _save_cameras(selected, twin_to_device or None)
@@ -3975,7 +3977,7 @@ def _detect_and_select_cameras() -> None:
         return
 
     pinned_twins = [(u, n) for u, n in camera_twins if u in had_pin]
-    if pinned_twins:
+    if pinned_twins and len(cameras) > 1:
         console.print("\n[bold]Existing camera bindings found:[/bold]")
         for uuid_, name in pinned_twins:
             pin = _pinned_camera(uuid_, name)
@@ -3999,21 +4001,31 @@ def _detect_and_select_cameras() -> None:
         f"\n[bold]Detected {len(cameras)} camera(s) and {len(camera_twins)} "
         f"camera twin(s).[/bold]"
     )
-    if len(camera_twins) > 1:
-        console.print(
-            "[dim]Map each twin to the physical camera it is wired to. "
-            "A device can be assigned to more than one twin if it is shared.[/dim]\n"
-        )
+    _render_camera_menu(cameras)
+    console.print(
+        "[dim]Each camera serves one twin. Pick a camera for each twin, or s to leave a "
+        "twin without one.[/dim]\n"
+    )
 
     twin_to_device = {}
-    assignments_label: dict[int, str] = {}
+    # One camera, one twin: verified pins reserve theirs up front; a duplicate loses its pin.
+    reserved: dict[int, str] = {}
+    dup_pins: set[str] = set()
+    for uuid_, name in camera_twins:
+        saved_pin = _pinned_camera(uuid_, name)
+        if saved_pin is not None and saved_pin.index is not None:
+            if saved_pin.index in reserved:
+                dup_pins.add(uuid_)
+            else:
+                reserved[saved_pin.index] = name
+    assignments_label: dict[int, str] = dict(reserved)
     first_selected: int | None = None
     remaining_default = default_idx
 
     def _claim(twin_uuid: str, twin_name: str, index: int) -> None:
         """Record that *twin_uuid* uses camera *index* and advance the menu default."""
         nonlocal first_selected, remaining_default
-        assignments_label[index] = twin_name
+        assignments_label.setdefault(index, twin_name)
         if first_selected is None:
             first_selected = index
         free = [idx for idx in cameras_by_index if idx not in assignments_label]
@@ -4025,6 +4037,13 @@ def _detect_and_select_cameras() -> None:
 
         pin = _pinned_camera(twin_uuid, twin_name)
         _accept_pin(twin_uuid, pin)
+        if pin is not None and twin_uuid in dup_pins:
+            console.print(
+                f"[yellow]{twin_name}'s saved camera is already bound to "
+                f"{reserved[pin.index]}: a camera serves one twin.[/yellow]"
+            )
+            pin_problem[twin_uuid] = "is already bound to another twin"
+            pin = None
         if pin is not None:
             # Always recorded: an absent mapping inherits the global selected_device.
             twin_to_device[twin_uuid] = pin.device
@@ -4048,24 +4067,67 @@ def _detect_and_select_cameras() -> None:
             console.print()
             continue
 
-        valid_indices = _render_camera_menu(cameras, assignments=assignments_label)
-        console.print()
-        selected = _prompt_camera_index(
-            cameras,
-            valid_indices,
-            prompt=f"Camera for {twin_name}",
-            default_index=remaining_default,
-        )
+        free = [i for i in cameras_by_index if i not in assignments_label]
+        if free:
+            valid_indices = _render_camera_menu(cameras, assignments=assignments_label)
+            console.print("  [dim]s) no camera for this twin[/dim]\n")
+            while True:
+                selected = _prompt_camera_index(
+                    cameras,
+                    valid_indices,
+                    prompt=f"Camera for {twin_name}",
+                    default_index=free[0],
+                )
+                if selected is None or selected == _SKIP or selected in free:
+                    break
+                console.print(
+                    f"[yellow]{cameras_by_index[selected].card} is already bound to "
+                    f"{assignments_label[selected]}: choose another camera, or s.[/yellow]"
+                )
+        else:
+            selected = _SKIP
+            console.print(f"[yellow]No free camera is left for {twin_name}.[/yellow]")
         if selected is None:
             console.print(
                 "[yellow]Skipping remaining twin mappings; edge will fall back "
                 "to /dev/video0 for unmapped twins.[/yellow]"
             )
             break
+        if selected == _SKIP:
+            if twin_uuid in dup_pins and twin_uuid not in twin_serials:
+                pins[twin_uuid] = {"serial_number": "", "video_device": ""}
+                console.print(
+                    f"[yellow]{twin_name}'s saved camera pin is cleared: that camera "
+                    f"belongs to another twin.[/yellow]\n"
+                )
+            elif twin_uuid in twin_serials or twin_uuid in twin_devices:
+                twin_to_device[twin_uuid] = _saved_pin_source(twin_uuid)
+                console.print(f"[yellow]{twin_name} keeps its saved camera pin.[/yellow]\n")
+            else:
+                console.print(f"[yellow]{twin_name} is left without a camera.[/yellow]\n")
+            continue
         twin_to_device[twin_uuid] = _device_for(selected)
         _claim(twin_uuid, twin_name, selected)
         _record_choice(twin_uuid, selected)
         console.print(f"[green]Selected:[/green] {valid_indices[selected].card}\n")
+
+    without = [n for u, n in camera_twins if u not in twin_to_device]
+    if without:
+        console.print(
+            f"[yellow]{len(without)} camera twin(s) have no physical camera: "
+            f"{', '.join(without)}. They are not pinned; edge-core may fall back to "
+            f"/dev/video0 for them.[/yellow]"
+        )
+    unused = [
+        f"{c.card} ({_camera_identity_hint(c, unit_by_index[i])})"
+        for i, c in cameras_by_index.items()
+        if i not in assignments_label
+    ]
+    if unused:
+        console.print(
+            f"[yellow]{len(unused)} camera(s) are not used by any twin: "
+            f"{', '.join(unused)}.[/yellow]"
+        )
 
     if not twin_to_device:
         console.print("[yellow]No cameras mapped — skipping camera config.[/yellow]")
@@ -4269,19 +4331,22 @@ def _detect_and_select_audio_devices() -> None:
         else:
             connected[uuid_] = card
 
-    console.print("\n[bold]Audio devices[/bold]")
+    console.print(f"\n[bold]Detected {len(cards)} USB audio device(s):[/bold]")
     for card in cards:
+        modes = (("capture", card.capture), ("playback", card.playback))
+        kinds = "/".join(name for name, on in modes if on)
+        note = ""
         if card.unit.collided:
-            console.print(
-                f"  [yellow]{card.label}: identical to another attached unit, so its udev id "
-                f"is shared — "
-                + (
-                    "pinned by USB port, keep it in the same port"
-                    if card.pin
-                    else "no USB port link either, cannot be pinned"
-                )
-                + "[/yellow]"
+            note = (
+                "  [yellow]identical to another unit: pinned by USB port, keep it in the "
+                "same port[/yellow]"
+                if card.pin
+                else "  [red]identical to another unit and no USB port link: cannot be pinned[/red]"
             )
+        elif not card.pin:
+            note = "  [red]no stable udev link: cannot be pinned[/red]"
+        link = os.path.basename(card.pin) if card.pin else card.label
+        console.print(f"  {card.label}: [cyan]{link}[/cyan] [dim]({kinds})[/dim]{note}")
     for uuid_, serial in serials.items():
         if uuid_ in by_serial:
             console.print(
@@ -4318,10 +4383,25 @@ def _detect_and_select_audio_devices() -> None:
         saved.clear()
         problem.clear()
 
+    # One device, one twin: the first keeps it, a later twin on the same device chooses again.
+    owner: dict[int, str] = {}
+    conflicted: set[str] = set()
+    for uuid_ in twins:
+        card = connected.get(uuid_) or by_serial.get(uuid_)
+        if card is None:
+            continue
+        if card.index in owner:
+            conflicted.add(uuid_)
+            connected.pop(uuid_, None)
+            by_serial.pop(uuid_, None)
+            problem[uuid_] = f"device {card.label} is already bound to {owner[card.index]}"
+            console.print(
+                f"[yellow]{twins[uuid_][0]}: {card.label} is already bound to "
+                f"{owner[card.index]}; a device serves one twin.[/yellow]"
+            )
+        else:
+            owner[card.index] = twins[uuid_][0]
     pending = [u for u in twins if u not in connected and u not in by_serial]
-    owner: dict[int, str] = {
-        c.index: twins[u][0] for u, c in {**connected, **by_serial}.items()
-    }
     pins: dict[str, dict[str, str]] = {}
     by_index = {c.index: c for c in cards}
     cached = _cached_twin_metadata()
@@ -4360,7 +4440,7 @@ def _detect_and_select_audio_devices() -> None:
             card = by_index[decided[0]]
             missing = (
                 problem.get(uuid_)
-                if uuid_ in saved
+                if uuid_ in saved or uuid_ in conflicted
                 else f"serial {serials[uuid_]} matches no attached device"
                 if uuid_ in serials
                 else None
@@ -4393,30 +4473,24 @@ def _detect_and_select_audio_devices() -> None:
         ):
             console.print(f"[yellow]{name} keeps its serial {serials[uuid_]}.[/yellow]")
             continue
-        pool = [c for c in pool if c.index not in owner] or pool
+        pool = [c for c in pool if c.index not in owner]
+        if not pool:
+            console.print(f"[yellow]No free audio device is left for {name}.[/yellow]")
+            continue
         if len(pool) == 1:
             card = pool[0]
-            holder = owner.get(card.index)
-            if holder:
-                use = _ask_yes_no(
-                    f"{os.path.basename(card.pin)} is already used by {holder}. "
-                    f"Also use it for {name}?",
-                    default=False,
-                    on_eof=False,
-                )
-            else:
-                use = _ask_yes_no(
-                    f"Only one device ({os.path.basename(card.pin)}) is available for "
-                    f"{name}. Use it?"
-                )
-            if use:
+            if _ask_yes_no(
+                f"Only one device ({os.path.basename(card.pin)}) is available for "
+                f"{name}. Use it?",
+                on_eof=False,
+            ):
                 _assign(uuid_, card)
             continue
 
         console.print(f"\n[bold]Audio device for {name}[/bold] [dim]({uuid_[:8]}...)[/dim]")
+        console.print("  [dim]s) no device for this twin[/dim]")
         for i, card in enumerate(pool):
-            holder = owner.get(card.index)
-            suffix = f"  [yellow](assigned to {holder})[/yellow]" if holder else ""
+            suffix = ""
             if card.unit.collided:
                 suffix += "  [yellow](identical unit: pinned by USB port)[/yellow]"
             console.print(
@@ -4428,15 +4502,43 @@ def _detect_and_select_audio_devices() -> None:
         except EOFError:
             console.print("[yellow]No input available — skipping audio pinning.[/yellow]")
             break
+        if str(raw).strip().lower() in ("s", "skip"):
+            continue
         try:
             choice = int(raw)
             if choice < 0:
                 raise IndexError(choice)
-            _assign(uuid_, pool[choice])
+            card = pool[choice]
         except (ValueError, IndexError):
             console.print(f"[yellow]'{raw}' is not a listed device — skipping {name}.[/yellow]")
             continue
+        _assign(uuid_, card)
         console.print(f"[green]Selected:[/green] {pins[uuid_]['audio_device']}")
+
+    for uuid_ in conflicted:
+        if uuid_ in saved and uuid_ not in pins:
+            pins[uuid_] = {"audio_device": "", "serial_number": ""}
+    bound = {u for u, m in pins.items() if m.get("audio_device")}
+    without = [
+        twins[u][0]
+        for u in pending
+        if u not in bound and (u in conflicted or (u not in serials and u not in saved))
+    ]
+    if without:
+        console.print(
+            f"[yellow]{len(without)} audio twin(s) have no physical device: "
+            f"{', '.join(without)}. They are not pinned.[/yellow]"
+        )
+    unused = [
+        f"{c.label} ({os.path.basename(c.pin)})"
+        for c in cards
+        if c.pin and c.index not in owner and any(_can_serve(u, c) for u in twins)
+    ]
+    if unused:
+        console.print(
+            f"[yellow]{len(unused)} audio device(s) are not used by any twin: "
+            f"{', '.join(unused)}.[/yellow]"
+        )
 
     _persist_twin_pins(pins)
 

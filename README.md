@@ -511,6 +511,7 @@ Pick `by-id` when the model is unique on the host, `by-path` when you may attach
 - A device whose udev `ID_SERIAL` (vendor, model and USB serial) is unique on the host is pinned by `by-id` (`/dev/v4l/by-id`, `/dev/snd/by-id`).
 - Identical units share one `ID_SERIAL` (two C920s without a USB serial), so no `by-id` name can tell them apart and udev may hand the name to either unit after a reboot. Those units are pinned by `by-path` instead (`/dev/v4l/by-path`, `/dev/snd/by-path`), which follows the USB port: keep each unit plugged into the same port. The menu marks them "identical unit: pinned by USB port". A saved `by-id` pin that points at such a unit is not trusted and the twin is asked again.
 - A unit with neither a unique `by-id` name nor a `by-path` link cannot be pinned and is asked again on the next install.
+- Every attached camera and USB audio device is listed, identical or not. A sensor serves one twin: with more twins than sensors the surplus twins are left without one (type `s` to choose which), and with more sensors than twins the unused ones are listed. Both cases print a warning. A sensor is never shared: it is bound to exactly one twin, and a second twin saved on the same sensor loses that pin.
 - When udev data is not available the installer falls back to counting links: identical models where only some units own a `by-id` link are treated as identical.
 
 ```bash

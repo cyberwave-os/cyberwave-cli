@@ -183,7 +183,7 @@ def _patch_camera_helpers(
     )
 
 
-def test_detect_and_select_cameras_single_physical_auto_assigns_all_twins(
+def test_single_physical_camera_serves_one_twin_and_the_other_is_left_without(
     monkeypatch, tmp_path
 ):
     core = load_core_module(monkeypatch)
@@ -192,13 +192,13 @@ def test_detect_and_select_cameras_single_physical_auto_assigns_all_twins(
     _write_twin_json(tmp_path, TWIN_B, "Cam B", camera=True)
 
     cameras = [_FakeCam(0, "USB Cam", "/dev/video0")]
-    _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=[])
+    _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=["0", "s"])
 
     core._detect_and_select_cameras()
 
     data = json.loads((tmp_path / "cameras.json").read_text())
     assert data["selected_device"] == 0
-    assert data["twin_to_device"] == {TWIN_A: 0, TWIN_B: 0}
+    assert data["twin_to_device"] == {TWIN_A: 0}
 
 
 def test_detect_and_select_cameras_single_twin_keeps_legacy_prompt(

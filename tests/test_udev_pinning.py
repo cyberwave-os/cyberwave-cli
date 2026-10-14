@@ -320,7 +320,7 @@ def test_one_twin_one_camera_is_associated_and_pinned_without_asking(monkeypatch
     assert pinned == {TWIN_A: core._camera_pin_metadata(C920)}
 
 
-def test_two_twins_one_camera_shares_it_without_pinning_either(monkeypatch, tmp_path):
+def test_two_twins_one_camera_pins_the_one_the_operator_picks(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
     _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True)
@@ -328,13 +328,13 @@ def test_two_twins_one_camera_shares_it_without_pinning_either(monkeypatch, tmp_
     node = _node(tmp_path, "video0")
     _tree(monkeypatch, core, tmp_path, "_V4L_BY_ID_DIR", {C920: node})
 
-    _patch_camera_helpers(monkeypatch, core, [_FakeCam(0, "C920", node)], prompt_inputs=[])
+    _patch_camera_helpers(monkeypatch, core, [_FakeCam(0, "C920", node)], prompt_inputs=["s", "0"])
     pinned: dict = {}
     monkeypatch.setattr(core, "_persist_twin_pins", lambda p: pinned.update(p) or 0)
 
     core._detect_and_select_cameras()
 
-    assert pinned == {}  # which twin owns it is exactly the unknown
+    assert pinned == {TWIN_B: core._camera_pin_metadata(C920)}  # the operator chose Cam B
 
 
 def test_stale_pin_with_one_camera_needs_approval_to_substitute(monkeypatch, tmp_path):
@@ -522,7 +522,7 @@ def test_audio_mic_and_speaker_twins_each_get_their_own_device(monkeypatch, tmp_
     }
 
 
-def test_audio_two_twins_one_device_asks_to_share(monkeypatch, tmp_path):
+def test_audio_two_twins_one_device_gives_it_to_one_twin_only(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
     _write_audio_twin(tmp_path, TWIN_A, "Mic A")
     _write_audio_twin(tmp_path, TWIN_B, "Mic B")
@@ -532,9 +532,8 @@ def test_audio_two_twins_one_device_asks_to_share(monkeypatch, tmp_path):
 
     core._detect_and_select_audio_devices()
 
-    assert len(confirms) == 2
-    assert "Only one device" in confirms[0] and "already used by Mic A" in confirms[1]
-    assert set(pinned) == {TWIN_A, TWIN_B}
+    assert len(confirms) == 1 and "Only one device" in confirms[0]  # Mic B is never offered it
+    assert set(pinned) == {TWIN_A}
 
 
 def test_audio_declining_to_share_pins_nothing(monkeypatch, tmp_path):
