@@ -45,6 +45,7 @@ pyinstaller \
     --hidden-import rich \
     --hidden-import httpx \
     --collect-submodules rich._unicode_data \
+    --collect-submodules cyberwave_cli.commands \
     __pyinstaller_entry.py
 
 # Clean up the temporary entry point

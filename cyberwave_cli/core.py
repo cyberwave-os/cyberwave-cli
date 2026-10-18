@@ -310,7 +310,7 @@ def is_service_active(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
 
 def _run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.CompletedProcess:
     """Run a subprocess and stream output to the console."""
-    console.print(f"[dim]$ {' '.join(cmd)}[/dim]")
+    console.print(f"[dim]$ {_redact_buildkite_credentials(' '.join(cmd))}[/dim]")
     kwargs.setdefault("env", clean_subprocess_env())
     return subprocess.run(cmd, check=check, **kwargs)
 
@@ -1962,7 +1962,12 @@ def _apt_query(cmd: list[str]) -> subprocess.CompletedProcess[str] | None:
 
 def _installed_service_package(spec: ServiceSpec = EDGE_CORE_SPEC) -> InstalledPackage | None:
     """Return the installed Debian package of the given service, or None if there is none."""
-    for channel, package_name in spec.package_channels.items():
+    return _installed_package_in_channels(spec.package_channels)
+
+
+def _installed_package_in_channels(package_channels: dict[str, str]) -> InstalledPackage | None:
+    """Return the installed Debian package among a ``{channel: package}`` map, or None."""
+    for channel, package_name in package_channels.items():
         result = _apt_query(
             ["dpkg-query", "-W", "-f=${db:Status-Status} ${Version}", package_name]
         )
@@ -2181,12 +2186,14 @@ def _apt_get_install(
 # Re-exported from pip_registry for backward compat.
 from .pip_registry import (  # noqa: E402
     INTERNAL_PYTHON_REGISTRY_SLUG,
+    InvalidVersion,
     Version,
     _buildkite_python_registry_index_url,
     _buildkite_python_registry_slug,
     _extract_version_from_distribution_filename,
     _fetch_available_simple_index_versions,
     _normalize_service_channel,
+    _redact_buildkite_credentials,
     _pip_version_matches_channel,
     _resolve_buildkite_python_registry_slug,
     _select_pip_version_for_channel,
@@ -2225,12 +2232,7 @@ def _pip_install(
     normalized_channel = _normalize_service_channel(channel)
     pip_command = [sys.executable, "-m", "pip", "install"]
     buildkite_index_url: str | None = None
-    registry_read_token = os.environ.get(INTERNAL_PYTHON_READ_TOKEN_ENV)
-    if not registry_read_token:
-        creds = load_credentials()
-        saved_token = getattr(creds, "internal_python_read_token", None) if creds else None
-        if isinstance(saved_token, str) and saved_token.strip():
-            registry_read_token = saved_token.strip()
+    registry_read_token = _internal_python_read_token()
 
     if normalized_channel == "stable" and not package_version:
         pip_target = spec.package_name
@@ -2962,6 +2964,382 @@ def update_edge_core(
     # template fallback, which would replace the config dir with this shell's.
     _run_ensure_unit(str(spec.binary_path))
     return restart_service(spec)
+
+
+# ---- CLI self-update (CYB-4419) ----------------------------------------------
+
+CLI_PYTHON_PACKAGE = "cyberwave-cli"
+CLI_PACKAGE_CHANNELS = {
+    "stable": "cyberwave-cli",
+    "dev": "cyberwave-cli-dev",
+    "staging": "cyberwave-cli-staging",
+    "pr": "cyberwave-cli-pr",
+}
+_PYPI_SIMPLE_INDEX_URL = "https://pypi.org/simple"
+_CLI_VERIFY_TIMEOUT_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class InstalledCli:
+    """How the running CLI was installed.
+
+    ``method`` is ``apt`` (the Debian package, whose binary bundles the SDK),
+    ``python`` (a wheel in pip, pipx or the installer's venv), ``editable`` (a
+    source checkout) or ``standalone`` (a bundled binary no package owns).
+    """
+
+    method: str
+    package: str
+    version: str
+    channel: str
+    environment: str = ""
+
+
+def _infer_pip_channel(version_text: str) -> str:
+    """The release channel a pip-installed version belongs to."""
+    try:
+        version = Version(version_text)
+    except InvalidVersion:
+        return "stable"
+    for channel in ("pr", "dev", "staging", "stable"):
+        if _pip_version_matches_channel(version, channel):
+            return channel
+    return "stable"
+
+
+def _is_editable_install() -> bool:
+    import importlib.metadata
+
+    try:
+        raw = importlib.metadata.distribution(CLI_PYTHON_PACKAGE).read_text("direct_url.json")
+        return bool(raw) and bool(json.loads(raw).get("dir_info", {}).get("editable"))
+    except (importlib.metadata.PackageNotFoundError, ValueError, OSError):
+        return False
+
+
+def _python_environment_label() -> str:
+    prefix = Path(sys.prefix)
+    if "pipx" in prefix.parts and "venvs" in prefix.parts:
+        return "pipx"
+    installer_venv = Path(
+        os.environ.get("CYBERWAVE_INSTALL_PYTHON_ENV_DIR")
+        or Path.home() / ".cyberwave-cli" / "venv"
+    )
+    if prefix == installer_venv:
+        return "installer venv"
+    return "pip"
+
+
+def _detect_cli_install() -> InstalledCli:
+    from ._version import get_version
+
+    current_version = get_version()
+    if getattr(sys, "frozen", False):
+        package = _installed_package_in_channels(CLI_PACKAGE_CHANNELS)
+        if package is not None:
+            return InstalledCli("apt", package.name, package.version, package.channel)
+        return InstalledCli("standalone", CLI_PYTHON_PACKAGE, current_version, "stable")
+    if _is_editable_install():
+        return InstalledCli("editable", CLI_PYTHON_PACKAGE, current_version, "stable")
+    return InstalledCli(
+        "python",
+        CLI_PYTHON_PACKAGE,
+        current_version,
+        _infer_pip_channel(current_version),
+        _python_environment_label(),
+    )
+
+
+def _internal_python_read_token() -> str | None:
+    token = os.environ.get(INTERNAL_PYTHON_READ_TOKEN_ENV)
+    if token:
+        return token
+    creds = load_credentials()
+    saved = getattr(creds, "internal_python_read_token", None) if creds else None
+    return saved.strip() if isinstance(saved, str) and saved.strip() else None
+
+
+def _cli_pip_index_url(channel: str, token: str | None) -> str:
+    """Index to read CLI versions from: PyPI for stable, Buildkite otherwise."""
+    if channel == "stable":
+        return _PYPI_SIMPLE_INDEX_URL
+    return _buildkite_python_registry_index_url(
+        _resolve_buildkite_python_registry_slug(CLI_PYTHON_PACKAGE, channel), token
+    )
+
+
+def _resolve_cli_pip_version(channel: str, version: str | None, token: str | None):
+    """The version ``cyberwave update`` installs from pip. Raises ValueError/RuntimeError."""
+    if version:
+        return _validate_pip_channel_version(CLI_PYTHON_PACKAGE, version, channel)
+    versions = _fetch_available_simple_index_versions(
+        _cli_pip_index_url(channel, None),
+        CLI_PYTHON_PACKAGE,
+        buildkite_read_token=token if channel != "stable" else None,
+    )
+    return _select_pip_version_for_channel(
+        versions, package_name=CLI_PYTHON_PACKAGE, channel=channel
+    )
+
+
+def _print_edge_core_update_hint() -> None:
+    """Point at ``edge update`` when edge-core is behind; updating it restarts drivers."""
+    edge_core = _installed_service_package(EDGE_CORE_SPEC)
+    if edge_core is None or edge_core.channel == "pr":
+        return
+    candidate = _apt_candidate_version(edge_core.name)
+    if candidate and _deb_version_is_newer(candidate, edge_core.version):
+        console.print(
+            f"[dim]edge-core {edge_core.version} → {candidate} is available "
+            "(restarts drivers): sudo cyberwave edge update[/dim]"
+        )
+
+
+def _print_cli_update_check(
+    installed: InstalledCli, *, candidate: str | None, is_newer: bool, held: bool = False
+) -> None:
+    from ._version import get_sdk_version
+
+    where = f", {installed.environment}" if installed.environment else ""
+    console.print(f"Package:   {installed.package} ({installed.channel} channel{where})")
+    console.print(f"Installed: {installed.version}")
+    console.print(f"Available: {candidate or 'unknown'}")
+    sdk_version = get_sdk_version()
+    if sdk_version:
+        bundled = "bundled" if installed.method == "apt" else "installed"
+        console.print(f"SDK:       {sdk_version} ({bundled})")
+    if held:
+        console.print(
+            "[yellow]The package is held (apt-mark hold); updating it needs --force.[/yellow]"
+        )
+    if installed.channel == "pr":
+        console.print(
+            "[dim]PR builds are not ordered against each other; update with --version.[/dim]"
+        )
+    elif is_newer:
+        console.print("[cyan]An update is available: cyberwave update[/cyan]")
+    else:
+        console.print("[green]Up to date.[/green]")
+    _print_edge_core_update_hint()
+
+
+def _verify_cli_install() -> bool:
+    """Run the freshly installed CLI's SDK self-check in a new process.
+
+    This process holds the old modules. The self-check starts the CLI and imports the
+    SDK, so a pass covers both. A CLI that predates the self-check (a rollback target)
+    answers with a usage error; then starting at all is the best check left.
+    """
+    frozen = getattr(sys, "frozen", False)
+    base = [sys.executable] if frozen else [sys.executable, "-m", "cyberwave_cli.main"]
+    env = clean_subprocess_env()
+    if frozen:
+        # Without this a PyInstaller binary started from itself takes the parent's
+        # extraction dir for its own, but clean_subprocess_env() just dropped the
+        # LD_LIBRARY_PATH that points there, so it cannot load libpython.
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+
+    def run(arg: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [*base, arg],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_CLI_VERIFY_TIMEOUT_SECONDS,
+            env=env,
+        )
+
+    try:
+        result = run("__selfcheck_sdk")
+        if result.returncode == _CLICK_USAGE_ERROR_EXIT:
+            result = run("--version")
+    except (OSError, subprocess.SubprocessError) as exc:
+        console.print(f"[red]Could not run the updated CLI: {exc}[/red]")
+        return False
+    if result.returncode != 0:
+        output = f"{result.stdout or ''}{result.stderr or ''}".strip()
+        detail = output.splitlines()[-1] if output else f"exit {result.returncode}"
+        console.print(f"[red]The updated CLI failed its self-check: {detail}[/red]")
+        return False
+    return True
+
+
+def _update_cli_apt(installed: InstalledCli, *, version: str | None, check: bool, force: bool):
+    if not shutil.which("apt-get"):
+        console.print("[red]apt-get was not found, so the CLI package cannot be updated.[/red]")
+        return False
+    held = _apt_package_is_held(installed.package)
+    env = {**clean_subprocess_env(), "DEBIAN_FRONTEND": "noninteractive"}
+
+    if check:
+        if os.geteuid() == 0:
+            _apt_get_update(env)
+        else:
+            console.print("[dim]Using the cached package index; run with sudo to refresh it.[/dim]")
+        candidate = _apt_candidate_version(installed.package)
+        _print_cli_update_check(
+            installed,
+            candidate=candidate,
+            is_newer=bool(candidate) and _deb_version_is_newer(candidate, installed.version),
+            held=held,
+        )
+        return True
+
+    require_root("sudo cyberwave update")
+    if installed.channel == "pr" and not version:
+        console.print(
+            "[red]PR builds are not ordered against each other, so there is no latest one.[/red]\n"
+            "[dim]Pass the build from the pull request's comment: "
+            "sudo cyberwave update --version 1.2.3~pr4337.gabc123def456[/dim]"
+        )
+        return False
+    if held and not force:
+        console.print(
+            f"[red]{installed.package} is held (apt-mark hold), so it was not updated.[/red]\n"
+            f"[dim]Re-run with --force, or release the hold: "
+            f"sudo apt-mark unhold {installed.package}[/dim]"
+        )
+        return False
+
+    _apt_get_update(env)
+    command = ["apt-get", "install", "-y"]
+    if held:
+        command.append("--allow-change-held-packages")
+    if version:
+        # An explicit version is also how an operator rolls back.
+        command += ["--allow-downgrades", f"{installed.package}={version}"]
+    else:
+        command += ["--only-upgrade", installed.package]
+    try:
+        _run(command, env=env)
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]apt-get install failed (exit {exc.returncode}).[/red]")
+        return False
+
+    updated = _installed_package_in_channels({installed.channel: installed.package})
+    new_version = updated.version if updated else None
+    if new_version == installed.version:
+        console.print(f"[green]{installed.package} is already at {installed.version}.[/green]")
+        return True
+    console.print(
+        f"[green]Updated {installed.package}: {installed.version} → {new_version}[/green]"
+    )
+    if not _verify_cli_install():
+        console.print(
+            f"[red]The new version does not work. Roll back with: "
+            f"sudo apt-get install --allow-downgrades {installed.package}={installed.version}[/red]"
+        )
+        return False
+    return True
+
+
+def _pip_install_cli(targets: list[str], *, channel: str, token: str | None) -> bool:
+    command = [sys.executable, "-m", "pip", "install", "--upgrade"]
+    if channel != "stable":
+        command += ["--pre", "--extra-index-url", _cli_pip_index_url(channel, token)]
+    try:
+        _run([*command, *targets])
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]pip install failed (exit {exc.returncode}).[/red]")
+        console.print(
+            "[dim]On a system Python that pip refuses to modify, reinstall with "
+            "pipx or the installer: https://cyberwave.com/install.sh[/dim]"
+        )
+        return False
+    return True
+
+
+def _update_cli_python(installed: InstalledCli, *, version: str | None, check: bool):
+    channel = installed.channel
+    if channel == "pr" and not version:
+        if check:
+            _print_cli_update_check(installed, candidate=None, is_newer=False)
+            return True
+        console.print(
+            "[red]PR builds are not ordered against each other, so there is no latest one.[/red]\n"
+            "[dim]Pass the build from the pull request's comment: "
+            "cyberwave update --version 1.2.3rc45+gabc123def456[/dim]"
+        )
+        return False
+    token = _internal_python_read_token()
+    if channel != "stable" and not token:
+        console.print(
+            f"[red]{INTERNAL_PYTHON_READ_TOKEN_ENV} is required for {channel} "
+            "Python package installs.[/red]"
+        )
+        return False
+    try:
+        target = _resolve_cli_pip_version(channel, version, token)
+    except (ValueError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        return False
+
+    try:
+        is_newer = target > Version(installed.version)
+    except InvalidVersion:
+        is_newer = True
+    if check:
+        _print_cli_update_check(installed, candidate=str(target), is_newer=is_newer)
+        return True
+    if not version and not is_newer:
+        # Latest on the channel is not newer: a source build or a pre-release ahead of the
+        # index must not be "updated" down to it. An explicit --version still can.
+        console.print(
+            f"[green]{installed.package} {installed.version} is already up to date "
+            f"(latest on the {channel} channel: {target}).[/green]"
+        )
+        return True
+
+    targets = [f"{CLI_PYTHON_PACKAGE}=={target}"]
+    if channel == "stable" and not version:
+        # Name the SDK too: pip leaves a satisfied dependency alone otherwise, so
+        # the CLI's SDK would stay at whatever the first install pulled in. The
+        # CLI's own requirement still bounds what this can pick.
+        targets.append("cyberwave")
+    if not _pip_install_cli(targets, channel=channel, token=token):
+        return False
+
+    console.print(f"[green]Updated {installed.package}: {installed.version} → {target}[/green]")
+    if _verify_cli_install():
+        return True
+    console.print(f"[yellow]Rolling back to {installed.version}...[/yellow]")
+    if _pip_install_cli(
+        [f"{CLI_PYTHON_PACKAGE}=={installed.version}"], channel=channel, token=token
+    ):
+        console.print(f"[yellow]Restored {installed.package} {installed.version}.[/yellow]")
+    else:
+        # The old version is not on the index, e.g. a build made from a source checkout.
+        console.print(
+            f"[red]Could not restore {installed.version}; reinstall it with: "
+            f"{sys.executable} -m pip install {CLI_PYTHON_PACKAGE}=={installed.version}[/red]"
+        )
+    return False
+
+
+def update_cli(*, version: str | None = None, check: bool = False, force: bool = False) -> bool:
+    """Update the CLI package in place. Returns True on success.
+
+    The installed package decides the channel, so ``update`` never switches
+    channel (reinstall with the installer for that). Debian packages bundle the
+    SDK, so it moves with them; a pip install upgrades it alongside the CLI on
+    the stable channel. Edge-core is never touched.
+    """
+    installed = _detect_cli_install()
+    if installed.method == "editable":
+        console.print(
+            "[yellow]This CLI is an editable (source) install; update it with git and "
+            "pip install -e.[/yellow]"
+        )
+        return False
+    if installed.method == "standalone":
+        console.print(
+            "[yellow]This CLI is a standalone binary that no package manager owns.[/yellow]\n"
+            "[dim]Reinstall it: bash <(curl -fsSL https://cyberwave.com/install.sh)[/dim]"
+        )
+        return False
+    if installed.method == "apt":
+        return _update_cli_apt(installed, version=version, check=check, force=force)
+    return _update_cli_python(installed, version=version, check=check)
 
 
 def stop_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:

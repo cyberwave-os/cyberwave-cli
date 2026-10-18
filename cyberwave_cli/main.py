@@ -49,6 +49,7 @@ _LAZY_COMMANDS: dict[str, tuple[str, str]] = {
     "scan": (".commands.scan", "scan"),
     "so101": (".commands.so101", "so101"),
     "twin": (".commands.twin", "twin"),
+    "update": (".commands.update", "update"),
     "workflow": (".commands.workflow", "workflow"),
     "worker": (".commands.worker", "worker"),
 }
@@ -113,8 +114,27 @@ def run_sdk_selfcheck() -> int:
     return 0
 
 
+def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> None:
+    """``--version``: the CLI version, plus the SDK it runs against."""
+    if not value or ctx.resilient_parsing:
+        return
+    from ._version import get_sdk_version
+
+    sdk_version = get_sdk_version()
+    suffix = f" (cyberwave SDK {sdk_version})" if sdk_version else ""
+    click.echo(f"cyberwave, version {__version__}{suffix}")
+    ctx.exit()
+
+
 @click.group(cls=_LazyGroup, lazy_commands=_LAZY_COMMANDS, invoke_without_command=True)
-@click.version_option(version=__version__, prog_name="cyberwave")
+@click.option(
+    "--version",
+    is_flag=True,
+    is_eager=True,
+    expose_value=False,
+    callback=_print_version,
+    help="Show the CLI and SDK versions and exit.",
+)
 @click.pass_context
 def cli(ctx: click.Context) -> None:
     """Cyberwave CLI - Manage digital twins and edge ML.
@@ -141,6 +161,7 @@ def cli(ctx: click.Context) -> None:
       compute     Manage cloud node (install, start, stop, status)
       scan        Discover IP cameras on the network
       completion  Generate/install shell completion
+      update      Update this CLI (and the SDK it bundles)
 
     \b
     Resource Management:

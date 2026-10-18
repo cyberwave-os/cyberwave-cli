@@ -85,6 +85,7 @@ picking one for you. Re-run `cyberwave login` to change the selected workspace.
 | `configure`   | Set API token and URL directly (without login flow)           |
 | `config-dir`  | Print the active configuration directory                      |
 | `completion`  | Generate/install shell autocomplete                           |
+| `update`      | Update this CLI (and the SDK it bundles)                      |
 | `pair`        | Pair this device as an edge node (alias for `edge install`)   |
 | `twin`        | Create, pair, list, show, and delete digital twins            |
 | `edge`        | Manage edge node (install, start, stop, drivers, sync, etc.)  |
@@ -430,6 +431,32 @@ cat "$CONFIG_DIR/credentials.json"
 ```
 
 See [Configuration](#configuration) for how the directory is resolved.
+
+## `cyberwave update`
+
+Updates the CLI itself, on the channel it was installed from (stable, dev, staging or pr). It never switches channel.
+
+```bash
+cyberwave update --check               # installed vs available, changes nothing
+sudo cyberwave update                  # Debian / Ubuntu package
+cyberwave update                       # pip, pipx or the installer's venv
+cyberwave update --version 0.12.7      # exact version, older ones included
+```
+
+**Options:**
+
+- `--check`: Show the installed and available versions without changing anything
+- `--version`: Exact version to install (required for PR builds)
+- `--force`: Update even when the package is held with `apt-mark hold`
+
+**Behavior:**
+
+- **Debian package:** needs root. The SDK is bundled in the binary, so it updates with the CLI.
+- **pip / pipx / installer venv:** no sudo. On the stable channel the SDK is upgraded together with the CLI when the CLI is updated (an up-to-date CLI leaves its SDK alone); on dev and staging the CLI's declared SDK range decides.
+- The new version is run in a fresh process (its SDK self-check, or `--version` for an older release that has none). A failed pip update is rolled back, or you are told how to restore the old version if it is not on the index; a failed Debian update prints the downgrade command.
+- Without `--version`, an installed CLI that is already newer than the latest release is left alone, never moved back.
+- Edge-core is not updated, because that restarts drivers. `--check` tells you when `cyberwave edge update` has something to install.
+- Editable (source) installs and standalone binaries are refused with a hint.
 
 ## `cyberwave edge`
 

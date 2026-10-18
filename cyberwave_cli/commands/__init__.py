@@ -18,6 +18,7 @@ from .plugin import plugin
 from .scan import scan
 from .so101 import so101
 from .twin import twin
+from .update import update
 from .workflow import workflow
 from .worker import worker
 
@@ -38,6 +39,7 @@ __all__ = [
     "scan",
     "so101",
     "twin",
+    "update",
     "workflow",
     "worker",
 ]
