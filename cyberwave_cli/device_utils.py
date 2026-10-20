@@ -1,9 +1,7 @@
 """Machine-dependent device utilities for the Cyberwave CLI.
 
 This module provides utilities for discovering and enumerating hardware devices
-on the edge machine. Currently supports Linux via v4l2-ctl.
-
-Future: Add support for macOS (AVFoundation), Windows (DirectShow), etc.
+on the edge machine. Supports Linux V4L2/ALSA and macOS AVFoundation.
 """
 
 from __future__ import annotations
@@ -17,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .config import clean_subprocess_env
+from .config import chown_to_sudo_user, clean_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +247,26 @@ def _ensure_video_device_permissions() -> None:
         )
 
 
+def _video_device_nodes() -> list[str]:
+    return sorted(
+        (str(p) for p in Path("/dev").glob("video*")
+         if re.fullmatch(r"video\d+", p.name) and p.is_char_device()),
+        key=lambda path: int(Path(path).name[5:]),
+    )
+
+
+def _usb_camera_without_driver(usb_devices: Path = Path("/sys/bus/usb/devices")) -> bool:
+    for class_file in usb_devices.glob("*/bInterfaceClass"):
+        try:
+            if class_file.read_text().strip() != "0e":  # USB Video class
+                continue
+        except OSError:
+            continue
+        if not (class_file.parent / "driver").exists():
+            return True
+    return False
+
+
 def discover_usb_cameras_v4l2() -> list[CameraDevice]:
     """Discover USB cameras using v4l2-ctl (Linux only).
 
@@ -264,9 +282,14 @@ def discover_usb_cameras_v4l2() -> list[CameraDevice]:
 
     _ensure_video_device_permissions()
 
+    nodes = _video_device_nodes()
+    if not nodes:
+        logger.debug("No /dev/video* nodes; skipping v4l2-ctl")
+        return []
+
     try:
         result = subprocess.run(
-            ["v4l2-ctl", "--list-devices"],
+            ["v4l2-ctl", "-d", nodes[0], "--list-devices"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -274,12 +297,10 @@ def discover_usb_cameras_v4l2() -> list[CameraDevice]:
         )
         if result.returncode != 0 and result.stderr:
             logger.warning(
-                "v4l2-ctl reported errors (e.g. unplugged device) but continuing: %s",
+                "v4l2-ctl --list-devices failed, using its partial output: %s",
                 result.stderr.strip(),
             )
 
-        # Parse stdout regardless of return code - v4l2-ctl may output valid devices
-        # before failing on an inaccessible one (e.g. unplugged /dev/video0)
         devices = _parse_v4l2_list_devices(result.stdout or "")
 
         # Exclude known non-camera platform devices (codecs, ISPs, decoders)
@@ -337,6 +358,31 @@ class MicrophoneDevice:
     paths: list[str] = field(default_factory=list)
     driver: str = ""
 
+    def to_dict(self) -> dict:
+        from dataclasses import asdict
+
+        return asdict(self)
+
+
+def _discover_microphones_alsa(root: Path = Path("/proc/asound")) -> list[MicrophoneDevice]:
+    microphones = []
+    for card_dir in sorted(root.glob("card[0-9]*")):
+        if not re.fullmatch(r"card\d+", card_dir.name):
+            continue
+        card_index = card_dir.name[4:]
+        try:
+            label = (card_dir / "id").read_text().strip() or card_dir.name
+        except OSError:
+            label = card_dir.name
+        paths = [
+            f"hw:{card_index},{pcm.name[3:-1]}"
+            for pcm in sorted(card_dir.glob("pcm*c"))
+            if re.fullmatch(r"pcm\d+c", pcm.name)
+        ]
+        if paths:
+            microphones.append(MicrophoneDevice(label, f"alsa-card-{card_index}", paths, "alsa"))
+    return microphones
+
 
 def _discover_microphones_avfoundation() -> list[MicrophoneDevice]:
     """Discover microphones on macOS via AVFoundation (ffmpeg probe)."""
@@ -363,7 +409,7 @@ def discover_microphones() -> list[MicrophoneDevice]:
 
     Platform-specific:
     - macOS: Uses AVFoundation via ffmpeg
-    - Linux: Not yet implemented (edge uses ALSA inside the container)
+    - Linux: ALSA capture PCMs from /proc/asound (no external tool required)
     - Windows: Not yet implemented
     """
     import platform
@@ -372,8 +418,7 @@ def discover_microphones() -> list[MicrophoneDevice]:
     if system == "Darwin":
         return _discover_microphones_avfoundation()
     if system == "Linux":
-        logger.debug("Linux microphone discovery is handled by the edge driver")
-        return []
+        return _discover_microphones_alsa()
     if system == "Windows":
         logger.warning("Windows microphone discovery not yet implemented")
         return []
@@ -408,6 +453,43 @@ def discover_usb_cameras() -> list[CameraDevice]:
 
     cameras.sort(key=camera_likelihood_score, reverse=True)
     return cameras
+
+
+def no_camera_hint() -> Optional[str]:
+    """One line on why Linux discovery found no camera and what to run next; None off Linux."""
+    import platform
+
+    if platform.system() != "Linux":
+        return None
+    if not shutil.which("v4l2-ctl"):
+        if shutil.which("apt-get"):
+            install = "sudo apt-get install v4l-utils"
+        elif shutil.which("pacman"):
+            install = "sudo pacman -S v4l-utils"
+        else:
+            install = "use your package manager to install v4l-utils"
+        return f"v4l2-ctl not found. Install v4l-utils: {install}"
+    nodes = _video_device_nodes()
+    if not nodes:
+        if _usb_camera_without_driver():
+            return (
+                "A USB camera is connected but no /dev/video* device was created: "
+                "a USB Video interface has no bound driver. Try: sudo modprobe uvcvideo; "
+                "then inspect sudo dmesg for driver or probe errors."
+            )
+        return (
+            "No /dev/video* device exists. Check the camera shows up in lsusb "
+            "(cable, port, power), replug it, then look for errors: sudo dmesg | tail -20"
+        )
+    if not any(os.access(node, os.R_OK | os.W_OK) for node in nodes):
+        return (
+            "Video devices exist but this user cannot open them. Re-run with sudo, "
+            "or: sudo usermod -aG video $USER (then log out and back in)"
+        )
+    return (
+        "Video nodes exist but no camera was enumerated. They may be codec/ISP nodes, "
+        "or discovery failed. Inspect v4l2-ctl -d <existing-video-node> --all and sudo dmesg."
+    )
 
 
 def list_serial_ports() -> list[str]:
@@ -478,13 +560,15 @@ def write_cameras_json(
     if selected_index is not None:
         data["selected_device"] = selected_index
     if twin_to_device:
-        # ``int()`` on every value would raise on a by-id path and, before
-        # that, quietly rounded the whole feature down to positional indices.
         data["twin_to_device"] = {
-            str(twin_uuid): value if isinstance(value, str) else int(value)
+            str(twin_uuid): (
+                int(value) if not isinstance(value, str) or re.fullmatch(r"[0-9]+", value)
+                else value
+            )
             for twin_uuid, value in twin_to_device.items()
         }
     atomic_write_json(cameras_file, data, mode=0o644)
+    chown_to_sudo_user(cameras_file)
     logger.info("Wrote cameras.json to %s (%d devices)", cameras_file, len(cameras))
     return cameras_file
 

@@ -408,3 +408,24 @@ def test_edge_install_has_no_short_form_for_token():
 
     assert result.exit_code == 2, result.output
     assert "No such option: -t" in result.output, result.output
+
+
+def test_reconfigure_camera_on_linux_rebinds_network_cameras_before_usb(monkeypatch):
+    calls: list[object] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "cyberwave_cli.core",
+        types.SimpleNamespace(
+            _list_network_twins=lambda: [("twin", "AX8", object())],
+            _detect_and_bind_network_devices=lambda: calls.append("network") or {"twin": {}},
+            _detect_and_select_cameras=lambda: calls.append("usb"),
+            _record_network_twin_sources=lambda bindings: calls.append(("record", bindings)),
+            normalize_environment_reference=_real_normalize_environment_reference,
+        ),
+    )
+    monkeypatch.setattr(importlib.import_module("cyberwave_cli.macos"), "is_macos", lambda: False)
+
+    result = CliRunner().invoke(_edge_module.install_edge, ["--reconfigure-camera"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["network", "usb", ("record", {"twin": {}})]

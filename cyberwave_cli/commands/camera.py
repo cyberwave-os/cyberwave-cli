@@ -55,6 +55,7 @@ def run_command(cmd: list[str], cwd: Path | None = None) -> bool:
             capture_output=True,
             text=True,
             env=clean_subprocess_env(),
+            timeout=10,
         )
         return result.returncode == 0
     except Exception:
@@ -486,15 +487,25 @@ def camera(
         console.print("\n[bold]Cloning camera edge software...[/bold]")
         console.print(f"[dim]→ {CAMERA_EDGE_REPO_URL}[/dim]")
 
-        result = subprocess.run(
-            ["git", "clone", CAMERA_EDGE_REPO_URL, str(target_path)],
-            capture_output=True,
-            text=True,
-            env=clean_subprocess_env(),
-        )
+        git_env = clean_subprocess_env()
+        git_env.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="Never")
+        try:
+            result = subprocess.run(
+                ["git", "clone", CAMERA_EDGE_REPO_URL, str(target_path)],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                env=git_env,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            console.print("[red][ERROR][/red] Repository download timed out after 60 seconds.")
+            console.print("[dim]Check Git access, or use --local-edge with an existing checkout.[/dim]")
+            raise click.Abort() from None
 
         if result.returncode != 0:
             console.print("[red][ERROR][/red] Failed to clone repository")
+            console.print("[dim]Configure Git credentials with repository access, or use --local-edge.[/dim]")
             console.print(f"[dim]{result.stderr}[/dim]")
             raise click.Abort()
 

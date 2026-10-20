@@ -406,17 +406,28 @@ cyberwave completion generate --shell zsh
 
 ## `cyberwave login`
 
-Authenticates with Cyberwave using your email and password.
+Authenticates with Cyberwave using your email and password, or with an existing API token.
 
 ```bash
 cyberwave login                                              # interactive
 cyberwave login --email you@example.com --password yourpass   # non-interactive
+cyberwave login --token cw_XXXX                              # an API token, no password
 ```
 
 **Options:**
 
 - `-e, --email`: Email address
 - `-p, --password`: Password (will prompt if not provided)
+- `--token`: An API token. The workspace is the one the token belongs to. It cannot be combined with `--email`/`--password`, and an empty value is refused.
+
+When the backend cannot be reached at all, retrying the password cannot help, so login stops at once and says why, in one line, with the address it tried (credentials in it are hidden) and what to check:
+
+```
+✗ Can't reach the Cyberwave backend at http://192.168.1.138:8000 (no route to host)
+  → Is it running at that address? Point CYBERWAVE_BASE_URL at the right one and retry.
+```
+
+The reason is read from the error itself: `no route to host`, `connection refused`, `timed out`, `host name not found` and so on. `cyberwave edge install` uses the same message. While it looks for credentials it tries each candidate address once, skips one that already failed to answer, and never asks for a password when the login address itself is down. A failed login exits with status 1.
 
 ## `cyberwave config-dir`
 
@@ -476,6 +487,8 @@ Manage the edge node service lifecycle, configuration, and monitoring.
 | `remote-status`  | Check edge status from twin metadata (heartbeat)         |
 | `logs`           | Show edge node logs                                      |
 | `install-deps`   | Install edge ML dependencies                             |
+| `cameras`        | List the video inputs this host sees (`--json`)          |
+| `microphones`    | List the audio capture inputs this host sees (`--json`)  |
 | `sync-workflows` | Trigger workflow sync on the edge node                   |
 | `list-models`    | List model bindings loaded on the edge node              |
 | `driver`         | Manage edge driver containers (subgroup — see [below](#cyberwave-edge-driver)) |
@@ -520,42 +533,76 @@ On **macOS**, the installer also sets up an MJPEG camera stream bridge (using `f
 
 For **microphone** twins, the installer sets up a PCM audio stream bridge on the same pattern: `ffmpeg` captures from AVFoundation on the host and serves raw PCM over HTTP (ports starting at `8101`). Assignments are persisted in `~/.cyberwave/audio_streams.json` and injected as `CYBERWAVE_METADATA_AUDIO_DEVICE` when edge-core starts each generic-microphone driver container.
 
-On **Linux** with multiple camera-bearing twins, the installer walks you through a per-twin mapping so each twin is bound to a specific `/dev/video*` device. The mapping is saved to the backend as `Edge.metadata.cameras` and mirrored locally in `~/.cyberwave/edge.json`. Edge-core reads camera config from `edge.json` at startup; `~/.cyberwave/cameras.json` is kept as a legacy fallback but is deprecated.
+On **Linux**, the installer binds every camera, microphone and speaker twin to one physical device and pins it there, so the binding survives a reboot, a replug, or a renumbering of `/dev/video*` and of the ALSA cards. It runs right after you pick the twins, cameras first and audio second. The code is `_detect_and_select_cameras` and `_detect_and_select_audio_devices` in `cyberwave_cli/core.py`.
 
-A twin that already pins its camera through `metadata.serial_number` is **not** prompted for: the installer matches that serial against the serials reported by the attached cameras and binds the twin automatically. Twins without a serial are asked as before, and the camera you choose is written back to the twin as its `serial_number` — so the prompt appears once per camera instead of on every install, and the binding survives a replug or a reboot that renumbers `/dev/video*`. If a pinned serial matches none of the attached cameras, the installer warns and asks rather than binding a different unit, because the driver refuses to substitute hardware for a pinned twin.
+**What a pin is.** A pin is a stable udev link written into the twin's metadata: `metadata.video_device` for a camera, `metadata.audio_device` for a microphone or speaker, with `metadata.serial_number` left blank. The serial is blanked on purpose, because both the camera driver and the microphone driver let a serial outrank the device field, so a leftover serial would override the pin. Which link is used depends on the hardware:
 
-Some cameras have no serial to pin — the Logitech C920, for instance, reports an empty USB serial descriptor, so `metadata.serial_number` can never identify it. For those, set `metadata.video_device` to a udev stable name instead and the twin is skipped in the same way:
+- A device whose udev `ID_SERIAL` (vendor, model and USB serial) is unique on the host is pinned by `by-id` (`/dev/v4l/by-id`, `/dev/snd/by-id`). It follows the device to any port.
+- Identical units share one `ID_SERIAL` (two C920s without a USB serial), so no `by-id` name can tell them apart and udev may hand the name to either unit after a reboot. Those units are pinned by `by-path` instead (`/dev/v4l/by-path`, `/dev/snd/by-path`), which follows the USB port: keep each unit plugged into the same port. A saved `by-id` pin that points at such a unit is not trusted, and the twin is asked again.
+- When udev data is not available, the installer falls back to counting links: identical models where only some units own a `by-id` link are treated as identical.
+- A camera without any link falls back to its V4L2 serial, written to `serial_number`. A camera that cannot be pinned at all can still be chosen, but only for this boot, and is asked again on the next install. An audio card that cannot be pinned is listed but never offered.
+
+A single device such as a Logitech C920 is both a camera and a microphone, and each sensor is pinned on its own, so the camera driver and the microphone driver can use the same hardware.
+
+A twin that carries both a camera and an audio sensor (a webcam with a microphone, a go2) is pinned by the camera flow only. Its driver picks the microphone by device name, and a `/dev/snd` link in `audio_device` would stop that driver, video included, so the audio flow leaves such twins alone. The twin has one `serial_number` for both sensors, but a serial names one device, so the installer never writes `serial_number` there: the camera flow writes only `video_device`, and when the serial does not name the camera it prints a warning that the shared serial needs your attention. A link name an older installer left there is not a serial and is still moved.
 
 ```
 /dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920-video-index0      # follows the camera across ports
 /dev/v4l/by-path/platform-...-usb-0:1.3:1.0-video-index0     # follows the port, not the camera
 ```
 
-Pick `by-id` when the model is unique on the host, `by-path` when you may attach a second identical camera and care which port it is in. An `rtsp://` or `http://` URL in the same field marks the twin as a network camera, which is likewise never asked about and consumes no local device. A positional value (`0`, `/dev/video6`) is **not** identity — it means "whatever enumerated there this boot" — so those twins are still prompted. `serial_number` wins when a twin carries both.
+**Identity you set yourself.** A twin can name its device before the install: a hardware serial in `metadata.serial_number`, or a stable link in `video_device` / `audio_device`. Such a twin is matched without a prompt. A camera serial matches the serial V4L2 reports (ignoring case) or the delimited serial field of a by-id name; a microphone serial is matched against the `/dev/snd/by-id` names with the microphone driver's rule (see the generic-microphone README, *Choosing the device*). An `rtsp://` or `http://` URL in `video_device` marks a network camera, which is never asked about, consumes no local device and outranks `serial_number` in the camera driver. A positional value (`0`, `/dev/video6`) is **not** identity, since it means "whatever enumerated there this boot", so those twins are still prompted. A serial you set is kept: the installer replaces it only when you decline to keep the existing bindings, or approve a substitute for a missing device, and never on a twin with both camera and audio sensors. A numeric serial is read as text, as the drivers read it. A link name that an older installer stored in `serial_number` is moved into the device field, because the drivers cannot resolve a link name given as a serial.
+
+**One device, one twin.** A device serves exactly one twin. Verified pins reserve their device first, and when two twins are saved on the same device the first keeps it and the other loses its pin and chooses again. With more twins than devices, the surplus twins are left without one (type `s` to choose which); with more devices than twins, the unused ones are listed. Both cases print a warning. When the evidence leaves a twin only one possible device, because every complete assignment of twins to devices agrees on it, the installer binds it without asking and says so ("associated automatically with …"). It does that only for a twin with no previous pin; replacing a pin always needs your approval.
+
+**Reinstalling.** When twins already carry pins and more than one device is attached, the installer lists the bindings and asks "Keep these existing camera bindings?", and the same for audio. Answering no re-maps every twin, and the new choices replace the old pins. A saved pin whose device is not attached is never replaced silently: the installer offers the device it can identify ("<twin>'s saved camera is not attached. Bind it to … instead?") or a menu, and if you decline, the twin stays pinned to its missing device. Its driver then refuses to substitute another one, and for cameras Edge Core raises a `sensor_device_missing` alert until the device is back. One case does not wait for an answer: with one camera twin and one attached camera, a run without a terminal (stdin closed) moves the twin to that camera and says so ("No input available: <twin> moves from its saved camera …"), so a scripted reinstall after a camera swap does not leave the driver refusing to start.
+
+**The menus.** The camera menu lists each camera with its card name, its `/dev/videoN` node and a short `id <unit>` or `port <USB port>`. A `*` marks identical units pinned by USB port, "(probably not a camera)" marks unlikely devices, and the suggested default prefers a RealSense for a depth twin and otherwise the camera whose name shares the most words with the twin's asset. The audio menu is numbered by ALSA card. `s` leaves a twin without a device. In the audio menu, so do three answers that are not a listed device (`yes | cyberwave edge install` answers `y` to every prompt). In the camera menu, three empty answers or three picks of a camera that is already bound leave the twin without one, while an answer that is not a listed camera at all stops the camera prompts: the remaining twins are not asked and keep their saved pins ("No valid answer: the remaining twins are not asked and keep their saved pins."). With no camera twin, `s` at "Select camera" writes no camera configuration. Without a terminal (stdin closed), the prompts fall back on their own: keeping existing bindings is yes, approving a substitute is no (yes for the only camera twin when only one camera is attached), and menus are skipped. `-y` does not answer these prompts.
+
+**What gets written, and why.**
+- **The twin's metadata**, through the backend, best-effort so a failure never blocks the install. Only `serial_number`, `video_device` and `audio_device` are written. When a camera twin's update fails, the camera mapping below still applies on this host while the twin keeps its old pin; the installer says so, and a re-run of `cyberwave edge install` pins the twin.
+- **The local twin file** `~/.cyberwave/<twin-uuid>.json`, which receives the same keys after a successful update. Edge Core syncs that file back to the backend, so leaving it stale would push the old pin back over the new one.
+- **The camera mapping**, saved to the backend as `Edge.metadata.cameras` and mirrored in `~/.cyberwave/edge.json`; edge-core reads it from there, with `~/.cyberwave/cameras.json` kept as a deprecated fallback. Under `twin_to_device` it holds a link, an index, `serial:<serial>` for a depth camera the driver resolves itself, or a stream URL. Every pinned twin is recorded, including one whose rebind you declined, because Edge Core gives a twin missing from the map the global `selected_device` and would point it at the wrong camera. A camera twin left without a camera is named in a warning that says which camera it will get instead ("…so edge-core starts them on the default camera (HD Pro Webcam C920, /dev/video0), which may be another twin's"). When the mapping cannot be uploaded and `edge.json` already holds one, the new mapping is written into `edge.json` too, because Edge Core reads `edge.json` first and would otherwise keep the old one; the installer says so. Audio pins are not part of this mapping; the microphone driver reads them from the twin. A speaker twin is pinned like a microphone, and the summary marks it "(saved; the speaker driver does not use it yet)".
+
+Edge Core follows a changed camera pin by recreating the driver, and alerts when a pinned camera disappears; see *Camera pins: drift and missing devices* in the cyberwave-edge-core README.
+
+**Network devices.** Hardware on the Ethernet port, such as a FLIR AX8 thermal camera, has no `/dev` node and its address can change, so it is bound differently. A twin opts in through a `network_discovery` block in its asset's metadata. Before the USB cameras, the installer looks at the wired ports, gives an unaddressed port DHCP and link-local addressing (after asking), finds each device by mDNS, ARP or the ports it serves, identifies it by MAC and writes its address into the twin, for example `video_device=rtsp://169.254.150.216/avc` plus `mac_address`. Such a twin never enters the USB camera menu. A driver param `-e CYBERWAVE_METADATA_VIDEO_DEVICE=...` naming a real address is followed and checked. One that names no address, such as the AX8 asset's `rtsp://192.168.X.X/avc` placeholder, is ignored and removed once the device is found. When the param, the scan and the saved MAC disagree, or several twins compete for one device, the installer asks. The [wired network devices](docs/wired-network-devices.md) guide explains the whole flow, every prompt and default, the NetworkManager changes, and how to describe a new kind of IP device in metadata.
+
+One caveat: a RealSense depth camera is opened by its serial through librealsense, which ignores `video_device`, so a depth twin is only truly pinned when its `serial_number` is set.
 
 ```bash
 sudo cyberwave edge install
-sudo cyberwave edge install -y   # skip prompts
+sudo cyberwave edge install -y   # skip confirmation prompts (not the device pinning prompts)
 sudo cyberwave edge install -e acme/envs/production-floor   # pin the environment
 sudo cyberwave edge install --token cw_XXXX -e acme/envs/production-floor -y   # scripted
-sudo cyberwave edge install --reconfigure-camera   # re-select camera without full reinstall
-sudo cyberwave edge install --reconfigure-microphone   # re-select microphone without full reinstall
+sudo cyberwave edge install --reconfigure-camera   # re-select cameras without full reinstall
+sudo cyberwave edge install --reconfigure-microphone   # macOS: re-select microphone without full reinstall
 ```
 
 **Options:**
 
 - `-e`, `--environment`: Environment to attach this device to, as a UUID or full slug. Skips the environment prompt. Must already exist in the token's workspace.
 - `--token`: API token to authenticate with. Overrides stored credentials, `CYBERWAVE_API_KEY`, and the interactive login. Has no short form.
-- `--reconfigure-camera`: Re-run the camera selection prompt and restart the camera stream and edge-core service. Useful when switching between cameras (e.g. laptop webcam to external USB camera).
-- `--reconfigure-microphone`: Re-run the microphone selection prompt and restart the audio stream bridge and edge-core service. Useful when switching microphones or fixing a broken PCM bridge.
+- `--reconfigure-camera`: Re-run the camera selection. On macOS it also restarts the camera stream and edge-core service. On Linux it re-runs the camera pinning above, network cameras first and then USB cameras, and edge-core picks up the changed pins on its own; a pinning failure exits with an error. Useful when switching between cameras (e.g. laptop webcam to external USB camera).
+- `--reconfigure-microphone`: macOS only. Re-run the microphone selection prompt and restart the audio stream bridge and edge-core service. Useful when switching microphones or fixing a broken PCM bridge. On Linux, microphone pins are redone by a full `cyberwave edge install`.
 - `--force-reinstall`: Force reinstall of the USB/IP server on macOS. Camera stream and edge-core setup are always forced during install.
 - `--channel {stable,dev,staging,pr}`: Which build of `cyberwave-edge-core` to install. Defaults to `stable`. `pr` installs an unreviewed build of a single pull request and **requires `--version`** — PR builds are not ordered against each other, so there is no latest one to pick; copy the version from the pull request's build comment. It is meant for testing a change on hardware before it merges, not for running a device.
 - `--version`: Exact package version to install instead of the channel's latest. Required with `--channel pr`.
-- `-y`: Skip interactive confirmation prompts.
+- `-y`: Skip interactive confirmation prompts. The Linux camera and audio pinning prompts are not confirmations and still ask; without a terminal they fall back as described above.
 
 ### `cyberwave edge uninstall`
 
 Stops the systemd service, removes the unit file, and optionally uninstalls the package.
+
+On a host where systemd is not running, such as WSL without systemd or a container, there is no
+service to stop: uninstall says so, skips the service steps, and still removes the unit file,
+the driver and worker containers, the backend registration and the configuration.
+
+When Docker is installed but its daemon is not running, no container can be running:
+uninstall warns, skips the container cleanup and carries on. Containers started with a restart
+policy come back when Docker starts again; remove them then (`docker ps -a --filter name=^cyberwave-`).
+Any other container failure, such as a listing that times out or a `docker stop` / `docker rm`
+that fails, stops uninstall before the configuration is deleted.
 
 Uninstalling also releases the twins this device was paired to, so they stop
 appearing under it in **Workspace settings → Edges** and are free to pair
@@ -568,7 +615,7 @@ sudo cyberwave edge uninstall --channel dev   # keep Docker images/containers
 
 **Options:**
 
-- `--channel {stable,dev,staging,pr}`: When set to `dev`, `staging` or `pr`, Docker images and containers are preserved so that a subsequent reinstall does not need to re-download them. This speeds up QA and development cycles and avoids unnecessary wear on SD cards.
+- `--channel {stable,dev,staging,pr}`: When set to `dev` or `staging`, Docker images and containers are preserved so that a subsequent reinstall does not need to re-download them. This speeds up QA and development cycles and avoids unnecessary wear on SD cards.
 - `-y`: Skip interactive confirmation prompts.
 
 ### `cyberwave edge start / stop / restart`
@@ -851,7 +898,11 @@ cyberwave scan -s 10.0.0              # specific subnet
 cyberwave scan --json                 # JSON output
 cyberwave scan --no-ports             # discovery protocols only
 cyberwave scan -t 2.0                 # increase timeout
+cyberwave scan --wired                # hardware on this host's Ethernet ports
+cyberwave scan --wired --json         # ... with every mDNS service, instance and TXT record
 ```
+
+`--wired` runs the discovery that `cyberwave edge install` uses to bind network devices, without changing anything. It lists each Ethernet port with its link and addresses, then each device on it with its MAC, vendor and announced mDNS services; a device announcing an address the host cannot reach is marked "other subnet". The JSON output is plain stdout, safe to pipe, and is the quickest way to find the service types, names and TXT records for a new device's `network_discovery` block (see [wired network devices](docs/wired-network-devices.md)).
 
 ## `cyberwave camera`
 
@@ -908,11 +959,14 @@ Run `cyberwave config-dir` to see which directory is active.
 - `environment.json` — selected workspace, environment, and twin bindings
 - `fingerprint.json` — unique edge device identifier
 - `edge.json` — cached edge device record from the backend, including `metadata.cameras` (device list and twin-to-device mapping); written during install and refreshed by edge-core
-- `cameras.json` — **deprecated**; legacy camera config retained for backward compatibility with older edge-core builds
+- `cameras.json` — **deprecated**; legacy camera config retained for backward compatibility with older edge-core builds. The Linux installer still writes it on every camera mapping.
+- `<twin-uuid>.json` — the cached twin JSON that edge-core hands to each driver. The installer writes it atomically when it downloads the twins, and merges every device pin it saves into it, so that edge-core's twin sync does not push an older copy back over the new pin.
+
+These files are written atomically and, when the installer runs under `sudo`, handed back to the invoking user.
 
 Other environment variables:
 
-- `CYBERWAVE_BASE_URL`: Override the API URL (default: `https://api.cyberwave.com`)
+- `CYBERWAVE_BASE_URL`: Override the API URL (default: `https://api.cyberwave.com`). It must be an `http` or `https` URL with a host; anything else stops the CLI with `CYBERWAVE_BASE_URL is not a valid URL: '<value>'` instead of a traceback.
 - `CYBERWAVE_ENVIRONMENT`: Environment name (for example `dev`, defaults to `production`)
 - `CYBERWAVE_MQTT_HOST`: MQTT broker host (for example `dev.mqtt.cyberwave.com` for dev; defaults to `mqtt.cyberwave.com`)
 - `CYBERWAVE_MQTT_TOPIC_PREFIX`: Override the MQTT topic prefix (rarely needed; the CLI derives it from `CYBERWAVE_ENVIRONMENT`/credentials)
@@ -966,3 +1020,31 @@ Contributions are welcome. Please open an issue for bugs or feature requests, an
 - **Documentation**: [docs.cyberwave.com](https://docs.cyberwave.com)
 - **Issues**: [GitHub Issues](https://github.com/cyberwave-os/cyberwave-cli/issues)
 - **Community**: [Discord](https://discord.gg/dfGhNrawyF)
+
+### Camera and microphone diagnostics
+
+Use `cyberwave edge cameras` to inspect video inputs and `cyberwave edge microphones`
+to inspect audio capture inputs; both accept `--json`. Linux microphone discovery
+reads ALSA capture PCMs, including built-in and USB devices. macOS uses AVFoundation.
+Windows device discovery is not yet implemented. Listing devices does not assign
+them to twins: use `cyberwave edge install` for installation-time assignments.
+
+An older `v4l2-ctl` can print a useful inventory and then fail because its default
+`/dev/video0` is absent. The CLI selects an existing numeric video node and retains
+partial output. With no video nodes it skips the probe and explains what to check.
+A loaded `uvcvideo` module alone does not establish that a camera is connected.
+
+See [Media device troubleshooting](docs/media-device-troubleshooting.md) for the
+full testbed investigation, manual recovery, permissions, supported package-manager
+hints, version/update commands, and the separate twin JSON directory failure.
+
+### Linux lifecycle commands
+
+`edge start`, `edge restart`, and the final service step of `edge install` submit
+systemd jobs without waiting for startup readiness. Their success means the request
+was accepted. Use `systemctl status cyberwave-edge-core.service --no-pager -l` and
+`cyberwave edge logs` to check actual progress. Stop and uninstall wait up to 120
+seconds for verified service shutdown; if confirmation fails, uninstall retains
+configuration and reports the error. The accompanying Edge Core update adds bounded
+startup extensions and shutdown timeouts. See the
+[lifecycle investigation](docs/media-device-troubleshooting.md#implemented-lifecycle-limits).

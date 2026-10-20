@@ -91,6 +91,89 @@ def test_edge_core_falls_back_to_cli_template(monkeypatch, tmp_path, binary):
     assert unit_path.exists()
 
 
+def _drop_in(tmp_path, name, body):
+    drop_in_dir = tmp_path / "cyberwave-edge-core.service.d"
+    drop_in_dir.mkdir(exist_ok=True)
+    (drop_in_dir / name).write_text(body)
+
+
+def _executable(tmp_path, name):
+    path = tmp_path / name
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_a_drop_in_build_renders_the_unit_for_the_packaged_exec_start(monkeypatch, tmp_path):
+    core, _unit_path = _setup(monkeypatch, tmp_path)
+    local_build = _executable(tmp_path, "cyberwave-edge-core-dev")
+    _drop_in(tmp_path, "zz-local-build.conf", f"[Service]\nExecStart=\nExecStart={local_build}\n")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="ensure-systemd-unit: wrote\n", stderr="")
+
+    monkeypatch.setattr(core.subprocess, "run", fake_run)
+
+    assert core.create_systemd_service(core.EDGE_CORE_SPEC) is True
+
+    assert calls == [
+        [
+            local_build,
+            "__ensure-systemd-unit",
+            "--install",
+            "--binary-path",
+            "/usr/bin/cyberwave-edge-core",
+            "--config-dir",
+            str(core.CONFIG_DIR),
+        ]
+    ]
+
+
+def test_a_drop_in_build_that_cannot_render_falls_back_to_the_packaged_binary(
+    monkeypatch, tmp_path
+):
+    core, _unit_path = _setup(monkeypatch, tmp_path)
+    local_build = _executable(tmp_path, "cyberwave-edge-core-dev")
+    _drop_in(tmp_path, "override.conf", f"[Service]\nExecStart=\nExecStart={local_build} --flag\n")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd[0])
+        code = 2 if cmd[0] == local_build else 0
+        return subprocess.CompletedProcess(cmd, code, stdout="", stderr="")
+
+    monkeypatch.setattr(core.subprocess, "run", fake_run)
+
+    assert core.create_systemd_service(core.EDGE_CORE_SPEC) is True
+    assert calls == [local_build, "/usr/bin/cyberwave-edge-core"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[Service]\nExecStart=\n",
+        "[Service]\nExecStart=relative/binary\n",
+        "[Service]\nEnvironment=CYBERWAVE_WEBRTC_ICE_MODE=lan\n",
+    ],
+    ids=["reset-only", "not-absolute", "no-exec-start"],
+)
+def test_a_drop_in_without_a_usable_exec_start_changes_nothing(monkeypatch, tmp_path, body):
+    core, _unit_path = _setup(monkeypatch, tmp_path)
+    _drop_in(tmp_path, "override.conf", body)
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd[0])
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(core.subprocess, "run", fake_run)
+
+    assert core.create_systemd_service(core.EDGE_CORE_SPEC) is True
+    assert calls == ["/usr/bin/cyberwave-edge-core"]
+
+
 def test_cloud_node_unit_is_not_delegated(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
     unit_path = tmp_path / "cyberwave-cloud-node.service"

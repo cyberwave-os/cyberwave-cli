@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from tests._core_module_loader import load_core_module
+from tests._core_module_loader import load_core_module, use_production_device_paths
 
 # Twin object files are UUID-named by contract, and `_is_twin_object_file`
 # enforces that shape, so these fixtures have to be real UUIDs.
@@ -168,6 +168,8 @@ def _patch_camera_helpers(
     monkeypatch.setattr(device_utils, "camera_likelihood_score", lambda _cam: 80)
 
     iterator = iter(prompt_inputs)
+    monkeypatch.setattr(core.Confirm, "ask", lambda *a, **k: True)
+    monkeypatch.setattr(core, "_persist_twin_pins", lambda _pins: set())
     monkeypatch.setattr(
         core.Prompt,
         "ask",
@@ -180,7 +182,7 @@ def _patch_camera_helpers(
     )
 
 
-def test_detect_and_select_cameras_single_physical_auto_assigns_all_twins(
+def test_single_physical_camera_serves_one_twin_and_the_other_is_left_without(
     monkeypatch, tmp_path
 ):
     core = load_core_module(monkeypatch)
@@ -189,13 +191,13 @@ def test_detect_and_select_cameras_single_physical_auto_assigns_all_twins(
     _write_twin_json(tmp_path, TWIN_B, "Cam B", camera=True)
 
     cameras = [_FakeCam(0, "USB Cam", "/dev/video0")]
-    _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=[])
+    _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=["0", "s"])
 
     core._detect_and_select_cameras()
 
     data = json.loads((tmp_path / "cameras.json").read_text())
     assert data["selected_device"] == 0
-    assert data["twin_to_device"] == {TWIN_A: 0, TWIN_B: 0}
+    assert data["twin_to_device"] == {TWIN_A: 0}
 
 
 def test_detect_and_select_cameras_single_twin_keeps_legacy_prompt(
@@ -260,7 +262,6 @@ def test_detect_and_select_cameras_invalid_selection_aborts_without_file(
     assert not (tmp_path / "cameras.json").exists()
 
 
-# ---- serial-driven binding ---------------------------------------------------
 #
 # A twin carrying ``metadata.serial_number`` already names its physical camera,
 # and discovery reports the same serial per device, so the installer must
@@ -354,7 +355,7 @@ def test_pinned_serial_absent_from_host_falls_back_to_prompt(monkeypatch, tmp_pa
     ]
     # Only the unmatched twin is asked; the pinned one resolves on its own.
     _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=["0"])
-    monkeypatch.setattr(core, "_persist_twin_serial_numbers", lambda _m: 0)
+    monkeypatch.setattr(core, "_persist_twin_pins", lambda _m: set())
 
     core._detect_and_select_cameras()
 
@@ -378,13 +379,16 @@ def test_manual_mapping_pins_serial_back_onto_twin(monkeypatch, tmp_path):
     recorded: dict[str, str] = {}
     monkeypatch.setattr(
         core,
-        "_persist_twin_serial_numbers",
-        lambda mapping: recorded.update(mapping) or len(mapping),
+        "_persist_twin_pins",
+        lambda mapping: recorded.update(mapping) or set(),
     )
 
     core._detect_and_select_cameras()
 
-    assert recorded == {TWIN_A: SERIAL_B, TWIN_B: SERIAL_A}
+    assert recorded == {
+        TWIN_A: core._camera_pin_metadata(SERIAL_B),
+        TWIN_B: core._camera_pin_metadata(SERIAL_A),
+    }
 
 
 def test_manual_mapping_without_discoverable_serial_pins_nothing(monkeypatch, tmp_path):
@@ -403,8 +407,8 @@ def test_manual_mapping_without_discoverable_serial_pins_nothing(monkeypatch, tm
     recorded: dict[str, str] = {}
     monkeypatch.setattr(
         core,
-        "_persist_twin_serial_numbers",
-        lambda mapping: recorded.update(mapping) or len(mapping),
+        "_persist_twin_pins",
+        lambda mapping: recorded.update(mapping) or set(),
     )
 
     core._detect_and_select_cameras()
@@ -414,7 +418,6 @@ def test_manual_mapping_without_discoverable_serial_pins_nothing(monkeypatch, tm
     assert data["twin_to_device"] == {TWIN_A: 0, TWIN_B: 1}
 
 
-# ---- device-path binding -----------------------------------------------------
 #
 # Cameras whose USB descriptor carries no serial (the Logitech C920 reports
 # ``iSerial 0``) can never be pinned by ``metadata.serial_number``. udev still
@@ -444,6 +447,7 @@ def _by_id(monkeypatch, core, tmp_path, name: str, target: str | None) -> str:
 
 def test_is_stable_camera_device_rejects_positional_values(monkeypatch):
     core = load_core_module(monkeypatch)
+    use_production_device_paths(monkeypatch, core)
     assert core._is_stable_camera_device(BY_ID_C920) is True
     assert core._is_stable_camera_device(BY_PATH_C920) is True
     assert core._is_stable_camera_device("rtsp://10.0.0.2/avc") is True
@@ -455,6 +459,7 @@ def test_is_stable_camera_device_rejects_positional_values(monkeypatch):
 
 def test_load_twin_camera_devices_reads_only_stable_pins(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
+    use_production_device_paths(monkeypatch, core)
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
 
     _write_twin_json(
@@ -567,7 +572,7 @@ def test_pinned_device_absent_from_host_falls_back_to_prompt(monkeypatch, tmp_pa
     ]
     # Only the unresolvable twin is asked.
     _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=["0"])
-    monkeypatch.setattr(core, "_persist_twin_serial_numbers", lambda _m: 0)
+    monkeypatch.setattr(core, "_persist_twin_pins", lambda _m: set())
 
     core._detect_and_select_cameras()
 
@@ -593,14 +598,14 @@ def test_device_pinned_twin_never_learns_a_serial(monkeypatch, tmp_path):
     recorded: dict[str, str] = {}
     monkeypatch.setattr(
         core,
-        "_persist_twin_serial_numbers",
-        lambda mapping: recorded.update(mapping) or len(mapping),
+        "_persist_twin_pins",
+        lambda mapping: recorded.update(mapping) or set(),
     )
 
     core._detect_and_select_cameras()
 
     # Only the twin that was actually asked learns a serial.
-    assert recorded == {TWIN_B: SERIAL_A}
+    assert recorded == {TWIN_B: core._camera_pin_metadata(SERIAL_A)}
 
 
 def test_stream_pinned_twin_is_not_given_a_local_camera(monkeypatch, tmp_path):
@@ -716,16 +721,9 @@ def test_stream_pin_is_recorded_so_it_cannot_inherit_the_global_device(
     assert mapping[TWIN_A] == "rtsp://10.0.0.2/avc"
 
 
-def test_single_twin_device_pin_is_never_overwritten_by_a_learned_serial(
+def test_single_twin_stale_device_pin_is_replaced_by_the_operators_choice(
     monkeypatch, tmp_path
 ):
-    """The single-twin branch must honour ``video_device`` like the multi one.
-
-    With the pinned camera unplugged, the operator picks a different one. If
-    that camera's serial is written back, the twin is re-pinned to the wrong
-    unit permanently -- the driver prefers ``serial_number`` over
-    ``video_device``, so the original pin can never win again.
-    """
     core = load_core_module(monkeypatch)
     monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
 
@@ -734,17 +732,17 @@ def test_single_twin_device_pin_is_never_overwritten_by_a_learned_serial(
     _write_twin_json(tmp_path, TWIN_A, "C920", camera=True, video_device=link)
 
     recorded: dict[str, str] = {}
-    monkeypatch.setattr(core, "_persist_twin_serial_numbers", recorded.update)
 
     cameras = [
         _FakeCam(0, "Some Other Cam", "/dev/video0", serial=SERIAL_A),
         _FakeCam(1, "Spare", "/dev/video1"),
     ]
     _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=["0"])
+    monkeypatch.setattr(core, "_persist_twin_pins", lambda p: recorded.update(p) or set())
 
     core._detect_and_select_cameras()
 
-    assert recorded == {}
+    assert recorded == {TWIN_A: core._camera_pin_metadata(SERIAL_A)}
 
 
 def test_stable_camera_device_mirrors_the_driver_classification(monkeypatch):
@@ -756,6 +754,7 @@ def test_stable_camera_device_mirrors_the_driver_classification(monkeypatch):
     driver would have honoured.
     """
     core = load_core_module(monkeypatch)
+    use_production_device_paths(monkeypatch, core)
 
     # Non-RTSP transports are just as much a pinned source.
     assert core._is_stable_camera_device("udp://239.0.0.1:5000") is True
@@ -876,13 +875,13 @@ def test_depth_twin_never_learns_a_serial_over_its_pin(monkeypatch, tmp_path):
     )
 
     recorded: dict[str, str] = {}
-    monkeypatch.setattr(core, "_persist_twin_serial_numbers", recorded.update)
 
     cameras = [
         _FakeCam(0, "Intel RealSense", "/dev/video0", serial="214523026669"),
         _FakeCam(6, "Spare", "/dev/video6", serial=SERIAL_B),
     ]
     _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=[])
+    monkeypatch.setattr(core, "_persist_twin_pins", lambda p: recorded.update(p) or set())
     _forbid_prompt(monkeypatch, core)
 
     core._detect_and_select_cameras()
@@ -928,3 +927,128 @@ def test_depth_detection_reads_both_sensor_vocabularies(monkeypatch, tmp_path):
     assert core._twin_has_depth_sensor(TWIN_B) is True
     assert core._twin_has_depth_sensor(TWIN_C) is False
     assert core._twin_has_depth_sensor("no-such-twin") is False
+
+
+def test_declining_existing_pins_reprompts_and_repins(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True, serial=SERIAL_B)
+    _write_twin_json(tmp_path, TWIN_B, "Cam B", camera=True, serial=SERIAL_A)
+    cameras = [
+        _FakeCam(0, "RealSense", "/dev/video0", serial=SERIAL_A),
+        _FakeCam(6, "RealSense", "/dev/video6", serial=SERIAL_B),
+    ]
+    _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=["0", "6"])
+    monkeypatch.setattr(core.Confirm, "ask", lambda *a, **k: False)
+    persisted: dict = {}
+    monkeypatch.setattr(
+        core, "_persist_twin_pins", lambda m: persisted.update(m) or set()
+    )
+
+    core._detect_and_select_cameras()
+
+    data = json.loads((tmp_path / "cameras.json").read_text())
+    assert data["twin_to_device"] == {TWIN_A: 0, TWIN_B: 6}
+    assert persisted == {
+        TWIN_A: core._camera_pin_metadata(SERIAL_A),
+        TWIN_B: core._camera_pin_metadata(SERIAL_B),
+    }
+
+
+def test_declining_existing_pin_single_twin_reprompts(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True, serial=SERIAL_B)
+    cameras = [
+        _FakeCam(0, "RealSense", "/dev/video0", serial=SERIAL_A),
+        _FakeCam(6, "RealSense", "/dev/video6", serial=SERIAL_B),
+    ]
+    _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=["0"])
+    monkeypatch.setattr(core.Confirm, "ask", lambda *a, **k: False)
+    persisted: dict = {}
+    monkeypatch.setattr(
+        core, "_persist_twin_pins", lambda m: persisted.update(m) or set()
+    )
+
+    core._detect_and_select_cameras()
+
+    data = json.loads((tmp_path / "cameras.json").read_text())
+    assert data["twin_to_device"] == {TWIN_A: 0}
+    assert persisted == {TWIN_A: core._camera_pin_metadata(SERIAL_A)}
+
+
+def test_no_confirmation_asked_without_existing_pins(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True)
+    _write_twin_json(tmp_path, TWIN_B, "Cam B", camera=True)
+    cameras = [_FakeCam(0, "A", "/dev/video0"), _FakeCam(1, "B", "/dev/video1")]
+    _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=["0", "1"])
+
+    def _boom(*a, **k):
+        raise AssertionError("Confirm must not be asked without pins")
+
+    monkeypatch.setattr(core.Confirm, "ask", _boom)
+    core._detect_and_select_cameras()
+
+
+def test_keeping_existing_pins_uses_them_without_a_menu(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True, serial=SERIAL_B)
+    _write_twin_json(tmp_path, TWIN_B, "Cam B", camera=True, serial=SERIAL_A)
+    cameras = [
+        _FakeCam(0, "RealSense", "/dev/video0", serial=SERIAL_A),
+        _FakeCam(6, "RealSense", "/dev/video6", serial=SERIAL_B),
+    ]
+    _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=[])
+    _forbid_prompt(monkeypatch, core)
+    asked: list[str] = []
+    monkeypatch.setattr(core.Confirm, "ask", lambda p, **k: asked.append(p) or True)
+
+    core._detect_and_select_cameras()
+
+    assert asked == ["Keep these existing camera bindings?"]
+    data = json.loads((tmp_path / "cameras.json").read_text())
+    assert data["twin_to_device"] == {TWIN_A: 6, TWIN_B: 0}
+
+
+def test_single_physical_camera_never_asks_to_keep(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True, serial=SERIAL_A)
+    cameras = [_FakeCam(0, "RealSense", "/dev/video0", serial=SERIAL_A)]
+    _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=[])
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("a single camera has nothing to keep or redo")
+
+    monkeypatch.setattr(core.Confirm, "ask", _boom)
+
+    core._detect_and_select_cameras()
+
+    data = json.loads((tmp_path / "cameras.json").read_text())
+    assert data["twin_to_device"] == {TWIN_A: 0}
+
+
+def test_closed_stdin_keeps_existing_pins(monkeypatch, tmp_path):
+    core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "CONFIG_DIR", tmp_path)
+    _write_twin_json(tmp_path, TWIN_A, "Cam A", camera=True, serial=SERIAL_B)
+    _write_twin_json(tmp_path, TWIN_B, "Cam B", camera=True, serial=SERIAL_A)
+    cameras = [
+        _FakeCam(0, "RealSense", "/dev/video0", serial=SERIAL_A),
+        _FakeCam(6, "RealSense", "/dev/video6", serial=SERIAL_B),
+    ]
+    _patch_camera_helpers(monkeypatch, core, cameras, prompt_inputs=[])
+    _forbid_prompt(monkeypatch, core)
+
+    def _eof(*_args, **_kwargs):
+        raise EOFError
+
+    monkeypatch.setattr(core.Confirm, "ask", _eof)
+
+    core._detect_and_select_cameras()
+
+    data = json.loads((tmp_path / "cameras.json").read_text())
+    assert data["twin_to_device"] == {TWIN_A: 6, TWIN_B: 0}

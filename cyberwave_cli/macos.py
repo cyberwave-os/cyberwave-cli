@@ -492,18 +492,22 @@ def _chown_to_real_user(path: Path, *, recursive: bool = False) -> None:
 
 def _fix_user_dir_ownership(dir_path: Path) -> None:
     """Reclaim ownership of *dir_path* if it was left root-owned by a prior sudo run."""
-    username, real_uid, _ = _resolve_real_user()
+    username, real_uid, real_gid = _resolve_real_user()
     if real_uid is None:
         return
     try:
         stat = dir_path.stat()
-        if stat.st_uid != real_uid:
-            logger.debug("Reclaiming ownership of %s (uid %d -> %d)", dir_path, stat.st_uid, real_uid)
-            subprocess.run(
-                ["sudo", "chown", username or str(real_uid), str(dir_path)],
-                check=True,
-                capture_output=True,
-            )
+        if stat.st_uid == real_uid:
+            return
+        logger.debug("Reclaiming ownership of %s (uid %d -> %d)", dir_path, stat.st_uid, real_uid)
+        if os.geteuid() == 0:
+            os.chown(dir_path, real_uid, real_gid if real_gid is not None else -1)
+            return
+        subprocess.run(
+            ["sudo", "chown", username or str(real_uid), str(dir_path)],
+            check=True,
+            capture_output=True,
+        )
     except (OSError, subprocess.CalledProcessError):
         pass
 
@@ -3177,10 +3181,10 @@ def setup_audio_stream_server(
     capture_sample_rate, capture_channels = _resolve_microphone_capture_settings(
         microphone_twins
     )
-    from .device_utils import discover_microphones
+    from .device_utils import _discover_microphones_avfoundation
 
     microphones = [
-        (int(mic.paths[0]), mic.card) for mic in discover_microphones()
+        (int(mic.paths[0]), mic.card) for mic in _discover_microphones_avfoundation()
     ]
     multi_mapping = (
         device_index is None

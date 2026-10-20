@@ -92,7 +92,18 @@ Assets define what edge runtimes are supported and the configuration schema for 
                 }
             }
         }
-    ]
+    ],
+
+    # Hardware found on the Ethernet port (see docs/wired-network-devices.md).
+    # The asset describes the model; a twin's own block is merged over it.
+    "network_discovery": {
+        "methods": ["mdns"],                        # also "arp", "ports"
+        "mdns_services": ["_flir-ircam._tcp"],
+        "mac_prefixes": ["00:40:7F"],
+        "link_local": True,                         # falls back to 169.254/16 without DHCP
+        "tcp_ports": [554],
+        "bind": {"video_device": "rtsp://{ip}/avc"} # written onto the twin once found
+    }
 }
 ```
 
@@ -125,9 +136,28 @@ Twins store per-edge configurations:
     "default_edge_config": {
         "cameras": [],
         "models": []
-    }
+    },
+
+    # Device identity, written by `cyberwave edge install` on Linux (top level, not per edge)
+    "video_device": "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920-video-index0",  # camera twins
+    "audio_device": "/dev/snd/by-path/platform-xhci-hcd.1-usb-0:2:1.0",         # microphone and speaker twins
+    "serial_number": "",                                                        # a hardware serial, or blank
+    # A network camera instead: its stream URL, and the MAC that identifies the unit
+    # "video_device": "rtsp://169.254.150.216/avc",
+    "mac_address": "00:40:7f:14:8b:73"
 }
 ```
+
+The three identity keys pin a twin to one physical unit. The installer writes a stable udev
+link into `video_device` or `audio_device` (`by-id` for a unique device, `by-path` for one of
+several identical units) and leaves `serial_number` blank, because both the camera and the
+microphone driver let a serial outrank the device field. `audio_device` is written only for
+microphone and speaker twins: a twin that also has a camera (a webcam, a go2) gets its
+`video_device` pinned and its microphone is left to its driver, which selects audio by name. A serial an operator types into the twin
+is honoured as identity, and a stream URL in `video_device` marks a network camera. The rules are
+described in the CLI README under `cyberwave edge install`. For a network device the identity is
+`mac_address`, written next to whatever the asset's `network_discovery.bind` produces, so the same
+unit is found again after its address changes.
 
 ## CLI Commands
 
@@ -217,3 +247,28 @@ cyberwave twin create https://example.com/asset.json
 - **Secrets** (passwords, tokens) are stored in local `.env` only, never synced to cloud
 - **Configuration** (camera URLs, FPS, etc.) is synced to cloud for portability
 - Device fingerprints are derived from hardware characteristics for stability
+
+## Device discovery and saved camera sources
+
+`cameras.json` describes discovered devices and can contain `selected_device` and
+`twin_to_device` assignments. Numeric strings supplied to the writer are normalized
+to integer indices for compatibility with older consumers. Stable device paths and
+stream URLs remain strings; converting those into numeric indices would lose the
+identity or source that the assignment is intended to preserve.
+
+`cyberwave edge cameras --save` writes the detected inventory. Use installation-time
+selection to configure twin mappings. `cyberwave edge microphones --json` exposes
+current audio capture devices without writing configuration or changing audio pins.
+Linux ALSA indices can change across boots, so they should not replace the existing
+stable USB audio pinning workflow.
+
+A network camera, such as a FLIR AX8 on the Ethernet port, appears in `twin_to_device`
+as its stream URL. The installer finds it on the wire from the asset's
+`network_discovery` metadata, writes the URL and the device's `mac_address` onto the
+twin, and records the URL here so that Edge Core never hands that twin a USB camera.
+[Wired network devices](wired-network-devices.md) describes that metadata, the
+discovery, and the rules for several twins and several sources.
+
+The [media troubleshooting guide](media-device-troubleshooting.md) explains discovery
+failures and how to repair paths ending in `.json` that have become directories.
+That filesystem error is distinct from camera mapping serialization.

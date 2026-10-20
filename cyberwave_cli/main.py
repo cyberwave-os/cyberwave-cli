@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import sys
 from typing import Any
 
 import click
@@ -114,6 +115,22 @@ def run_sdk_selfcheck() -> int:
     return 0
 
 
+def _use_utf8_streams() -> None:
+    """Switch non-UTF-8 stdout/stderr to UTF-8 with ``errors="replace"``.
+
+    A redirected stream on Windows uses cp1252, which cannot encode the CLI's glyphs.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        encoding = getattr(stream, "encoding", None) or ""
+        if reconfigure is None or encoding.lower().replace("-", "") == "utf8":
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> None:
     """``--version``: the CLI version, plus the SDK it runs against."""
     if not value or ctx.resilient_parsing:
@@ -175,6 +192,7 @@ def cli(ctx: click.Context) -> None:
     \b
     Documentation: https://docs.cyberwave.com
     """
+    _use_utf8_streams()
     if ctx.invoked_subcommand is None:
         console.print(BANNER)
         console.print("[dim]Type [bold]cyberwave --help[/bold] for available commands.[/dim]\n")

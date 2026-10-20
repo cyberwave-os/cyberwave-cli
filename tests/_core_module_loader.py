@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+from rich.markup import escape as _rich_escape
+
 
 def load_core_module(monkeypatch):
     """Import `cyberwave_cli.core` with lightweight dependency stubs."""
@@ -31,6 +33,8 @@ def load_core_module(monkeypatch):
     rich_module = ModuleType("rich")
     rich_console_module = ModuleType("rich.console")
     rich_prompt_module = ModuleType("rich.prompt")
+    rich_markup_module = ModuleType("rich.markup")
+    rich_markup_module.escape = _rich_escape
 
     class _Console:
         def print(self, *_args, **_kwargs):
@@ -77,6 +81,7 @@ def load_core_module(monkeypatch):
     rich_prompt_module.Confirm = _Confirm
     rich_prompt_module.Prompt = _Prompt
     rich_module.console = rich_console_module
+    rich_module.markup = rich_markup_module
     rich_module.prompt = rich_prompt_module
     rich_module.table = rich_table_module
 
@@ -108,6 +113,7 @@ def load_core_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "cyberwave.fingerprint", fingerprint_module)
     monkeypatch.setitem(sys.modules, "rich", rich_module)
     monkeypatch.setitem(sys.modules, "rich.console", rich_console_module)
+    monkeypatch.setitem(sys.modules, "rich.markup", rich_markup_module)
     monkeypatch.setitem(sys.modules, "rich.prompt", rich_prompt_module)
     monkeypatch.setitem(sys.modules, "rich.table", rich_table_module)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.auth", auth_module)
@@ -117,7 +123,7 @@ def load_core_module(monkeypatch):
     package_root = Path(__file__).resolve().parents[1] / "cyberwave_cli"
     cyberwave_cli_package = ModuleType("cyberwave_cli")
     cyberwave_cli_package.__path__ = [str(package_root)]  # type: ignore[attr-defined]
-    sys.modules["cyberwave_cli"] = cyberwave_cli_package
+    monkeypatch.setitem(sys.modules, "cyberwave_cli", cyberwave_cli_package)
 
     sys.modules.pop("cyberwave_cli.macos", None)
     sys.modules.pop("cyberwave_cli.pip_registry", None)
@@ -140,4 +146,29 @@ def load_core_module(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     sys.modules["cyberwave_cli.core"] = module
     spec.loader.exec_module(module)
+    _seal_host_hardware(monkeypatch, module)
     return module
+
+
+def _seal_host_hardware(monkeypatch, module: ModuleType) -> None:
+    for name in (
+        "_V4L_BY_ID_DIR",
+        "_V4L_BY_PATH_DIR",
+        "_ALSA_BY_ID_DIR",
+        "_ALSA_BY_PATH_DIR",
+        "_PROC_ASOUND_DIR",
+    ):
+        monkeypatch.setattr(module, name, "/nonexistent/cw-test", raising=False)
+    module._real_udev_properties = getattr(module, "_udev_properties", None)
+    monkeypatch.setattr(module, "_udev_properties", lambda node: {}, raising=False)
+
+
+def use_production_device_paths(monkeypatch, module: ModuleType) -> None:
+    """Restore the /dev udev trees for tests that only compare path strings, never resolve links."""
+    for name, value in (
+        ("_V4L_BY_ID_DIR", "/dev/v4l/by-id"),
+        ("_V4L_BY_PATH_DIR", "/dev/v4l/by-path"),
+        ("_ALSA_BY_ID_DIR", "/dev/snd/by-id"),
+        ("_ALSA_BY_PATH_DIR", "/dev/snd/by-path"),
+    ):
+        monkeypatch.setattr(module, name, value)

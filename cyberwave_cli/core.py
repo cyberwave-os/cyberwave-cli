@@ -8,10 +8,12 @@ This module provides the logic for:
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import platform
 import plistlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -20,12 +22,14 @@ import tempfile
 import textwrap
 import time
 import uuid
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from rich.console import Console
+from rich.markup import escape
 from rich.prompt import Confirm, Prompt
 
 from .config import (
@@ -42,7 +46,7 @@ from .credentials import (
     load_credentials,
     save_credentials,
 )
-
+from .io_utils import atomic_write_json
 from .macos import (
     AUDIO_STREAMS_FILENAME,
     CAMERA_STREAMS_FILENAME,
@@ -58,6 +62,7 @@ from .macos import (
     wait_for_launchd_unload,
 )
 from .macos import init_console as _init_macos_console
+from .url_utils import backend_unreachable_message, redact_userinfo, unreachable_reason
 
 console = Console()
 _init_macos_console(console)
@@ -302,15 +307,17 @@ def is_service_active(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
             ["systemctl", "is-active", spec.unit_name],
             capture_output=True,
             text=True,
+            timeout=5,
         )
         return result.stdout.strip() == "active"
-    except (FileNotFoundError, OSError):
+    except (OSError, subprocess.TimeoutExpired):
         return False
 
 
-def _run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], *, check: bool = True, quiet: bool = False, **kwargs) -> subprocess.CompletedProcess:
     """Run a subprocess and stream output to the console."""
-    console.print(f"[dim]$ {_redact_buildkite_credentials(' '.join(cmd))}[/dim]")
+    if not quiet:
+        console.print(f"[dim]$ {_redact_buildkite_credentials(' '.join(cmd))}[/dim]")
     kwargs.setdefault("env", clean_subprocess_env())
     return subprocess.run(cmd, check=check, **kwargs)
 
@@ -504,6 +511,14 @@ def _ensure_credentials(*, skip_confirm: bool, token: str | None = None) -> bool
     """
     from .auth import APIToken, AuthClient, AuthenticationError
 
+    unreachable: dict[str, str] = {}
+
+    def _note_unreachable(url: str | None, exc: BaseException) -> bool:
+        reason = unreachable_reason(exc)
+        if reason is not None:
+            unreachable[url or get_api_url()] = reason
+        return reason is not None
+
     # `--token` is an instruction, not a fallback. Checking stored credentials
     # first would keep a device on its previous workspace whenever the old
     # token still validates — silently ignoring the flag, which is the failure
@@ -513,12 +528,13 @@ def _ensure_credentials(*, skip_confirm: bool, token: str | None = None) -> bool
         # the token: --token swaps the credential, it does not move the device
         # to a different backend.
         stored = load_credentials()
+        stored_url = getattr(stored, "cyberwave_base_url", None)
         try:
             _authenticate_with_api_token(
                 token,
                 skip_confirm=skip_confirm,
                 source="--token",
-                base_url=getattr(stored, "cyberwave_base_url", None),
+                base_url=stored_url,
             )
             return True
         except WorkspaceConflictError as exc:
@@ -528,17 +544,25 @@ def _ensure_credentials(*, skip_confirm: bool, token: str | None = None) -> bool
             # Deliberately no fallback: prompting here would pair the device
             # against whatever account is typed, which is not what --token asked
             # for, and on an unattended install there is nobody to type it.
-            console.print(f"[red]The API token passed with --token was rejected:[/red] {exc}")
-            console.print(
-                "[dim]Nothing was installed. Check the token, or drop --token to log in "
-                "interactively.[/dim]"
-            )
+            url = _resolve_base_url(collect_runtime_env_overrides(), stored_url) or get_api_url()
+            if _note_unreachable(url, exc):
+                console.print(backend_unreachable_message(url, unreachable[url]))
+                console.print("  [dim]Nothing was installed.[/dim]")
+            else:
+                console.print(
+                    f"[red]✗[/red] The API token passed with --token was rejected "
+                    f"[dim]({escape(_brief_error(exc))})[/dim]"
+                )
+                console.print(
+                    "  [dim]Nothing was installed. Check the token, or drop --token to log in "
+                    "interactively.[/dim]"
+                )
             return False
 
     creds = load_credentials()
     if creds and creds.token:
+        creds_base_url = creds.cyberwave_base_url
         try:
-            creds_base_url = creds.cyberwave_base_url
             sdk_client = _get_sdk_client(creds.token, base_url=creds_base_url)
             with console.status("[dim]Checking existing credentials...[/dim]"):
                 sdk_client.workspaces.list()
@@ -569,12 +593,15 @@ def _ensure_credentials(*, skip_confirm: bool, token: str | None = None) -> bool
                 )
             return True
         except Exception as e:
-            console.print("[yellow]Stored credentials are invalid or expired.[/yellow]")
-            console.print(e)  # print the error for debugging purposes
+            if not _note_unreachable(creds_base_url, e):
+                console.print(
+                    f"[yellow]⚠[/yellow] The saved login no longer works "
+                    f"[dim]({escape(_brief_error(e))})[/dim]"
+                )
 
-    console.print("[yellow]No valid credentials found.[/yellow]")
     env_token = os.getenv("CYBERWAVE_API_KEY", "").strip()
-    if env_token:
+    env_url = _resolve_base_url(collect_runtime_env_overrides(), None) or get_api_url()
+    if env_token and env_url not in unreachable:
         try:
             _authenticate_with_api_token(
                 env_token, skip_confirm=skip_confirm, source="CYBERWAVE_API_KEY"
@@ -586,10 +613,24 @@ def _ensure_credentials(*, skip_confirm: bool, token: str | None = None) -> bool
             console.print(f"[red]{e}[/red]")
             return False
         except Exception as e:
-            console.print("[yellow]CYBERWAVE_API_KEY is invalid or incomplete.[/yellow]")
-            console.print(e)
+            if not _note_unreachable(env_url, e):
+                console.print(
+                    f"[yellow]⚠[/yellow] CYBERWAVE_API_KEY was rejected "
+                    f"[dim]({escape(_brief_error(e))})[/dim]"
+                )
 
-    console.print("[cyan]Please log in to continue.[/cyan]\n")
+    login_url = get_api_url()
+    if login_url in unreachable:
+        console.print(backend_unreachable_message(login_url, unreachable[login_url]))
+        return False
+    for url, reason in unreachable.items():
+        console.print(
+            f"[yellow]⚠[/yellow] {escape(redact_userinfo(url))} did not answer "
+            f"[dim]({reason})[/dim]; logging in to [bold]{escape(redact_userinfo(login_url))}"
+            f"[/bold] instead"
+        )
+
+    console.print("[cyan]Log in to continue.[/cyan]\n")
 
     email = Prompt.ask("[bold]Email[/bold]")
     password = Prompt.ask("[bold]Password[/bold]", password=True)
@@ -645,8 +686,19 @@ def _ensure_credentials(*, skip_confirm: bool, token: str | None = None) -> bool
             return True
 
     except AuthenticationError as exc:
-        console.print(f"[red]Login failed:[/red] {exc}")
+        reason = unreachable_reason(exc)
+        if reason is not None:
+            console.print(backend_unreachable_message(login_url, reason))
+        else:
+            console.print(f"[red]✗[/red] Login failed: {escape(str(exc))}")
         return False
+
+
+def _brief_error(exc: BaseException, limit: int = 120) -> str:
+    """First line of *exc*, shortened: the SDK packs whole request dumps into it."""
+    text = next((line.strip() for line in str(exc).splitlines() if line.strip()), "")
+    text = text or type(exc).__name__
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 class WorkspaceConflictError(RuntimeError):
@@ -1398,8 +1450,9 @@ def _download_twin_json_files(client: Any, twin_uuids: list[str]) -> int:
             twin_data["asset"] = asset_data
             twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            with open(twin_json_file, "w") as f:
-                json.dump(twin_data, f, indent=2, default=_json_default)
+            atomic_write_json(
+                twin_json_file, json.loads(json.dumps(twin_data, default=_json_default)), mode=0o644
+            )
             chown_to_sudo_user(CONFIG_DIR, twin_json_file)
             written += 1
         except Exception as exc:
@@ -2703,19 +2756,26 @@ def _run_ensure_unit(binary: str, *args: str) -> subprocess.CompletedProcess[str
         return None
 
 
-def _ensure_unit_via_binary(spec: ServiceSpec, binary: str) -> bool:
+def _ensure_unit_via_binary(
+    spec: ServiceSpec, binary: str, *, exec_start: str | None = None
+) -> bool:
     """Ask the edge-core binary to write its own systemd unit.
 
     Edge-core owns the unit template since the auto-update work (plan B1):
     ``cyberwave-edge-core __ensure-systemd-unit --install`` renders it, writes
     it only if it changed and runs ``daemon-reload``. It never restarts.
+    ``exec_start`` is the unit's ``ExecStart`` (default: ``binary`` itself).
 
     Returns False when the binary cannot do it (missing, too old to know the
-    subcommand, or any failure), so the caller falls back to the in-CLI
-    template.
+    subcommand, or any failure), so the caller tries the next way.
     """
     result = _run_ensure_unit(
-        binary, "--install", "--binary-path", binary, "--config-dir", str(CONFIG_DIR)
+        binary,
+        "--install",
+        "--binary-path",
+        exec_start or binary,
+        "--config-dir",
+        str(CONFIG_DIR),
     )
     if result is None:
         return False
@@ -2726,13 +2786,42 @@ def _ensure_unit_via_binary(spec: ServiceSpec, binary: str) -> bool:
             output = f"{result.stdout or ''}{result.stderr or ''}".strip()
             detail = output.splitlines()[-1] if output else ""
             console.print(
-                f"[yellow]{spec.package_name} could not write its systemd unit "
-                f"(exit {result.returncode}); using the CLI template.[/yellow]"
+                f"[yellow]{binary} could not write the systemd unit "
+                f"(exit {result.returncode}).[/yellow]"
                 + (f"\n[dim]{detail}[/dim]" if detail else "")
             )
         return False
     console.print(f"[green]Created:[/green] {spec.unit_path}")
     return True
+
+
+_EXEC_START_LINE = re.compile(r"^\s*ExecStart\s*=(.*)$", re.MULTILINE)
+
+
+def _drop_in_exec_start(spec: ServiceSpec) -> str | None:
+    """The executable a drop-in runs in place of the unit's own ``ExecStart``.
+
+    Drop-ins in ``<unit>.d/*.conf`` next to the unit apply in name order, and an
+    empty ``ExecStart=`` resets the command, as systemd does. Returns None
+    without an override, or when it names no absolute executable.
+    """
+    command: str | None = None
+    drop_in_dir = spec.unit_path.parent / f"{spec.unit_path.name}.d"
+    for conf in sorted(drop_in_dir.glob("*.conf")):
+        try:
+            text = conf.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for match in _EXEC_START_LINE.finditer(text):
+            command = match.group(1).strip() or None
+    if not command:
+        return None
+    try:
+        executable = shlex.split(command)[0].lstrip("-@:+!")
+    except (ValueError, IndexError):
+        return None
+    path = Path(executable)
+    return str(path) if path.is_absolute() and os.access(path, os.X_OK) else None
 
 
 def create_systemd_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
@@ -2748,8 +2837,12 @@ def create_systemd_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
         return False
 
     binary = _resolve_service_binary(spec)
-    if spec.binary_owns_unit and _ensure_unit_via_binary(spec, binary):
-        return True
+    if spec.binary_owns_unit:
+        override = _drop_in_exec_start(spec)
+        owners = [override] if override and override != binary else []
+        for owner in [*owners, binary]:
+            if _ensure_unit_via_binary(spec, owner, exec_start=binary):
+                return True
 
     unit_contents = spec.unit_template.format(binary_path=binary, config_dir=CONFIG_DIR)
 
@@ -2786,11 +2879,11 @@ def enable_and_start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
         return False
 
     try:
-        _run(["systemctl", "daemon-reload"])
-        _run(["systemctl", "enable", spec.unit_name])
-        _run(["systemctl", "restart", "--no-block", spec.unit_name])
-    except subprocess.CalledProcessError as exc:
-        console.print(f"[red]systemctl command failed (exit {exc.returncode}).[/red]")
+        _run(["systemctl", "daemon-reload"], timeout=15)
+        _run(["systemctl", "enable", spec.unit_name], timeout=15)
+        _run(["systemctl", "restart", "--no-block", spec.unit_name], timeout=15)
+    except (subprocess.SubprocessError, OSError) as exc:
+        _service_operation_failed(spec.unit_name, exc)
         return False
 
     console.print(f"[green]Service enabled and (re)starting:[/green] {spec.unit_name}")
@@ -2805,7 +2898,7 @@ def enable_and_start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
 def restart_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
     """Restart the systemd service described by ``spec``.
 
-    Requires root privileges.  Returns True on success.
+    Requires root. True means the job was accepted, not that startup completed.
     """
     if not _has_systemd():
         console.print("[yellow]systemd not detected — cannot restart via systemd.[/yellow]")
@@ -2818,13 +2911,57 @@ def restart_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
     require_root(f"sudo {spec.install_command_hint.rsplit(' ', 1)[0]} restart")
 
     try:
-        _run(["systemctl", "restart", spec.unit_name])
-    except subprocess.CalledProcessError as exc:
-        console.print(f"[red]systemctl restart failed (exit {exc.returncode}).[/red]")
+        _run(["systemctl", "restart", "--no-block", spec.unit_name], timeout=15)
+    except (subprocess.SubprocessError, OSError) as exc:
+        _service_operation_failed(spec.unit_name, exc)
         return False
 
-    console.print(f"[green]Service restarted:[/green] {spec.unit_name}")
+    console.print(f"[green]Restart requested:[/green] {spec.unit_name}")
+    _service_progress_hint(spec.unit_name)
     return True
+
+
+def _service_progress_hint(unit: str) -> None:
+    console.print(
+        f"[dim]Check progress: systemctl status {unit} --no-pager -l\n"
+        f"Follow logs: sudo journalctl -u {unit} -n 80 -f[/dim]"
+    )
+
+
+def _service_operation_failed(unit: str, exc: BaseException) -> None:
+    console.print(f"[red]Service operation did not complete: {escape(str(exc))}[/red]")
+    console.print("[yellow]A queued systemd job may still be running. Inspect its state before retrying.[/yellow]")
+    _service_progress_hint(unit)
+
+
+def _stop_systemd_unit(unit: str, *, wait_seconds: float = 120) -> bool:
+    """Confirm shutdown within a fixed budget before allowing destructive cleanup."""
+    deadline = time.monotonic() + wait_seconds
+    console.print(f"[cyan]Stopping {unit} (waiting up to {wait_seconds:g}s)...[/cyan]")
+    try:
+        # A missing unit also needs a state check; do not depend on localized stderr.
+        result = _run(["systemctl", "stop", "--no-block", unit], check=False,
+                      timeout=min(15, wait_seconds))
+        while time.monotonic() < deadline:
+            state = _run(
+                ["systemctl", "show", unit, "--no-pager", "--all",
+                 "--property=LoadState,ActiveState,SubState,MainPID,ControlPID,Job"],
+                capture_output=True, text=True, check=False, quiet=True,
+                timeout=min(5, max(0.1, deadline - time.monotonic())),
+            )
+            fields = dict(line.split("=", 1) for line in state.stdout.splitlines() if "=" in line)
+            no_process = fields.get("MainPID") == "0" and fields.get("ControlPID") == "0"
+            no_job = fields.get("Job") in {"", "0"}
+            if (state.returncode == 0 and no_process and no_job
+                    and fields.get("ActiveState") in {"inactive", "failed"}):
+                return True
+            if result.returncode != 0 or state.returncode != 0:
+                raise RuntimeError(f"Cannot confirm {unit} stopped: {fields}")
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
+        raise TimeoutError(f"{unit} did not stop within {wait_seconds:g}s")
+    except (subprocess.SubprocessError, OSError, RuntimeError) as exc:
+        _service_operation_failed(unit, exc)
+        return False
 
 
 # ---- edge-core update (edge-core auto-update plan, B6) -----------------------
@@ -3357,10 +3494,7 @@ def stop_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
 
     require_root(f"sudo {spec.install_command_hint.rsplit(' ', 1)[0]} stop")
 
-    try:
-        _run(["systemctl", "stop", spec.unit_name])
-    except subprocess.CalledProcessError as exc:
-        console.print(f"[red]systemctl stop failed (exit {exc.returncode}).[/red]")
+    if not _stop_systemd_unit(spec.unit_name):
         return False
 
     console.print(f"[green]Service stopped:[/green] {spec.unit_name}")
@@ -3399,9 +3533,14 @@ def start_service(spec: ServiceSpec = EDGE_CORE_SPEC) -> bool:
 
     require_root(f"sudo {spec.install_command_hint.rsplit(' ', 1)[0]} start")
 
-    result = _run(["systemctl", "start", spec.unit_name], check=False)
+    try:
+        result = _run(["systemctl", "start", "--no-block", spec.unit_name], check=False, timeout=15)
+    except (subprocess.SubprocessError, OSError) as exc:
+        _service_operation_failed(spec.unit_name, exc)
+        return False
     if result.returncode == 0:
-        console.print(f"[green]✓ Started {spec.unit_name}[/green]")
+        console.print(f"[green]Start requested: {spec.unit_name}[/green]")
+        _service_progress_hint(spec.unit_name)
         return True
     console.print(
         f"[yellow]systemctl start failed (exit {result.returncode}). "
@@ -3416,7 +3555,7 @@ _CAMERA_SENSOR_TYPES = {"camera", "rgb", "depth_camera"}
 # with ``depth_camera`` as the sensor *id*. Both are matched so the check
 # holds whichever shape a twin carries.
 _DEPTH_SENSOR_TYPES = {"depth", "depth_camera"}
-_MICROPHONE_SENSOR_TYPES = {"audio", "audio_mono", "audio_stereo", "microphone"}
+_MICROPHONE_SENSOR_TYPES = {"audio", "audio_mono", "audio_stereo", "mic", "microphone", "audio_in"}
 _SPEAKER_SENSOR_TYPES = {"speaker", "loudspeaker", "speakerphone", "audio_out"}
 
 
@@ -3489,15 +3628,15 @@ def _list_camera_twins() -> list[tuple[str, str]]:
     return results
 
 
-def _load_twin_camera_serials() -> dict[str, str]:
-    """Return ``{twin_uuid: serial_number}`` for cached twins that pin one.
+def _serial_text(value: Any) -> str:
+    """``serial_number`` as the drivers read it: they ``str()`` a number; '' when unset."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return ""
+    return str(value).strip()
 
-    ``metadata.serial_number`` is hardware identity: the camera driver matches
-    it against the RealSense serial or udev's ``/dev/v4l/by-id`` tree, so a
-    twin carrying one has already answered "which physical camera" and needs
-    no positional ``/dev/videoN`` from the operator.  Twins without the field
-    are absent from the mapping, so callers can tell "unpinned" from "pinned".
-    """
+
+def _load_twin_camera_serials() -> dict[str, str]:
+    """``{twin_uuid: serial_number}``; a value may be a by-id name an older installer left."""
     serials: dict[str, str] = {}
     for path in sorted(CONFIG_DIR.glob("*.json")):
         if not _is_twin_object_file(path):
@@ -3509,12 +3648,12 @@ def _load_twin_camera_serials() -> dict[str, str]:
         metadata = data.get("metadata")
         if not isinstance(metadata, dict):
             continue
-        serial = metadata.get("serial_number")
-        if not isinstance(serial, str) or not serial.strip():
+        serial = _serial_text(metadata.get("serial_number"))
+        if not serial:
             continue
         twin_uuid = str(data.get("uuid") or path.stem)
         if twin_uuid:
-            serials[twin_uuid] = serial.strip()
+            serials[twin_uuid] = serial
     return serials
 
 
@@ -3527,6 +3666,220 @@ _CAMERA_STREAM_SCHEMES = ("rtsp://", "rtsps://", "http://", "https://")
 # Marks a ``twin_to_device`` value as hardware identity rather than a video
 # source. Kept in sync with edge-core's ``_SERIAL_SOURCE_PREFIX``.
 _SERIAL_PIN_PREFIX = "serial:"
+_ALSA_BY_ID_DIR = "/dev/snd/by-id"
+_ALSA_BY_PATH_DIR = "/dev/snd/by-path"
+_V4L_NODE_RE = re.compile(r"-video-index(\d+)$")
+_UDEV_NAME_PREFIXES = ("usb-", "pci-", "platform-")
+
+
+class _Inference(NamedTuple):
+    assigned: dict[str, tuple[Any, str]]
+    unresolved: list[str]
+
+
+def _ambiguous_groups(units: Iterable[tuple[Hashable, bool]]) -> set[Hashable]:
+    """Keys of identical units only some of which have a link (none linked: no udev tree)."""
+    groups: dict[Hashable, list[bool]] = {}
+    for key, linked in units:
+        groups.setdefault(key, []).append(linked)
+    return {k for k, v in groups.items() if len(v) > 1 and any(v) and not all(v)}
+
+
+def _infer_associations(
+    twins: list[str],
+    devices: list[Any],
+    *,
+    claimed: set[Any],
+    compatible: Callable[[str, Any], bool],
+    limit: int = 20000,
+) -> _Inference:
+    """Pair a twin with a device only where every full assignment agrees; past *limit*, none."""
+    free = [d for d in devices if d not in claimed]
+    options = {t: [d for d in free if compatible(t, d)] for t in twins}
+    images: dict[str, set[Any]] = {t: set() for t in twins}
+    order = sorted(twins, key=lambda t: len(options[t]))
+    found = 0
+    steps = 0
+    stop = False
+
+    def walk(i: int, used: set[Any], current: dict[str, Any]) -> None:
+        nonlocal found, steps, stop
+        steps += 1
+        stop = stop or steps > limit
+        if stop:
+            return
+        if i == len(order):
+            found += 1
+            for twin, device in current.items():
+                images[twin].add(device)
+            stop = all(len(v) > 1 for v in images.values())
+            return
+        twin = order[i]
+        for device in options[twin]:
+            if device not in used:
+                used.add(device)
+                current[twin] = device
+                walk(i + 1, used, current)
+                used.discard(device)
+                current.pop(twin, None)
+
+    if twins:
+        walk(0, set(), {})
+    if not twins or found == 0 or stop:
+        return _Inference({}, list(twins))
+
+    assigned: dict[str, tuple[Any, str]] = {}
+    for twin in twins:
+        if len(images[twin]) != 1:
+            continue
+        (device,) = images[twin]
+        only = sum(1 for d in devices if compatible(twin, d)) == 1
+        assigned[twin] = (
+            device,
+            "the only attached device it can use"
+            if only
+            else "the only device left once the other twins' verified bindings "
+            "and sensor types are accounted for",
+        )
+    return _Inference(assigned, [t for t in twins if t not in assigned])
+
+
+class _UdevDevice(NamedTuple):
+    name: str
+    target: str
+
+
+def _looks_like_udev_name(value: str) -> bool:
+    return value.strip().startswith(_UDEV_NAME_PREFIXES)
+
+
+def _ask_yes_no(prompt: str, *, default: bool = True, on_eof: bool = True) -> bool:
+    try:
+        return bool(Confirm.ask(prompt, default=default))
+    except EOFError:
+        return on_eof
+
+
+def _list_udev_links(directory: str) -> list[_UdevDevice]:
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    found = [_UdevDevice(n, os.path.realpath(os.path.join(directory, n))) for n in names]
+    return [d for d in found if os.path.exists(d.target)]
+
+
+def _list_v4l_by_id() -> list[_UdevDevice]:
+    return _list_udev_links(_V4L_BY_ID_DIR)
+
+
+def _list_alsa_by_id() -> list[_UdevDevice]:
+    return _list_udev_links(_ALSA_BY_ID_DIR)
+
+
+def _best_link(directory: str, nodes: set[str]) -> str | None:
+    best: tuple[int, str] | None = None
+    for device in _list_udev_links(directory):
+        if device.target not in nodes:
+            continue
+        match = _V4L_NODE_RE.search(device.name)
+        rank = (int(match.group(1)) if match else sys.maxsize, device.name)
+        best = min(best, rank) if best else rank
+    return best[1] if best else None
+
+
+def _udev_pin_name(value: str, directory: str) -> str | None:
+    """Bare link name of a udev pin (name or full path under *directory*); None for a raw serial."""
+    candidate = value.strip()
+    if candidate.startswith(directory.rstrip("/") + "/"):
+        candidate = candidate[len(directory.rstrip("/")) + 1 :]
+    if not candidate or "/" in candidate or not _looks_like_udev_name(candidate):
+        return None
+    return candidate
+
+
+def _udev_link_path(value: str, directories: tuple[str, ...]) -> str | None:
+    """Full path of a udev pin given as a path or a bare link name; None for a raw serial."""
+    candidate = value.strip()
+    for directory in directories:
+        if candidate.startswith(directory.rstrip("/") + "/"):
+            name = _udev_pin_name(candidate, directory)
+            return candidate if name else None
+    name = _udev_pin_name(candidate, directories[0])
+    if not name:
+        return None
+    holder = next(
+        (d for d in directories if os.path.lexists(os.path.join(d, name))), directories[0]
+    )
+    return f"{holder.rstrip('/')}/{name}"
+
+
+def _v4l_trees() -> tuple[str, str]:
+    return (_V4L_BY_ID_DIR, _V4L_BY_PATH_DIR)
+
+
+def _alsa_trees() -> tuple[str, str]:
+    return (_ALSA_BY_ID_DIR, _ALSA_BY_PATH_DIR)
+
+
+_PORT_FOOTNOTE = (
+    "[dim]* identical units, pinned by USB port: keep each one in the same port.[/dim]"
+)
+
+
+def _short_link(value: str) -> str:
+    name = os.path.basename(value.strip())
+    if "/by-path/" in value or name.startswith(("platform-", "pci-")):
+        core = re.sub(r"-video-index\d+$", "", re.sub(r"^(platform|pci)-", "", name))
+        return f"port {core}"
+    core = re.sub(r"-(video-index\d+|\d+)$", "", re.sub(r"^usb-", "", name))
+    return f"id {core.rsplit('_', 1)[-1]}"
+
+
+def _udev_properties(node: str) -> dict[str, str]:
+    try:
+        result = subprocess.run(
+            ["udevadm", "info", "--query=property", f"--name={node}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=clean_subprocess_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0:
+        return {}
+    props: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            props[key] = value
+    return props
+
+
+def _collided(keys: list[str | None], fallback: list[tuple[Hashable, bool]]) -> list[bool]:
+    """Per unit, True when an identical unit (same udev ID_SERIAL) is attached."""
+    known = Counter(k for k in keys if k)
+    legacy = _ambiguous_groups(fallback[i] for i, k in enumerate(keys) if not k)
+    return [known[k] > 1 if k else fallback[i][0] in legacy for i, k in enumerate(keys)]
+
+
+class _UsbUnit(NamedTuple):
+    """by-id, or by-path when an identical unit is attached: by-id could name either."""
+
+    pin: str | None
+    by_port: bool
+    collided: bool
+
+
+def _usb_unit(
+    by_id: str | None, by_path: str | None, collided: bool, trees: tuple[str, str]
+) -> _UsbUnit:
+    if by_id and not collided:
+        return _UsbUnit(f"{trees[0]}/{by_id}", False, collided)
+    if by_path:
+        return _UsbUnit(f"{trees[1]}/{by_path}", True, collided)
+    return _UsbUnit(None, False, collided)
 
 
 def _stable_camera_device_prefixes() -> tuple[str, ...]:
@@ -3551,7 +3904,10 @@ def _is_local_stable_camera_device(value: str) -> bool:
     against the discovery pass. Anything else stable (an RTSP/UDP URL) names a
     source that needs no local device at all.
     """
-    return value.strip().startswith(_stable_camera_device_prefixes())
+    candidate = value.strip()
+    return candidate.startswith(_stable_camera_device_prefixes()) and (
+        ".." not in candidate.split("/")
+    )
 
 
 def _is_stable_camera_device(value: str) -> bool:
@@ -3639,6 +3995,7 @@ class _CameraPin(NamedTuple):
     label: str
     index: int | None
     device: int | str
+    migrate: str | None = None
 
 
 def _camera_device_nodes(cam: Any) -> list[str]:
@@ -3653,6 +4010,20 @@ def _camera_device_nodes(cam: Any) -> list[str]:
         return [str(p) for p in paths if p]
     primary = getattr(cam, "primary_path", None)
     return [str(primary)] if primary else []
+
+
+def _camera_units(cameras: list[Any]) -> list[_UsbUnit]:
+    nodes = [set(_camera_device_nodes(cam)) for cam in cameras]
+    by_id = [_best_link(_V4L_BY_ID_DIR, n) for n in nodes]
+    keys = [
+        _udev_properties(cam.primary_path).get("ID_SERIAL") if cam.primary_path else None
+        for cam in cameras
+    ]
+    collided = _collided(keys, [(str(c.card or ""), b is not None) for c, b in zip(cameras, by_id)])
+    return [
+        _usb_unit(by_id[i], _best_link(_V4L_BY_PATH_DIR, nodes[i]), collided[i], _v4l_trees())
+        for i in range(len(cameras))
+    ]
 
 
 def _camera_index_for_device(cameras: list[Any], device: str) -> int | None:
@@ -3670,13 +4041,25 @@ def _camera_index_for_device(cameras: list[Any], device: str) -> int | None:
         target = os.path.realpath(candidate)
     except OSError:
         return None
-    if not target.startswith("/dev/video"):
-        return None
     for i, cam in enumerate(cameras):
         if target in _camera_device_nodes(cam):
             index = getattr(cam, "index", None)
             return index if index is not None else i
     return None
+
+
+def _twin_model_words(twin_uuid: str) -> list[str]:
+    path = CONFIG_DIR / f"{twin_uuid}.json"
+    if not _is_twin_object_file(path):
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    asset = data.get("asset") if isinstance(data.get("asset"), dict) else {}
+    names = (asset.get("name"), asset.get("registry_id"), data.get("name"))
+    text = " ".join(str(v) for v in names if v)
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) >= 3]
 
 
 def _twin_has_depth_sensor(twin_uuid: str) -> bool:
@@ -3780,21 +4163,20 @@ def _any_twin_has_speaker_sensor() -> bool:
     return bool(_list_speaker_twins())
 
 
-def _camera_identity_hint(cam: Any) -> str:
+def _camera_audio_twins() -> dict[str, str]:
+    """``{uuid: name}`` of twins with camera and audio sensors, which share one serial_number."""
+    audio = {u for u, _ in _list_microphone_twins() + _list_speaker_twins()}
+    return {u: escape(n) for u, n in _list_camera_twins() if u in audio}
+
+
+def _camera_identity_hint(cam: Any, unit: _UsbUnit | None = None) -> str:
     """The field that tells this camera apart from an identical sibling.
 
-    Two cameras of the same model render identical ``card`` strings, so the
-    menu's only other column -- ``/dev/videoN`` -- is what an operator ends up
-    choosing on. That is the one attribute that is *not* identity: it is
-    positional and moves on replug and reboot.
-
-    The serial is also the value that goes into ``metadata.serial_number``, so
-    showing it here is what lets an operator read a pin off the screen instead
-    of going back to the host with ``v4l2-ctl``. A camera that reports no
-    serial (the Logitech C920 ships an empty descriptor) falls back to its USB
-    port, the only thing distinguishing two identical such cameras -- and a
-    hint that this twin needs a ``video_device`` pin rather than a serial.
+    ``/dev/videoN`` moves on replug: the pin's link, else the USB serial, else the port.
     """
+    unit = unit or _camera_units([cam])[0]
+    if unit.pin:
+        return f"{'port' if unit.by_port else 'id'} {os.path.basename(unit.pin)}"
     serial = (getattr(cam, "serial", None) or "").strip()
     if serial:
         return f"serial {serial}"
@@ -3804,48 +4186,39 @@ def _camera_identity_hint(cam: Any) -> str:
     return ""
 
 
-def _render_camera_menu(
-    cameras: list[Any],
-    *,
-    assignments: dict[int, str] | None = None,
-) -> dict[int, Any]:
-    """Print a numbered camera menu and return the map of valid indices.
-
-    When ``assignments`` is provided, each already-mapped camera is annotated
-    with the twin name it is currently assigned to.
-    """
+def _render_camera_menu(cameras: list[Any]) -> dict[int, Any]:
     from .device_utils import camera_likelihood_score
 
-    assignments = assignments or {}
+    units = _camera_units(cameras)
     valid_indices: dict[int, Any] = {}
+    any_port = False
     for i, cam in enumerate(cameras):
         idx = cam.index if cam.index is not None else i
         valid_indices[idx] = cam
-        score = camera_likelihood_score(cam)
-        assigned_to = assignments.get(idx)
-        suffix = f"  [yellow](assigned to {assigned_to})[/yellow]" if assigned_to else ""
-        hint = _camera_identity_hint(cam)
-        hint_text = f"  {hint}" if hint else ""
-        if score >= 40:
-            label = (
-                f"  [bold cyan]{idx}[/bold cyan])  {cam.card}  "
-                f"[dim]{cam.primary_path}{hint_text}[/dim]{suffix}"
-            )
+        unit = units[i]
+        where = _short_link(unit.pin) if unit.pin else _camera_identity_hint(cam, unit)
+        node = os.path.basename(cam.primary_path or "")
+        suffix = ""
+        if unit.collided and unit.pin:
+            suffix += " *"
+            any_port = True
+        elif unit.collided:
+            suffix += "  [red](identical unit, cannot be pinned)[/red]"
+        detail = escape(" · ".join(x for x in (node, where) if x))
+        card = escape(str(cam.card))
+        if camera_likelihood_score(cam) >= 40:
+            console.print(f"  [bold cyan]{idx}[/bold cyan])  {card}  [dim]{detail}[/dim]{suffix}")
         else:
-            label = (
-                f"  [dim]{idx})  {cam.card}  {cam.primary_path}{hint_text}  "
-                f"(probably not a camera)[/dim]{suffix}"
-            )
-        console.print(label)
+            console.print(f"  [dim]{idx})  {card}  {detail}  (probably not a camera)[/dim]{suffix}")
+    if any_port:
+        console.print(_PORT_FOOTNOTE)
     return valid_indices
 
 
 def _camera_index_for_serial(cameras: list[Any], serial: str) -> int | None:
     """Index of the discovered camera reporting *serial*, or ``None``.
 
-    Compared case-insensitively after stripping: udev and V4L2 disagree on
-    case for some vendors, and a stored value may carry whitespace from a
-    hand-edited twin.  Cameras that report no serial never match.
+    A V4L2 serial matches case-insensitively; one found only in a by-id name, exactly.
     """
     target = serial.strip().casefold()
     if not target:
@@ -3854,7 +4227,23 @@ def _camera_index_for_serial(cameras: list[Any], serial: str) -> int | None:
         cam_serial = (getattr(cam, "serial", None) or "").strip().casefold()
         if cam_serial and cam_serial == target:
             return cam.index if cam.index is not None else i
+    name = _udev_pin_name(serial, _V4L_BY_ID_DIR)
+    if name is not None:
+        return _camera_index_for_device(cameras, os.path.join(_V4L_BY_ID_DIR, name))
+    field = re.compile(rf"_{re.escape(serial.strip())}-video-index(\d+)$")
+    matches = sorted(
+        (int(m.group(1)), d.name)
+        for d in _list_v4l_by_id()
+        if (m := field.search(d.name))
+    )
+    for _node, link in matches:
+        found = _camera_index_for_device(cameras, os.path.join(_V4L_BY_ID_DIR, link))
+        if found is not None:
+            return found
     return None
+
+
+_SKIP = -1
 
 
 def _prompt_camera_index(
@@ -3862,10 +4251,25 @@ def _prompt_camera_index(
     valid_indices: dict[int, Any],
     *,
     prompt: str,
-    default_index: int,
+    default_index: int | None,
 ) -> int | None:
-    """Prompt for a single camera index. Returns ``None`` on invalid input."""
-    raw = Prompt.ask(prompt, default=str(default_index))
+    """Camera index, ``_SKIP`` for "no camera", ``None`` on invalid input."""
+    # Bounded: `yes '' | cyberwave edge install` answers empty forever.
+    for _attempt in range(3):
+        try:
+            raw = Prompt.ask(
+                prompt, **({} if default_index is None else {"default": str(default_index)})
+            )
+        except EOFError:
+            console.print("[yellow]No input available — skipping camera config.[/yellow]")
+            return None
+        if default_index is not None or str(raw).strip():
+            break
+        console.print("[yellow]Choose a camera number, or s.[/yellow]")
+    else:
+        return None
+    if str(raw).strip().lower() in ("s", "skip"):
+        return _SKIP
     try:
         chosen = int(raw)
     except ValueError:
@@ -3877,13 +4281,32 @@ def _prompt_camera_index(
     return chosen
 
 
+def _mirror_cameras_into_edge_json(cameras_data: dict) -> None:
+    """Edge-core reads edge.json's cameras ahead of cameras.json: replace a stale copy there."""
+    path = CONFIG_DIR / "edge.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    metadata = data.get("metadata") if isinstance(data, dict) else None
+    if not isinstance(metadata, dict) or not metadata.get("cameras"):
+        return
+    if metadata["cameras"] != cameras_data:
+        data["metadata"] = {**metadata, "cameras": cameras_data}
+        atomic_write_json(path, data, mode=0o644)
+        chown_to_sudo_user(path)
+    console.print(
+        "[yellow]The camera mapping was not uploaded to the backend; this host uses the new "
+        "one (edge.json updated). Re-run install once the backend is reachable.[/yellow]"
+    )
+
+
 def _upload_cameras_to_edge_metadata(cameras_data: dict) -> bool:
     """Upload camera config to Edge.metadata.cameras and persist edge.json.
 
     Best-effort: logs a warning and returns False on any failure.
     """
     from .credentials import load_credentials
-    from .io_utils import atomic_write_json
     from .utils import resolve_api_url
 
     creds = load_credentials()
@@ -3930,6 +4353,7 @@ def _upload_cameras_to_edge_metadata(cameras_data: dict) -> bool:
         else:
             edge_dict = dict(updated_edge)
         atomic_write_json(CONFIG_DIR / "edge.json", edge_dict, mode=0o644)
+        chown_to_sudo_user(CONFIG_DIR / "edge.json")
         console.print(f"[dim]Saved to {CONFIG_DIR / 'edge.json'}[/dim]")
         return True
     except Exception as exc:
@@ -3937,99 +4361,985 @@ def _upload_cameras_to_edge_metadata(cameras_data: dict) -> bool:
         return False
 
 
-def _persist_twin_serial_numbers(twin_serials: dict[str, str]) -> int:
-    """Pin ``metadata.serial_number`` on twins the operator mapped by hand.
+def _write_local_twin_pin(twin_uuid: str, metadata: Mapping[str, Any]) -> None:
+    """Mirror a saved pin locally: edge-core would push the stale twin file back over it."""
+    path = CONFIG_DIR / f"{twin_uuid}.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+        current = data.get("metadata")
+        data["metadata"] = {**(current if isinstance(current, dict) else {}), **metadata}
+        atomic_write_json(path, data, mode=0o644)
+        chown_to_sudo_user(path)
+    except (OSError, ValueError):
+        return
 
-    Turning one positional answer into stable hardware identity is what stops
-    the installer asking again: the next run resolves these twins from their
-    serial instead of prompting, and the driver stops depending on an index
-    that moves across reboots and replugs.  ``twins.update`` merges metadata
-    server-side, so only the single key is sent.
 
-    Best-effort by design — camera mapping must never block an install.
-    Returns the number of twins updated.
+def _persist_twin_pins(pins: Mapping[str, Mapping[str, Any]]) -> set[str]:
+    """Write device-identity metadata onto twins, best-effort; returns the twins that failed.
+
+    A pin blanks ``serial_number``: both drivers let a serial outrank the device field.
     """
-    if not twin_serials:
-        return 0
+    pins = {u: m for u, m in pins.items() if u and m}
+    if not pins:
+        return set()
 
     from .credentials import load_credentials
     from .utils import resolve_api_url
 
     creds = load_credentials()
     if not creds or not creds.token:
-        return 0
+        console.print("[yellow]Could not save device bindings: no API credentials available.[/yellow]")
+        return set(pins)
 
     try:
         from cyberwave import Cyberwave
 
         client = Cyberwave(base_url=resolve_api_url(creds=creds), api_key=creds.token)
     except Exception as exc:
-        console.print(f"[dim]Could not record camera serials: {exc}[/dim]")
-        return 0
+        console.print(f"[dim]Could not record device ids: {escape(str(exc))}[/dim]")
+        return set(pins)
 
-    updated = 0
-    for twin_uuid, serial in twin_serials.items():
+    failed: set[str] = set()
+    for twin_uuid, metadata in pins.items():
         try:
-            client.twins.update(twin_uuid, metadata={"serial_number": serial})
-            updated += 1
+            client.twins.update(twin_uuid, metadata=metadata)
+            _write_local_twin_pin(twin_uuid, metadata)
         except Exception as exc:
+            failed.add(twin_uuid)
             console.print(
-                f"[yellow]Could not pin serial {serial} to twin "
-                f"{twin_uuid[:8]}…: {exc}[/yellow]"
+                f"[yellow]Could not pin device on twin {twin_uuid[:8]}…: {escape(str(exc))}. "
+                f"The twin keeps its previous pin.[/yellow]"
             )
-    if updated:
+    if len(pins) > len(failed):
         console.print(
-            f"[dim]Pinned camera serial on {updated} twin(s) — "
-            f"future installs resolve them without prompting.[/dim]"
+            f"[dim]Pinned {len(pins) - len(failed)} twin(s); a reinstall reuses the pins "
+            f"without asking.[/dim]"
         )
-    return updated
+    return failed
+
+
+def _spare_shared_serials(
+    pins: dict[str, dict[str, str]], matches: Callable[[str], bool]
+) -> None:
+    """Never write serial_number on a twin with camera and audio sensors: it pins one kind only."""
+    metadata = _cached_twin_metadata()
+    for uuid_, name in _camera_audio_twins().items():
+        serial = _serial_text(metadata.get(uuid_, {}).get("serial_number"))
+        if serial and _udev_link_path(serial, (*_v4l_trees(), *_alsa_trees())):
+            continue
+        repinned = uuid_ in pins
+        if repinned:
+            kept = {k: v for k, v in pins[uuid_].items() if k != "serial_number"}
+            if kept:
+                pins[uuid_] = kept
+            else:
+                del pins[uuid_]
+        if serial and (repinned or not matches(serial)):
+            console.print(
+                f"[yellow]{name}'s serial_number {escape(serial)} is shared by its camera and "
+                f"audio sensors and pins only one of them; it is left as is and needs your "
+                f"attention.[/yellow]"
+            )
+
+
+def _camera_pin_metadata(identity: str) -> dict[str, str]:
+    path = _udev_link_path(identity, _v4l_trees())
+    if path is not None:
+        return {"video_device": path, "serial_number": ""}
+    return {"serial_number": identity}
+
+
+def _twin_network_spec(twin_uuid: str) -> Any:
+    """The asset's ``network_discovery`` with the twin's merged over it.
+
+    A fixed source is read from the drivers edge-core launches: the twin's, else the asset's.
+    """
+    from .discovery.hardware import METADATA_KEY, DiscoverySpec, explicit_metadata_values
+
+    path = CONFIG_DIR / f"{twin_uuid}.json"
+    if not _is_twin_object_file(path):
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    asset = data.get("asset") if isinstance(data.get("asset"), dict) else {}
+    metadatas = [m for m in (asset.get("metadata"), data.get("metadata")) if isinstance(m, dict)]
+    blocks = [m[METADATA_KEY] for m in metadatas if isinstance(m.get(METADATA_KEY), dict)]
+    if not blocks:
+        return None
+    twin_metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    asset_metadata = asset.get("metadata") if isinstance(asset.get("metadata"), dict) else {}
+    drivers = twin_metadata.get("drivers") or asset_metadata.get("drivers")
+    return DiscoverySpec.from_metadata(*blocks, explicit=explicit_metadata_values(drivers))
+
+
+def _list_network_twins() -> list[tuple[str, str, Any]]:
+    selected_uuids = _load_selected_twin_uuids()
+    found: list[tuple[str, str, Any]] = []
+    for path in sorted(CONFIG_DIR.glob("*.json")):
+        if not _is_twin_object_file(path):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        twin_uuid = str(data.get("uuid") or path.stem)
+        if selected_uuids is not None and twin_uuid not in selected_uuids:
+            continue
+        spec = _twin_network_spec(twin_uuid)
+        if spec is not None:
+            found.append((twin_uuid, escape(str(data.get("name") or twin_uuid)), spec))
+    return found
+
+
+def _choose_port(ports: list[Any], reason: str) -> Any:
+    if not ports:
+        return None
+    if len(ports) == 1:
+        return ports[0]
+    names = [p.name for p in ports]
+    try:
+        answer = Prompt.ask(
+            f"{reason}. Which port is it on?", choices=[*names, "s"], default=names[0]
+        )
+    except EOFError:
+        return None
+    return None if answer == "s" else ports[names.index(answer)]
+
+
+def _apply_port_plans(plans: dict[str, dict[str, Any]]) -> bool:
+    from .discovery import linkconfig
+
+    if not plans:
+        return False
+    if not linkconfig.networkmanager_running():
+        console.print(
+            "[yellow]NetworkManager is not running, so the wired ports cannot be configured. "
+            "Give them the addresses above by hand and re-run install.[/yellow]"
+        )
+        return False
+    changed = False
+    for port_name, wanted in plans.items():
+        try:
+            profile = linkconfig.configure(
+                port_name, link_local=wanted["link_local"], addresses=wanted["addresses"]
+            )
+        except linkconfig.LinkConfigError as exc:
+            console.print(f"[yellow]Could not configure {port_name}: {escape(str(exc))}[/yellow]")
+            continue
+        want = wanted["addresses"][0] if wanted["addresses"] else None
+        held = linkconfig.wait_for_ipv4(port_name, want=want)
+        if held:
+            console.print(
+                f"[green]{port_name}[/green]: {', '.join(str(a) for a in held)} "
+                f"[dim](NetworkManager profile {profile})[/dim]"
+            )
+            changed = True
+        else:
+            console.print(f"[yellow]{port_name} did not get its address in time.[/yellow]")
+    return changed
+
+
+def _ensure_wired_addresses(ports: list[Any], twins: list[tuple[str, str, Any]]) -> list[Any]:
+    from .discovery import interfaces, linkconfig
+
+    if _adopt_dhcp_on_own_profiles([p for p in ports if p.carrier]):
+        ports = interfaces.wired_interfaces()
+    linked = [p for p in ports if p.carrier]
+    plans: dict[str, dict[str, Any]] = {}
+    planned: set[ipaddress.IPv4Network] = set()
+
+    def plan(port: Any) -> dict[str, Any]:
+        return plans.setdefault(port.name, {"link_local": False, "addresses": []})
+
+    for _uuid, name, spec in twins:
+        if spec.ip_address is None:
+            continue
+        subnet = spec.subnet_of(spec.ip_address)
+        if subnet in planned or any(a.ip in subnet for p in linked for a in p.addresses):
+            continue
+        planned.add(subnet)
+        port = _choose_port(linked, f"{name} has the fixed address {spec.ip_address}")
+        if port is None:
+            continue
+        if spec.host_address is not None and spec.host_address.ip in subnet:
+            address = spec.host_address
+        else:
+            if spec.host_address is not None:
+                console.print(
+                    f"[yellow]⚠[/yellow] {name}: host_address {spec.host_address} is outside "
+                    f"{subnet}, so it is ignored."
+                )
+            address = linkconfig.pick_free_address(subnet, {spec.ip_address})
+        if address is None or not _ask_yes_no(
+            f"{name} is at {spec.ip_address}, but {port.name} has no address in {subnet}. "
+            f"Add {address} to {port.name}?",
+            on_eof=False,
+        ):
+            continue
+        plan(port)["addresses"].append(address)
+
+    wants_link_local = [name for _uuid, name, spec in twins if spec.link_local]
+    for port in linked:
+        if port.has_ipv4 or port.name in plans:
+            continue
+        if not wants_link_local:
+            console.print(f"[dim]{port.name} has a cable connected but no IPv4 address.[/dim]")
+            continue
+        if _ask_yes_no(
+            f"{port.name} has a cable connected but no IPv4 address. Set it to take an address "
+            f"from DHCP when a router serves one, and a link-local one (169.254.x.x) either way, "
+            f"so {', '.join(wants_link_local)} can be found? This adds no default route.",
+            on_eof=False,
+        ):
+            plan(port)["link_local"] = True
+
+    return interfaces.wired_interfaces() if _apply_port_plans(plans) else ports
+
+
+def _adopt_dhcp_on_own_profiles(ports: list[Any]) -> bool:
+    from .discovery import linkconfig
+
+    if not ports or not linkconfig.networkmanager_running():
+        return False
+    changed = False
+    for port in ports:
+        try:
+            profile = linkconfig.adopt_dhcp(port.name)
+        except linkconfig.LinkConfigError:
+            continue
+        if profile is None:
+            continue
+        console.print(
+            f"[dim]{port.name}: {profile} now also takes a DHCP address when a router serves "
+            f"one, beside its link-local address.[/dim]"
+        )
+        linkconfig.wait_for_ipv4(port.name)
+        changed = True
+    return changed
+
+
+def _offer_subnet_addresses(
+    devices: list[Any], all_devices: list[Any], twins: list[tuple[str, str, Any]]
+) -> bool:
+    """Offer an address next to devices this host sees but cannot reach; True if one was added."""
+    from .discovery import hardware, linkconfig
+
+    plans: dict[str, dict[str, Any]] = {}
+    handled: set[tuple[str, Any]] = set()
+    for device in devices:
+        spec = next((s for _u, _n, s in twins if hardware.match_score(s, device)), None)
+        if spec is None:
+            continue
+        if ipaddress.IPv4Address(device.ip).is_link_local:
+            # A static 169.254 address would skip conflict detection: enable link-local.
+            if (device.interface, "link-local") in handled:
+                continue
+            handled.add((device.interface, "link-local"))
+            if _ask_yes_no(
+                f"{device.label()} answers from the link-local address {device.ip}, but "
+                f"{device.interface} has none. Add link-local addressing to {device.interface} "
+                f"so it can be reached?",
+                on_eof=False,
+            ):
+                plans.setdefault(device.interface, {"link_local": True, "addresses": []})[
+                    "link_local"
+                ] = True
+            continue
+        subnet = spec.subnet_of(device.ip)
+        if (device.interface, subnet) in handled:
+            continue
+        handled.add((device.interface, subnet))
+        if spec.host_address is not None and spec.host_address.ip in subnet:
+            address = spec.host_address
+        else:
+            taken = {d.ip for d in all_devices if ipaddress.IPv4Address(d.ip) in subnet}
+            address = linkconfig.pick_free_address(subnet, taken)
+        if address is None or not _ask_yes_no(
+            f"{device.label()} answers from {device.ip}, but {device.interface} has no "
+            f"address in {subnet}. Add {address} to {device.interface} so it can be reached?",
+            on_eof=False,
+        ):
+            continue
+        plans.setdefault(device.interface, {"link_local": False, "addresses": []})[
+            "addresses"
+        ].append(address)
+    return _apply_port_plans(plans)
+
+
+def _prompt_network_device(
+    twin_name: str, options: list[Any], rivals: Sequence[str] = ()
+) -> Any:
+    """Ask which of several matching devices serves *twin_name*; None to leave it unbound."""
+    console.print(
+        f"  [bold]{twin_name}[/bold]: {len(options)} matching "
+        f"{'device' if len(options) == 1 else 'devices'}. "
+        f"[dim]Check the MAC address on the device's label.[/dim]"
+    )
+    if len(rivals) >= len(options):
+        console.print(
+            f"  [dim]{len(rivals) + 1} twins ({twin_name}, {', '.join(rivals)}) fit "
+            f"{'it' if len(options) == 1 else 'them'}: a twin left without one stays "
+            f"unpinned.[/dim]"
+        )
+    for number, device in enumerate(options, start=1):
+        console.print(f"    {number}) {escape(device.label())}")
+    choices = [str(n) for n in range(1, len(options) + 1)] + ["s"]
+    try:
+        answer = Prompt.ask(f"  Device for {twin_name}", choices=choices, default="s")
+    except EOFError:
+        return None
+    return None if answer == "s" else options[int(answer) - 1]
+
+
+def _prompt_source_owner(source: str, group: list[tuple[str, str, Any]]) -> Any:
+    """Ask which twin a fixed source set on all of *group* belongs to; None leaves it on all."""
+    console.print(
+        f"  {source} is set on {len(group)} twins, but it names one device. "
+        f"[dim](s: leave it on all of them)[/dim]"
+    )
+    for number, (_uuid, name, _spec) in enumerate(group, start=1):
+        console.print(f"    {number}) {name}")
+    choices = [str(n) for n in range(1, len(group) + 1)] + ["s"]
+    try:
+        answer = Prompt.ask("  Which twin is it for", choices=choices, default="s")
+    except EOFError:
+        return None
+    return None if answer == "s" else group[int(answer) - 1]
+
+
+def _prompt_source_or_device(
+    twin_name: str, source: str, at_source: Any, others: list[Any], saved_mac: str
+) -> Any:
+    """Ask whether *twin_name* keeps its fixed source or takes a device found; None keeps it."""
+    there = (
+        f"answered by {escape(at_source.label())}" if at_source.mac else "nothing answers there"
+    )
+    console.print(f"  [bold]{twin_name}[/bold]: {source} ({there}), and the wired scan found:")
+    console.print(f"    1) keep {source}")
+    for number, device in enumerate(others, start=2):
+        saved = " [dim](the MAC saved on this twin)[/dim]" if device.mac == saved_mac else ""
+        console.print(f"    {number}) {escape(device.label())}{saved}")
+    choices = [str(n) for n in range(1, len(others) + 2)]
+    try:
+        answer = Prompt.ask(f"  Source for {twin_name}", choices=choices, default="1")
+    except EOFError:
+        return None
+    return None if answer == "1" else others[int(answer) - 2]
+
+
+def _one_twin_per_fixed_source(
+    twins: list[tuple[str, str, Any]],
+    devices: list[Any],
+    *,
+    saved_mac: Callable[[str], str],
+    can_search: bool,
+    not_bound: dict[str, str],
+    released: dict[str, str],
+) -> list[tuple[str, str, Any]]:
+    """A fixed source inherited by several twins goes to one; the others drop it and search."""
+    from .discovery import hardware
+
+    groups: dict[str, list[tuple[str, str, Any]]] = {}
+    for twin in twins:
+        if twin[2].fixed_field is not None:
+            groups.setdefault(twin[2].fixed_value, []).append(twin)
+    owner_of: dict[str, str] = {}  # twin_uuid -> name of the twin keeping the source
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        spec = group[0][2]
+        source = escape(redact_userinfo(spec.fixed_source))
+        mac = next((d.mac for d in devices if d.ip == spec.ip_address and d.mac), "")
+        owner = next((t for t in group if mac and saved_mac(t[0]) == mac), None)
+        if owner is None:
+            owner = _prompt_source_owner(source, group)
+        if owner is None:
+            console.print(
+                f"[yellow]⚠[/yellow] {', '.join(name for _u, name, _s in group)} all use "
+                f"{source}, so they show the same device."
+            )
+            continue
+        owner_of.update({t[0]: owner[1] for t in group if t[0] != owner[0]})
+
+    kept: list[tuple[str, str, Any]] = []
+    for twin_uuid, name, spec in twins:
+        owner = owner_of.get(twin_uuid)
+        if owner is None:
+            kept.append((twin_uuid, name, spec))
+            continue
+        param = f"{hardware.METADATA_ENV_PREFIX}{spec.fixed_field.upper()}"
+        released[twin_uuid] = (
+            f"Removed {param} from {name}'s driver params: it names {owner}'s device."
+        )
+        if can_search and spec.searchable:
+            console.print(
+                f"  {name}: {param} names {owner}'s device; searching for {name}'s own."
+            )
+            kept.append((twin_uuid, name, spec.without_fixed_source()))
+        else:
+            why_not = (
+                "the device cannot be searched for"
+                if can_search
+                else "no wired port has a link to search for its own"
+            )
+            not_bound[twin_uuid] = f"its {param} names {owner}'s device and {why_not}"
+    return kept
+
+
+def _drivers_without_param(twin_uuid: str, field: str) -> dict[str, Any] | None:
+    """The drivers edge-core launches, minus ``CYBERWAVE_METADATA_<FIELD>`` params; None if none."""
+    from .discovery.hardware import METADATA_ENV_PREFIX
+
+    try:
+        data = json.loads((CONFIG_DIR / f"{twin_uuid}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    asset = data.get("asset") if isinstance(data.get("asset"), dict) else {}
+    twin_metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    asset_metadata = asset.get("metadata") if isinstance(asset.get("metadata"), dict) else {}
+    drivers = twin_metadata.get("drivers") or asset_metadata.get("drivers")
+    if not isinstance(drivers, Mapping):
+        return None
+
+    def sets_field(raw: Any) -> bool:
+        key, sep, _value = str(raw).partition("=")
+        return bool(sep) and key.startswith(METADATA_ENV_PREFIX) and (
+            key[len(METADATA_ENV_PREFIX) :].lower() == field
+        )
+
+    changed = False
+    cleaned: dict[str, Any] = {}
+    for name, entry in drivers.items():
+        params = entry.get("params") if isinstance(entry, Mapping) else None
+        if not isinstance(params, list):
+            cleaned[name] = entry
+            continue
+        kept: list[Any] = []
+        skip_next = False
+        for index, param in enumerate(params):
+            if skip_next:
+                skip_next = False
+                continue
+            pair = param in ("-e", "--env") and index + 1 < len(params)
+            if pair and sets_field(params[index + 1]):
+                skip_next = changed = True
+                continue
+            if isinstance(param, str) and param.startswith("--env=") and sets_field(param[6:]):
+                changed = True
+                continue
+            kept.append(param)
+        cleaned[name] = {**entry, "params": kept}
+    return cleaned if changed else None
+
+
+def _detect_and_bind_network_devices() -> dict[str, dict[str, str]]:
+    """Bind every twin whose metadata declares ``network_discovery`` to its device.
+
+    The rules are in docs/wired-network-devices.md. Returns ``{twin_uuid: bound metadata}``,
+    which this host uses even where saving it on the twin failed.
+    """
+    from .discovery import hardware, interfaces
+    from .discovery.neighbors import normalize_mac
+
+    all_twins = _list_network_twins()
+    if not all_twins:
+        return {}
+    cached = _cached_twin_metadata()
+    pins: dict[str, dict[str, Any]] = {}
+    not_bound: dict[str, str] = {}
+    released: dict[str, str] = {}  # twin_uuid -> why its fixed-source param is removed
+
+    def saved_mac(twin_uuid: str) -> str:
+        return normalize_mac(str(cached.get(twin_uuid, {}).get(hardware.MAC_METADATA_KEY) or ""))
+
+    def clear_device_paths(twin_uuid: str, spec: Any) -> dict[str, str]:
+        """A network device never has a local /dev node: such a value is a stale pin."""
+        current = cached.get(twin_uuid, {})
+        return {
+            key: ""
+            for key, _template in spec.bind
+            if isinstance(current.get(key), str) and current[key].startswith("/dev/")
+        }
+
+    def settable(spec: Any) -> str:
+        return " or ".join(f"{hardware.METADATA_ENV_PREFIX}{key.upper()}" for key, _t in spec.bind)
+
+    ports = interfaces.wired_interfaces()
+    linked = any(p.carrier for p in ports)
+    if not linked:
+        console.print("\n[yellow]⚠[/yellow] No wired Ethernet port has a link.")
+
+    ignored: set[str] = set()
+    twins: list[tuple[str, str, Any]] = []
+    for twin_uuid, name, spec in all_twins:
+        problem = spec.fixed_problem
+        if problem is None:
+            twins.append((twin_uuid, name, spec))
+        elif linked and spec.searchable:
+            console.print(
+                f"[yellow]⚠[/yellow] {name}: ignoring {escape(redact_userinfo(spec.fixed_source))} "
+                f"[dim]({escape(problem)})[/dim]; searching the wired network instead."
+            )
+            ignored.add(twin_uuid)
+            twins.append((twin_uuid, name, spec.without_fixed_source()))
+        else:
+            why_not = "the device cannot be searched for" if linked else "no wired port has a link"
+            source = escape(redact_userinfo(spec.fixed_source))
+            not_bound[twin_uuid] = f"{source} is unusable ({escape(problem)}) and {why_not}"
+
+    bound: dict[str, Any] = {}
+    spare: list[Any] = []
+    if not linked:
+        twins = _one_twin_per_fixed_source(
+            twins,
+            [],
+            saved_mac=saved_mac,
+            can_search=False,
+            not_bound=not_bound,
+            released=released,
+        )
+        for twin_uuid, name, spec in twins:
+            if spec.fixed_field is not None:
+                bound[twin_uuid] = hardware.NetworkDevice(ip="", interface="", reachable=False)
+            else:
+                not_bound[twin_uuid] = f"no wired port has a link and no {settable(spec)} is set"
+    elif twins:
+        ports = _ensure_wired_addresses(ports, twins)
+        bound, twins, spare = _search_network_devices(twins, ports, not_bound, saved_mac, released)
+
+    effective_of = {twin_uuid: spec for twin_uuid, _name, spec in twins}
+    bindings: dict[str, dict[str, str]] = {}
+    for twin_uuid, name, declared in all_twins:
+        stale = clear_device_paths(twin_uuid, declared)
+        device = bound.get(twin_uuid)
+        if twin_uuid in released or (twin_uuid in ignored and device is not None):
+            drivers = _drivers_without_param(twin_uuid, declared.fixed_field)
+            if drivers is not None:
+                pins.setdefault(twin_uuid, {})["drivers"] = drivers
+        if device is None:
+            if stale:
+                pins.setdefault(twin_uuid, {}).update(stale)
+            continue
+        effective = effective_of[twin_uuid]
+        if effective.fixed_field is not None:
+            values = {effective.fixed_field: effective.fixed_value}
+            if stale:
+                pins.setdefault(twin_uuid, {}).update(stale)
+        else:
+            values = hardware.render_bind(effective, device)
+            pins.setdefault(twin_uuid, {}).update(values)
+        if device.reachable:
+            for problem in hardware.verify_binding(effective, device, values):
+                console.print(f"[yellow]{name}: {escape(problem)}; binding it anyway.[/yellow]")
+        if device.mac:
+            pins.setdefault(twin_uuid, {})[hardware.MAC_METADATA_KEY] = device.mac
+        bindings[twin_uuid] = {
+            **values,
+            **({hardware.MAC_METADATA_KEY: device.mac} if device.mac else {}),
+        }
+    failed = _persist_twin_pins(pins)
+
+    def removal_note(twin_uuid: str, name: str) -> str | None:
+        if "drivers" not in pins.get(twin_uuid, {}):
+            return None
+        if twin_uuid in released:
+            return released[twin_uuid]
+        return (
+            f"Removed the placeholder param from {name}'s driver params, so this pin is what "
+            f"the driver uses."
+        )
+
+    console.print("\n[bold]Network devices[/bold]")
+    for twin_uuid, name, _spec in all_twins:
+        device = bound.get(twin_uuid)
+        note = removal_note(twin_uuid, name)
+        if device is None:
+            console.print(f"  {name} → [yellow]not pinned[/yellow]: {not_bound.get(twin_uuid, '')}")
+            if note:
+                console.print(f"    [dim]{note}[/dim]")
+            continue
+        values = {k: v for k, v in bindings[twin_uuid].items() if k != hardware.MAC_METADATA_KEY}
+        details = []
+        if device.mac:
+            details.append(
+                f"MAC {device.mac}" + (f" on {device.interface}" if device.interface else "")
+            )
+        fixed_field = effective_of[twin_uuid].fixed_field
+        if fixed_field is not None:
+            details.append(
+                f"set by {hardware.METADATA_ENV_PREFIX}{fixed_field.upper()}"
+                + ("" if device.mac else ", not checked")
+            )
+        shown = ", ".join(f"{k}={escape(redact_userinfo(v))}" for k, v in values.items())
+        console.print(f"  {name} → {shown} [dim]({'; '.join(details)})[/dim]")
+        if note:
+            console.print(f"    [dim]{note}[/dim]")
+        if twin_uuid in failed:
+            console.print(
+                "    [yellow]Used on this host (cameras.json), but the twin still holds its old "
+                "binding. Re-run: cyberwave edge install[/yellow]"
+            )
+    for device in spare:
+        console.print(f"  [dim]Not pinned to any twin: {escape(device.label())}[/dim]")
+    return bindings
+
+
+class _NetworkSearch(NamedTuple):
+    bound: dict[str, Any]
+    twins: list[tuple[str, str, Any]]  # with the spec each binding was made from
+    spare: list[Any]
+
+
+def _search_network_devices(
+    twins: list[tuple[str, str, Any]],
+    ports: list[Any],
+    not_bound: dict[str, str],
+    saved_mac: Callable[[str], str],
+    released: dict[str, str],
+) -> _NetworkSearch:
+    """Find each twin's device on the wired ports; why a twin stays unbound goes in *not_bound*."""
+    from .discovery import hardware, interfaces
+
+    mdns_services = sorted(
+        {s for _u, _n, spec in twins if spec.uses_mdns for s in spec.mdns_services}
+    )
+    arp_sweep = any(spec.sweeps for _u, _n, spec in twins)
+    targets = sorted({spec.ip_address for _u, _n, spec in twins if spec.ip_address})
+    probe_ports = sorted({p for _u, _n, spec in twins if spec.uses_ports for p in spec.tcp_ports})
+    timeout = max(spec.timeout for _u, _n, spec in twins)
+
+    def run_discovery(ports: list[Any]) -> list[Any]:
+        return hardware.discover(
+            ports,
+            mdns_services=mdns_services,
+            arp_sweep=arp_sweep,
+            targets=targets,
+            probe_ports=probe_ports,
+            timeout=timeout,
+        )
+
+    usable = [p for p in ports if p.carrier and p.has_ipv4]
+    where = ", ".join(
+        f"{p.name} ({', '.join(str(a) for a in p.addresses)})" for p in usable
+    ) or "no addressed port"
+    names = ", ".join(name for _uuid, name, _spec in twins)
+    console.print(f"\n[bold]Looking for {names}[/bold] [dim]on {where}[/dim]")
+    devices = run_discovery(ports)
+
+    unreachable = [
+        d
+        for d in devices
+        if not d.reachable and any(hardware.match_score(s, d) for _u, _n, s in twins)
+    ]
+    if unreachable and _offer_subnet_addresses(unreachable, devices, twins):
+        devices = run_discovery(interfaces.wired_interfaces())
+
+    twins = _one_twin_per_fixed_source(
+        twins,
+        devices,
+        saved_mac=saved_mac,
+        can_search=True,
+        not_bound=not_bound,
+        released=released,
+    )
+    bound: dict[str, Any] = {}
+    name_of = {twin_uuid: name for twin_uuid, name, _spec in twins}
+
+    def taken() -> set[str]:
+        return {d.key for d in bound.values()}
+
+    def free(for_twin: str | None = None) -> list[Any]:
+        """Devices no other twin holds: bound, at a fixed source's address, or with its MAC."""
+        on_source = [(u, s) for u, _n, s in twins if s.ip_address]
+        held_ips = {s.ip_address for _u, s in on_source}
+        held_macs = {saved_mac(u) for u, _s in on_source if u != for_twin} - {""}
+        unique: dict[str, Any] = {}
+        for d in sorted(devices, key=lambda d: not ipaddress.IPv4Address(d.ip).is_link_local):
+            if (
+                d.reachable
+                and d.ip not in held_ips
+                and d.mac not in held_macs
+                and d.key not in taken()
+            ):
+                unique[d.key] = d
+        return list(unique.values())
+
+    def candidates(twin_uuid: str, spec: Any) -> list[Any]:
+        fits = [d for d in free(twin_uuid) if hardware.match_score(spec, d)]
+        return sorted(fits, key=lambda d: -hardware.match_score(spec, d))
+
+    search_twins = [t for t in twins if t[2].fixed_field is None]
+    spec_of = {twin_uuid: spec for twin_uuid, _name, spec in search_twins}
+
+    for twin_uuid, name, spec in search_twins:
+        saved = saved_mac(twin_uuid)
+        device = next((d for d in candidates(twin_uuid, spec) if saved and d.mac == saved), None)
+        if device is not None:
+            bound[twin_uuid] = device
+            console.print(f"[green]{name}[/green]: using its saved device {escape(device.label())}")
+
+    unresolved: set[str] = set()
+    while True:
+        pending = [u for u, _n, _s in search_twins if u not in bound and u not in unresolved]
+        if not pending:
+            break
+        pool = {d.key: d for d in devices if d.reachable}
+        inferred = _infer_associations(
+            pending,
+            list(pool),
+            claimed=set(pool) - {d.key for d in free()},
+            compatible=lambda twin_uuid, key: (
+                hardware.match_score(spec_of[twin_uuid], pool[key]) > 0
+            ),
+        )
+        for twin_uuid, name, _spec in search_twins:
+            if twin_uuid in inferred.assigned:
+                key, why = inferred.assigned[twin_uuid]
+                bound[twin_uuid] = pool[key]
+                console.print(f"[green]{name}[/green]: found {escape(pool[key].label())} — {why}.")
+        if inferred.assigned:
+            continue
+        twin_uuid, name, spec = next(t for t in search_twins if t[0] in pending)
+        options = candidates(twin_uuid, spec)
+        rivals = [
+            name_of[u]
+            for u in pending
+            if u != twin_uuid and any(hardware.match_score(spec_of[u], d) for d in options)
+        ]
+        chosen = _prompt_network_device(name, options, rivals) if options else None
+        if chosen is None:
+            unresolved.add(twin_uuid)
+        else:
+            bound[twin_uuid] = chosen
+
+    for index, (twin_uuid, name, spec) in enumerate(twins):
+        if spec.fixed_field is None:
+            continue
+        if spec.ip_address is None:
+            bound[twin_uuid] = hardware.NetworkDevice(ip="", interface="", reachable=False)
+            continue
+        source = escape(redact_userinfo(spec.fixed_source))
+        at_source = next((d for d in devices if d.ip == spec.ip_address), None)
+        if at_source is None:
+            at_source = hardware.NetworkDevice(ip=spec.ip_address, interface="", reachable=False)
+        saved = saved_mac(twin_uuid)
+        confirmed = bool(saved) and at_source.mac == saved
+        others = [] if confirmed else candidates(twin_uuid, spec)
+        chosen = None
+        if others:
+            chosen = _prompt_source_or_device(name, source, at_source, others, saved)
+        if chosen is not None:
+            bound[twin_uuid] = chosen
+            twins[index] = (twin_uuid, name, spec.without_fixed_source())
+            param = f"{hardware.METADATA_ENV_PREFIX}{spec.fixed_field.upper()}"
+            released[twin_uuid] = (
+                f"Removed {param} from {name}'s driver params: the device chosen on the wire "
+                f"replaces it."
+            )
+            continue
+        bound[twin_uuid] = at_source
+        if not at_source.mac:
+            console.print(
+                f"[yellow]{name}: nothing answers at {spec.ip_address}, the address set by "
+                f"{source}.[/yellow]"
+            )
+        elif saved and at_source.mac != saved:
+            console.print(
+                f"[yellow]{name}: the device at {spec.ip_address} has MAC {at_source.mac}, not "
+                f"the {saved} saved on the twin. Check that the address is right.[/yellow]"
+            )
+
+    for twin_uuid, _name, spec in search_twins:
+        if twin_uuid in bound:
+            continue
+        seen = [d for d in devices if not d.reachable and hardware.match_score(spec, d)]
+        fits = {d.key for d in devices if d.reachable and hardware.match_score(spec, d)}
+        unfree = fits - {d.key for d in free()}
+        if seen:
+            not_bound[twin_uuid] = (
+                f"seen at {', '.join(d.ip for d in seen)} but cannot be reached from this host"
+            )
+        elif fits and unfree == fits:
+            holders = sorted({name_of[u] for u, d in bound.items() if d.key in unfree})
+            not_bound[twin_uuid] = (
+                f"every matching device found is pinned to another twin ({', '.join(holders)})"
+            )
+        elif not fits:
+            not_bound[twin_uuid] = (
+                "was not found on the wired network; check that it is powered and connected, "
+                "then re-run install"
+            )
+        else:
+            not_bound[twin_uuid] = "no device was chosen"
+
+    spare = [d for d in free() if any(hardware.match_score(s, d) for _u, _n, s in twins)]
+    return _NetworkSearch(bound, twins, spare)
+
+
+def _record_network_twin_sources(bindings: Mapping[str, Mapping[str, str]] | None = None) -> None:
+    """Write each network camera twin's stream URL into ``cameras.json``.
+
+    Edge-core gives a twin missing there the global ``selected_device``, a USB camera.
+    """
+    camera_uuids = {twin_uuid for twin_uuid, _name in _list_camera_twins()}
+    network = {u: spec for u, _name, spec in _list_network_twins() if u in camera_uuids}
+    if not network:
+        return
+    metadata = _cached_twin_metadata()
+    path = CONFIG_DIR / "cameras.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    mapping = dict(data.get("twin_to_device") or {})
+    for twin_uuid, spec in network.items():
+        bound = (bindings or {}).get(twin_uuid, {})
+        usable = spec.fixed_field == "video_device" and spec.fixed_problem is None
+        fixed = spec.fixed_value if usable else None
+        source = (
+            bound.get("video_device") or fixed or metadata.get(twin_uuid, {}).get("video_device")
+        )
+        if isinstance(source, str) and "://" in source:
+            mapping[twin_uuid] = source
+        else:
+            mapping.pop(twin_uuid, None)
+    if mapping != (data.get("twin_to_device") or {}):
+        data.setdefault("devices", [])
+        if mapping:
+            data["twin_to_device"] = mapping
+        else:
+            data.pop("twin_to_device", None)
+        atomic_write_json(path, data, mode=0o644)
+        chown_to_sudo_user(path)
+    _sync_network_sources_to_edge_cameras(set(network), mapping)
+
+
+def _sync_network_sources_to_edge_cameras(
+    network_uuids: set[str], mapping: Mapping[str, Any]
+) -> None:
+    """Carry the network twins' entries into edge.json's cameras; the other entries stay.
+
+    Edge-core takes edge.json's entry over cameras.json's for every twin edge.json lists.
+    """
+    try:
+        data = json.loads((CONFIG_DIR / "edge.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    metadata = data.get("metadata") if isinstance(data, dict) else None
+    cameras = metadata.get("cameras") if isinstance(metadata, dict) else None
+    if not isinstance(cameras, dict) or not cameras:
+        return
+    current = cameras.get("twin_to_device")
+    current = dict(current) if isinstance(current, dict) else {}
+    wanted = {u: v for u, v in current.items() if u not in network_uuids}
+    wanted.update({u: mapping[u] for u in network_uuids if u in mapping})
+    if wanted == current:
+        return
+    updated = {k: v for k, v in cameras.items() if k != "twin_to_device"}
+    if wanted:
+        updated["twin_to_device"] = wanted
+    if not _upload_cameras_to_edge_metadata(updated):
+        _mirror_cameras_into_edge_json(updated)
 
 
 def _detect_and_select_cameras() -> None:
-    """Discover cameras and prompt the user to map them to camera-bearing twins.
+    """Bind each camera twin to one attached camera, pin it on the twin, write the mapping."""
+    from .device_utils import discover_usb_cameras, no_camera_hint, write_cameras_json
 
-    When a single camera twin is connected, the user is prompted once (matching
-    the historical single-select behaviour).  When multiple camera twins are
-    connected alongside multiple physical cameras, the user is walked through a
-    per-twin mapping so each twin ends up bound to a specific ``/dev/video*``
-    device.
-
-    A twin that already pins ``metadata.serial_number`` is never prompted for:
-    the serial names the physical unit, and the discovery pass reports the same
-    serial per device, so the binding is computed rather than asked.  Twins
-    without one are prompted as before, and their answer is written back as a
-    serial so the question is asked at most once per camera.
-
-    Best-effort: failures are logged but never block installation.
-    """
-    from .device_utils import discover_usb_cameras, write_cameras_json
+    all_camera_twins = _list_camera_twins()
+    network_twins = {u for u, _n in all_camera_twins if _twin_network_spec(u) is not None}
+    if all_camera_twins and len(network_twins) == len(all_camera_twins):
+        return
 
     cameras = discover_usb_cameras()
     if not cameras:
         console.print(
-            "[dim]No cameras detected. You can add one later: cyberwave edge cameras[/dim]"
+            "[dim]No cameras detected. After connecting a camera, check: cyberwave edge cameras[/dim]"
         )
+        hint = no_camera_hint()
+        if hint:
+            console.print(f"[dim]{escape(hint)}[/dim]")
         return
 
-    camera_twins = _list_camera_twins()
+    camera_twins = [(u, escape(n)) for u, n in all_camera_twins if u not in network_twins]
     twin_serials = _load_twin_camera_serials()
     twin_devices = _load_twin_camera_devices()
+    had_pin = set(twin_serials) | set(twin_devices)
+    remapped = False
     default_idx = cameras[0].index if cameras[0].index is not None else 0
     cameras_by_index: dict[int, Any] = {
         (cam.index if cam.index is not None else i): cam for i, cam in enumerate(cameras)
     }
-    # Serials learned from manual answers, pinned back onto their twins below.
-    learned_serials: dict[str, str] = {}
+    pins: dict[str, dict[str, str]] = {}
+    units = _camera_units(cameras)
+    unit_by_index = {
+        (cam.index if cam.index is not None else i): units[i] for i, cam in enumerate(cameras)
+    }
+    no_unit = _UsbUnit(None, False, False)
+    pin_problem: dict[str, str] = {}
 
-    def _serial_of(index: int) -> str | None:
-        """The discovered serial for a chosen menu index, when it reports one."""
+    def _default_camera_for(twin_uuid: str, free: list[int]) -> int | None:
+        want_depth = _twin_has_depth_sensor(twin_uuid)
+        words = _twin_model_words(twin_uuid)
+        best: tuple[int, int] | None = None
+        for position, idx in enumerate(free):
+            card = (cameras_by_index[idx].card or "").lower()
+            if (("realsense" in card) or ("depth" in card)) != want_depth:
+                continue
+            score = sum(1 for w in words if w in card)
+            if best is None or score > best[0]:
+                best = (score, position)
+        return free[best[1]] if best else None
+
+    def _identity_of(index: int) -> str | None:
         cam = cameras_by_index.get(index)
-        value = (getattr(cam, "serial", None) or "").strip() if cam is not None else ""
-        return value or None
+        if cam is None:
+            return None
+        unit = unit_by_index.get(index, no_unit)
+        return unit.pin or (getattr(cam, "serial", None) or "").strip() or None
+
+    def _device_for(index: int) -> int | str:
+        """The pin path when there is one: an index here would override the twin's pin."""
+        return unit_by_index.get(index, no_unit).pin or index
+
+    def _explain_unpinnable(index: int) -> None:
+        reason = (
+            "is identical to another attached unit and has no USB port link either"
+            if unit_by_index.get(index, no_unit).collided
+            else "exposes no stable udev name, USB port link or serial"
+        )
+        console.print(
+            f"[yellow]This camera {reason}, so it cannot be pinned; "
+            f"it will be asked again on the next install.[/yellow]"
+        )
+
+    def _record(twin_uuid: str, index: int) -> bool:
+        identity = _identity_of(index)
+        if identity:
+            pins[twin_uuid] = _camera_pin_metadata(identity)
+        return bool(identity)
+
+    def _record_choice(twin_uuid: str, index: int) -> None:
+        """Pin a manual choice, or clear the twin's old pin: the driver would still honour it."""
+        if _record(twin_uuid, index):
+            return
+        _explain_unpinnable(index)
+        if twin_uuid in had_pin:
+            console.print(
+                "[dim]Clearing the twin's previous camera pin so the new choice "
+                "is the one that applies.[/dim]"
+            )
+            pins[twin_uuid] = {"serial_number": "", "video_device": ""}
 
     def _warn_unmatched_serial(twin_name: str, serial: str) -> None:
         console.print(
-            f"[yellow]{twin_name} pins serial {serial}, which no attached camera "
+            f"[yellow]{twin_name} pins serial {escape(serial)}, which no attached camera "
             f"reports.[/yellow]\n"
             f"[dim]Its driver will refuse to start rather than open a different "
             f"camera. Check the twin's metadata.serial_number.[/dim]"
@@ -4037,7 +5347,7 @@ def _detect_and_select_cameras() -> None:
 
     def _warn_unverifiable_serial(twin_name: str, serial: str) -> None:
         console.print(
-            f"[dim]{twin_name} pins serial {serial}, which this host cannot "
+            f"[dim]{twin_name} pins serial {escape(serial)}, which this host cannot "
             f"verify — a depth camera's librealsense serial is not visible to "
             f"v4l2. Leaving it to the driver, which will fail rather than open "
             f"a different camera if the value is wrong.[/dim]"
@@ -4045,13 +5355,29 @@ def _detect_and_select_cameras() -> None:
 
     def _warn_unmatched_device(twin_name: str, device: str) -> None:
         console.print(
-            f"[yellow]{twin_name} pins device {device}, which does not resolve on "
-            f"this host.[/yellow]\n"
+            f"[yellow]{twin_name} pins device {escape(redact_userinfo(device))}, which does not "
+            f"resolve on this host.[/yellow]\n"
             f"[dim]Its driver will refuse to start rather than open a different "
             f"camera. Check the twin's metadata.video_device.[/dim]"
         )
 
+    def _warn_shared_name(twin_name: str, twin_uuid: str, path: str) -> None:
+        pin_problem[twin_uuid] = (
+            "saved id is shared by identical cameras and may point at either after a replug"
+        )
+
+    def _shared_by_id(path: str, index: int) -> bool:
+        return path.startswith(_V4L_BY_ID_DIR + "/") and unit_by_index.get(index, no_unit).collided
+
+    pin_cache: dict[str, _CameraPin | None] = {}
+
     def _pinned_camera(twin_uuid: str, twin_name: str) -> _CameraPin | None:
+        """Memoised so a mismatch is warned about once."""
+        if twin_uuid not in pin_cache:
+            pin_cache[twin_uuid] = _resolve_pin(twin_uuid, twin_name)
+        return pin_cache[twin_uuid]
+
+    def _resolve_pin(twin_uuid: str, twin_name: str) -> _CameraPin | None:
         """How a twin that already names its camera should be bound.
 
         Returns ``None`` when the twin is unpinned, or pinned to hardware this
@@ -4071,11 +5397,15 @@ def _detect_and_select_cameras() -> None:
         if serial:
             matched = _camera_index_for_serial(cameras, serial)
             if matched is not None:
-                # The index is safe to persist here: the driver resolves the
-                # twin's own ``metadata.serial_number`` first and never reaches
-                # the injected video device.
-                return _CameraPin(f"serial {serial}", matched, matched)
-            if _twin_has_depth_sensor(twin_uuid):
+                name = _udev_pin_name(serial, _V4L_BY_ID_DIR)
+                if name is not None:
+                    path = f"{_V4L_BY_ID_DIR}/{name}"
+                    if _shared_by_id(path, matched):
+                        _warn_shared_name(twin_name, twin_uuid, path)
+                        return None
+                    return _CameraPin(f"serial {escape(serial)}", matched, path, migrate=name)
+                return _CameraPin(f"serial {escape(serial)}", matched, matched)
+            if _twin_has_depth_sensor(twin_uuid) and not _looks_like_udev_name(serial):
                 # A depth camera reports two unrelated serials: the USB
                 # descriptor one that ``v4l2-ctl`` gives us, and librealsense's
                 # own, which nothing on this host can read. So a serial we
@@ -4096,7 +5426,7 @@ def _detect_and_select_cameras() -> None:
                 # The tag tells edge-core this is hardware identity, not a
                 # video source, so it injects no device at all.
                 return _CameraPin(
-                    f"serial {serial} (verified by driver)",
+                    f"serial {escape(serial)} (verified by driver)",
                     None,
                     f"{_SERIAL_PIN_PREFIX}{serial}",
                 )
@@ -4106,10 +5436,13 @@ def _detect_and_select_cameras() -> None:
         device = twin_devices.get(twin_uuid)
         if device:
             if not _is_local_stable_camera_device(device):
-                return _CameraPin(f"source {device}", None, device)
+                return _CameraPin(f"source {escape(redact_userinfo(device))}", None, device)
             matched = _camera_index_for_device(cameras, device)
             if matched is not None:
-                return _CameraPin(f"device {device}", matched, device)
+                if _shared_by_id(device, matched):
+                    _warn_shared_name(twin_name, twin_uuid, device)
+                    return None
+                return _CameraPin(device, matched, device)
             _warn_unmatched_device(twin_name, device)
         return None
 
@@ -4129,17 +5462,100 @@ def _detect_and_select_cameras() -> None:
             cameras_data["selected_device"] = selected_index
         if twin_to_device:
             cameras_data["twin_to_device"] = {str(k): v for k, v in twin_to_device.items()}
-        _upload_cameras_to_edge_metadata(cameras_data)
+        if not _upload_cameras_to_edge_metadata(cameras_data):
+            _mirror_cameras_into_edge_json(cameras_data)
 
-    # Single physical camera: auto-assign to every camera twin.
-    if len(cameras) == 1:
+    def _pin_and_save(
+        selected_index: int | None, twin_to_device: dict[str, int | str] | None
+    ) -> None:
+        """Write the twin pins, then the mapping, which this host uses even where a pin failed."""
+        _spare_shared_serials(pins, lambda s: _camera_index_for_serial(cameras, s) is not None)
+        failed = _persist_twin_pins(pins)
+        _save_cameras(selected_index, twin_to_device)
+        for uuid_, name in camera_twins:
+            if uuid_ in failed:
+                console.print(
+                    f"[yellow]{name} uses its new camera on this host (cameras.json), but the "
+                    f"twin still holds its old pin. Re-run: cyberwave edge install[/yellow]"
+                )
+
+    def _accept_pin(twin_uuid: str, pin: _CameraPin | None) -> None:
+        if pin is not None and pin.migrate:
+            pins.setdefault(twin_uuid, _camera_pin_metadata(pin.migrate))
+
+    def _infer_cameras(
+        done: frozenset[str] = frozenset(), taken: frozenset[int] = frozenset()
+    ) -> dict[str, tuple[int, str]]:
+        claimed: set[int] = set(taken)
+        pending: list[str] = []
+        for uuid_, name in camera_twins:
+            if uuid_ in done:
+                continue
+            pin = _pinned_camera(uuid_, name)
+            if pin is None:
+                pending.append(uuid_)
+            elif pin.index is not None:
+                claimed.add(pin.index)
+        result = _infer_associations(
+            pending, list(cameras_by_index), claimed=claimed, compatible=lambda _t, _i: True
+        )
+        return dict(result.assigned.items())
+
+    def _saved_pin_source(twin_uuid: str) -> str:
+        """The twin's own pin in cameras.json form; a serial outranks a device."""
+        if twin_uuid in twin_serials:
+            return f"{_SERIAL_PIN_PREFIX}{twin_serials[twin_uuid]}"
+        return twin_devices[twin_uuid]
+
+    def _bind_inferred(
+        twin_uuid: str, twin_name: str, index: int, why: str, *, rebind_on_eof: bool = False
+    ) -> bool:
+        """Queue an automatic pairing; a stale pin moves on approval, or on EOF with *rebind_on_eof*."""
+        if twin_uuid in twin_serials or twin_uuid in twin_devices:
+            cam = cameras_by_index[index]
+            try:
+                approved = bool(
+                    Confirm.ask(
+                        f"{twin_name}'s saved camera "
+                        f"{pin_problem.get(twin_uuid, 'is not attached')}. Bind it to "
+                        f"{escape(str(cam.card))} ({escape(str(_identity_of(index)))}) instead?",
+                        default=True,
+                    )
+                )
+            except EOFError:
+                approved = rebind_on_eof
+                if approved:
+                    console.print(
+                        f"[yellow]No input available: {twin_name} moves from its saved camera, "
+                        f"which is not attached, to the only camera attached.[/yellow]"
+                    )
+            if not approved:
+                console.print(
+                    f"[yellow]{twin_name} stays pinned to its saved camera; edge-core will "
+                    f"not start its driver until that camera is reconnected or you "
+                    f"re-run install.[/yellow]"
+                )
+                return False
+        _record_choice(twin_uuid, index)
+        console.print(
+            f"[green]{twin_name}[/green]: associated automatically with "
+            f"[cyan]{escape(str(_identity_of(index) or cameras_by_index[index].card))}[/cyan]"
+            f" — {why}."
+        )
+        return True
+
+    if len(cameras) == 1 and len(camera_twins) <= 1:
         cam = cameras[0]
         selected = cam.index if cam.index is not None else 0
-        console.print(f"\n[cyan]Detected camera:[/cyan] {cam.card} ({cam.primary_path})")
+        console.print(
+            f"\n[cyan]Detected camera:[/cyan] {escape(str(cam.card))} ({cam.primary_path})"
+        )
         twin_to_device: dict[str, int | str] = {}
         shared = 0
+        inferred = _infer_cameras()
         for twin_uuid, twin_name in camera_twins:
             pin = _pinned_camera(twin_uuid, twin_name)
+            _accept_pin(twin_uuid, pin)
             # A stream-pinned twin needs no local device, but it cannot simply
             # be left out of the mapping either: edge-core falls back to the
             # global ``selected_device`` for any twin it cannot find there, so
@@ -4149,139 +5565,655 @@ def _detect_and_select_cameras() -> None:
                 console.print(f"[dim]{twin_name} is served by {pin.label}.[/dim]")
                 twin_to_device[twin_uuid] = pin.device
                 continue
-            twin_to_device[twin_uuid] = pin.device if pin is not None else selected
+            if pin is None and twin_uuid in inferred:
+                if not _bind_inferred(
+                    twin_uuid, twin_name, *inferred[twin_uuid], rebind_on_eof=True
+                ):
+                    twin_to_device[twin_uuid] = _saved_pin_source(twin_uuid)
+                    continue
+            twin_to_device[twin_uuid] = pin.device if pin is not None else _device_for(selected)
             shared += 1
-        if shared > 1:
-            console.print(
-                f"[dim]All {shared} camera twin(s) will share this device.[/dim]"
-            )
-        _save_cameras(selected, twin_to_device or None)
+        if shared and not pins and not _identity_of(selected):
+            _explain_unpinnable(selected)
+        _pin_and_save(selected, twin_to_device or None)
         return
 
-    # Single camera twin (or none known) with multiple cameras: keep the legacy
-    # single-select flow so existing scripted installs remain unchanged.
-    if len(camera_twins) <= 1:
-        if camera_twins:
-            twin_uuid, twin_name = camera_twins[0]
-            pin = _pinned_camera(twin_uuid, twin_name)
-            if pin is not None:
-                if pin.index is None:
-                    console.print(
-                        f"\n[green]{twin_name}[/green] is served by [cyan]{pin.label}"
-                        f"[/cyan] — no local camera to map."
-                    )
-                    # Persist the source rather than returning early: a
-                    # cameras.json left over from a previous install would
-                    # otherwise keep steering this twin at a local device.
-                    _save_cameras(None, {twin_uuid: pin.device})
-                    return
-                console.print(
-                    f"\n[green]{twin_name}[/green] is pinned to "
-                    f"[cyan]{pin.label}[/cyan] — bound to "
-                    f"{cameras_by_index[pin.index].primary_path} automatically."
-                )
-                _save_cameras(pin.index, {twin_uuid: pin.device})
-                return
+    if not camera_twins:
         console.print(f"\n[bold]Detected {len(cameras)} camera(s):[/bold]\n")
         valid_indices = _render_camera_menu(cameras)
         console.print()
         selected = _prompt_camera_index(
-            cameras,
-            valid_indices,
-            prompt="Select camera",
-            default_index=default_idx,
+            cameras, valid_indices, prompt="Select camera", default_index=default_idx
         )
-        if selected is None:
-            return
-        console.print(f"[green]Selected:[/green] {valid_indices[selected].card}")
-        twin_to_device = {camera_twins[0][0]: selected} if camera_twins else {}
-        if camera_twins:
-            learned = _serial_of(selected)
-            # Mirror the multi-twin guard: a twin pinned by ``video_device``
-            # has already answered "which camera". Writing a learned serial
-            # over it would re-pin it to whatever was picked while its own
-            # camera was unplugged, and the driver prefers serial_number.
-            chosen_twin = camera_twins[0][0]
-            if learned and chosen_twin not in twin_serials and chosen_twin not in twin_devices:
-                _persist_twin_serial_numbers({chosen_twin: learned})
-        _save_cameras(selected, twin_to_device or None)
+        if selected is not None and selected != _SKIP:
+            console.print(f"[green]Selected:[/green] {escape(str(valid_indices[selected].card))}")
+            _save_cameras(selected, None)
         return
 
-    # Multiple camera twins AND multiple cameras: map each twin to a camera.
-    console.print(
-        f"\n[bold]Detected {len(cameras)} camera(s) and {len(camera_twins)} camera twin(s).[/bold]"
-    )
-    console.print(
-        "[dim]Map each twin to the physical camera it is wired to. "
-        "A device can be assigned to more than one twin if it is shared.[/dim]\n"
-    )
+    pinned_twins = [(u, n) for u, n in camera_twins if u in had_pin]
+    if pinned_twins and len(cameras) > 1:
+        console.print("\n[bold]Existing camera bindings found:[/bold]")
+        for uuid_, name in pinned_twins:
+            pin = _pinned_camera(uuid_, name)
+            if pin is None:
+                reason = pin_problem.get(uuid_)
+                console.print(
+                    f"  {name}: [yellow]{reason}; choose again (it will be pinned by USB "
+                    f"port)[/yellow]"
+                    if reason
+                    else f"  {name}: [yellow]pinned camera not attached[/yellow]"
+                )
+            elif pin.index is None:
+                console.print(f"  {name}: served by {pin.label}")
+            else:
+                how = _short_link(pin.device) if isinstance(pin.device, str) else pin.label
+                node = os.path.basename(cameras_by_index[pin.index].primary_path or "")
+                console.print(f"  {name}: {how} -> {node}")
+        if not _ask_yes_no("Keep these existing camera bindings?"):
+            remapped = True
+            twin_serials.clear()
+            twin_devices.clear()
+            pin_cache.clear()
+            console.print(
+                "[dim]Re-mapping cameras manually; new choices replace the old pins.[/dim]"
+            )
 
-    twin_to_device: dict[str, int | str] = {}
-    assignments_label: dict[int, str] = {}
+    console.print(
+        f"\n[bold]Detected {len(cameras)} camera(s) and {len(camera_twins)} "
+        f"camera twin(s).[/bold] "
+        "[dim]Each camera serves one twin; answer s to leave a twin without one.[/dim]"
+    )
+    menu_indices = _render_camera_menu(cameras)
+    console.print()
+
+    twin_to_device = {}
+    reserved: dict[int, str] = {}
+    dup_pins: set[str] = set()
+    for uuid_, name in camera_twins:
+        saved_pin = _pinned_camera(uuid_, name)
+        if saved_pin is not None and saved_pin.index is not None:
+            if saved_pin.index in reserved:
+                dup_pins.add(uuid_)
+            else:
+                reserved[saved_pin.index] = name
+    assignments_label: dict[int, str] = dict(reserved)
     first_selected: int | None = None
-    remaining_default = default_idx
+    bound: dict[str, int] = {}
+    prompts_closed = False
 
-    def _advance_default() -> None:
-        """Prefer an unassigned device as the next prompt's default."""
-        nonlocal remaining_default
-        remaining = [idx for idx in cameras_by_index if idx not in assignments_label]
-        if remaining:
-            remaining_default = remaining[0]
+    def _claim(twin_uuid: str, twin_name: str, index: int) -> None:
+        nonlocal first_selected
+        assignments_label.setdefault(index, twin_name)
+        bound[twin_uuid] = index
+        if first_selected is None:
+            first_selected = index
 
     for twin_uuid, twin_name in camera_twins:
         console.print(f"[bold]Twin:[/bold] {twin_name} [dim]({twin_uuid[:8]}...)[/dim]")
 
-        pinned = twin_uuid in twin_serials or twin_uuid in twin_devices
         pin = _pinned_camera(twin_uuid, twin_name)
+        _accept_pin(twin_uuid, pin)
+        if pin is not None and twin_uuid in dup_pins:
+            console.print(
+                f"[yellow]{twin_name}'s saved camera is already bound to "
+                f"{reserved[pin.index]}: a camera serves one twin.[/yellow]"
+            )
+            pin_problem[twin_uuid] = "is already bound to another twin"
+            pin = None
         if pin is not None:
+            twin_to_device[twin_uuid] = pin.device
             if pin.index is None:
-                # Recorded, not skipped -- see the single-camera branch: an
-                # absent mapping inherits the global ``selected_device``.
-                twin_to_device[twin_uuid] = pin.device
                 console.print(f"[green]Served by[/green] [cyan]{pin.label}[/cyan]\n")
                 continue
-            twin_to_device[twin_uuid] = pin.device
-            assignments_label[pin.index] = twin_name
-            if first_selected is None:
-                first_selected = pin.index
-            _advance_default()
+            _claim(twin_uuid, twin_name, pin.index)
             console.print(
-                f"[green]Bound by[/green] [cyan]{pin.label}[/cyan] → "
+                f"[green]Using saved device[/green] [cyan]{pin.label}[/cyan] (connected) → "
                 f"{cameras_by_index[pin.index].primary_path}\n"
             )
             continue
 
-        valid_indices = _render_camera_menu(cameras, assignments=assignments_label)
-        console.print()
-        selected = _prompt_camera_index(
-            cameras,
-            valid_indices,
-            prompt=f"Camera for {twin_name}",
-            default_index=remaining_default,
+        inferred = _infer_cameras(
+            done=frozenset(twin_to_device), taken=frozenset(assignments_label)
         )
+        if twin_uuid in inferred and _bind_inferred(twin_uuid, twin_name, *inferred[twin_uuid]):
+            index = inferred[twin_uuid][0]
+            twin_to_device[twin_uuid] = _device_for(index)
+            _claim(twin_uuid, twin_name, index)
+            console.print()
+            continue
+
+        free = [i for i in cameras_by_index if i not in assignments_label]
+        if prompts_closed:
+            selected = None
+        elif free:
+            valid_indices = menu_indices
+            console.print(f"  [dim]free: {', '.join(map(str, free))}  (s = none)[/dim]")
+            for _attempt in range(3):
+                selected = _prompt_camera_index(
+                    cameras,
+                    valid_indices,
+                    prompt=f"Camera for {twin_name}",
+                    default_index=_default_camera_for(twin_uuid, free),
+                )
+                if selected is None or selected == _SKIP or selected in free:
+                    break
+                console.print(
+                    f"[yellow]{escape(str(cameras_by_index[selected].card))} is already bound "
+                    f"to {assignments_label[selected]}: choose another camera, or s.[/yellow]"
+                )
+            else:
+                selected = None
+        else:
+            selected = _SKIP
+            console.print(f"[yellow]No free camera is left for {twin_name}.[/yellow]")
         if selected is None:
+            if not prompts_closed:
+                prompts_closed = True
+                console.print(
+                    "[yellow]No valid answer: the remaining twins are not asked and keep "
+                    "their saved pins.[/yellow]"
+                )
+            if twin_uuid in twin_serials or twin_uuid in twin_devices:
+                twin_to_device[twin_uuid] = _saved_pin_source(twin_uuid)
+            continue
+        if selected == _SKIP:
+            if twin_uuid in dup_pins and twin_uuid not in twin_serials:
+                pins[twin_uuid] = {"serial_number": "", "video_device": ""}
+                console.print(
+                    f"[yellow]{twin_name}'s saved camera pin is cleared: that camera "
+                    f"belongs to another twin.[/yellow]\n"
+                )
+            elif twin_uuid in twin_serials or twin_uuid in twin_devices:
+                twin_to_device[twin_uuid] = _saved_pin_source(twin_uuid)
+                console.print(f"[yellow]{twin_name} keeps its saved camera pin.[/yellow]\n")
+            elif remapped and twin_uuid in had_pin:
+                pins[twin_uuid] = {"serial_number": "", "video_device": ""}
+                console.print(
+                    f"[yellow]{twin_name}'s old camera pin is cleared; it is left without "
+                    f"a camera.[/yellow]\n"
+                )
+            else:
+                console.print(f"[yellow]{twin_name} is left without a camera.[/yellow]\n")
+            continue
+        twin_to_device[twin_uuid] = _device_for(selected)
+        _claim(twin_uuid, twin_name, selected)
+        _record_choice(twin_uuid, selected)
+        console.print()
+
+    without = [n for u, n in camera_twins if u not in twin_to_device]
+    if without:
+        fallback = (
+            f"{escape(str(cameras_by_index[first_selected].card))}, "
+            f"{cameras_by_index[first_selected].primary_path}"
+            if first_selected is not None
+            else "/dev/video0"
+        )
+        console.print(
+            f"[yellow]{len(without)} camera twin(s) have no physical camera: "
+            f"{', '.join(without)}. They are not pinned, so edge-core starts them on the "
+            f"default camera ({fallback}), which may be another twin's.[/yellow]"
+        )
+
+    def _where(i: int, cam: Any) -> str:
+        unit = unit_by_index.get(i, no_unit)
+        return _short_link(unit.pin) if unit.pin else _camera_identity_hint(cam, unit)
+
+    if bound:
+        console.print("\n[bold]Cameras[/bold]")
+        for uuid_, index in bound.items():
+            cam, unit = cameras_by_index[index], unit_by_index.get(index, no_unit)
+            how = _where(index, cam)
+            note = "  [yellow](pinned by USB port)[/yellow]" if unit.by_port else ""
             console.print(
-                "[yellow]Skipping remaining twin mappings; edge will fall back "
-                "to /dev/video0 for unmapped twins.[/yellow]"
+                f"  {dict(camera_twins)[uuid_]} → {escape(str(cam.card))}  "
+                f"[dim]{os.path.basename(cam.primary_path or '')} · {how}[/dim]{note}"
             )
-            break
-        twin_to_device[twin_uuid] = selected
-        assignments_label[selected] = twin_name
-        if first_selected is None:
-            first_selected = selected
-        if not pinned:
-            learned = _serial_of(selected)
-            if learned:
-                learned_serials[twin_uuid] = learned
-        _advance_default()
-        console.print(f"[green]Selected:[/green] {valid_indices[selected].card}\n")
+    unused = [
+        f"{escape(str(c.card))} ({_where(i, c)})"
+        for i, c in cameras_by_index.items()
+        if i not in assignments_label
+    ]
+    if unused:
+        console.print(
+            f"[yellow]{len(unused)} camera(s) are not used by any twin: "
+            f"{', '.join(unused)}.[/yellow]"
+        )
 
     if not twin_to_device:
         console.print("[yellow]No cameras mapped — skipping camera config.[/yellow]")
+        if pins:
+            _spare_shared_serials(pins, lambda s: _camera_index_for_serial(cameras, s) is not None)
+            _persist_twin_pins(pins)
         return
 
-    _persist_twin_serial_numbers(learned_serials)
-    _save_cameras(first_selected, twin_to_device)
+    _pin_and_save(first_selected, twin_to_device)
+
+
+_PROC_ASOUND_DIR = "/proc/asound"
+
+
+class _AudioCard(NamedTuple):
+    """One USB audio card: ``link`` is its by-id name."""
+
+    index: int
+    usbid: str
+    label: str
+    link: str | None
+    unit: _UsbUnit
+    capture: bool
+    playback: bool
+
+    @property
+    def pin(self) -> str | None:
+        return self.unit.pin
+
+
+def _discover_usb_audio_cards() -> list[_AudioCard]:
+    by_id: dict[str, str] = {}
+    for device in _list_alsa_by_id():
+        by_id.setdefault(os.path.basename(device.target), device.name)
+    by_path: dict[str, str] = {}
+    for device in _list_udev_links(_ALSA_BY_PATH_DIR):
+        by_path.setdefault(os.path.basename(device.target), device.name)
+    try:
+        entries = sorted(os.listdir(_PROC_ASOUND_DIR))
+    except OSError:
+        return []
+    found: list[tuple[int, str, str, bool, bool]] = []
+    for entry in entries:
+        match = re.fullmatch(r"card(\d+)", entry)
+        if not match:
+            continue
+        card_dir = os.path.join(_PROC_ASOUND_DIR, entry)
+        try:
+            with open(os.path.join(card_dir, "usbid"), encoding="utf-8") as fh:
+                usbid = fh.read().strip()
+        except OSError:
+            continue
+        try:
+            with open(os.path.join(card_dir, "id"), encoding="utf-8") as fh:
+                label = fh.read().strip() or entry
+        except OSError:
+            label = entry
+        try:
+            pcms = os.listdir(card_dir)
+        except OSError:
+            pcms = []
+        found.append(
+            (
+                int(match.group(1)),
+                usbid,
+                label,
+                any(re.fullmatch(r"pcm\d+c", n) for n in pcms),
+                any(re.fullmatch(r"pcm\d+p", n) for n in pcms),
+            )
+        )
+    keys = [_udev_properties(f"/dev/snd/controlC{i}").get("ID_SERIAL") for i, *_ in found]
+    collided = _collided(
+        keys, [(usbid, f"controlC{i}" in by_id) for i, usbid, *_ in found]
+    )
+    return [
+        _AudioCard(
+            index=i,
+            usbid=usbid,
+            label=label,
+            link=by_id.get(f"controlC{i}"),
+            unit=_usb_unit(
+                by_id.get(f"controlC{i}"), by_path.get(f"controlC{i}"), collided[n], _alsa_trees()
+            ),
+            capture=capture,
+            playback=playback,
+        )
+        for n, (i, usbid, label, capture, playback) in enumerate(found)
+    ]
+
+
+def _cached_twin_metadata() -> dict[str, dict[str, Any]]:
+    found: dict[str, dict[str, Any]] = {}
+    for path in sorted(CONFIG_DIR.glob("*.json")):
+        if not _is_twin_object_file(path):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        metadata = data.get("metadata")
+        if isinstance(metadata, dict):
+            found[str(data.get("uuid") or path.stem)] = metadata
+    return found
+
+
+def _load_twin_audio_pins() -> dict[str, str]:
+    pins: dict[str, str] = {}
+    for uuid_, metadata in _cached_twin_metadata().items():
+        for key in ("serial_number", "audio_device"):
+            value = metadata.get(key)
+            path = _udev_link_path(value, _alsa_trees()) if isinstance(value, str) else None
+            if path is not None:
+                pins[uuid_] = path
+                break
+    return pins
+
+
+def _load_twin_audio_serials() -> dict[str, str]:
+    """{twin_uuid: serial} for operator-set hardware serials; a udev link there is a legacy pin."""
+    serials: dict[str, str] = {}
+    for uuid_, metadata in _cached_twin_metadata().items():
+        value = _serial_text(metadata.get("serial_number"))
+        if value and _udev_link_path(value, _alsa_trees()) is None:
+            serials[uuid_] = value
+    return serials
+
+
+def _audio_card_for_serial(cards: list[_AudioCard], serial: str) -> _AudioCard | None:
+    """The one card whose by-id link ends in ``_<serial>-<N>``, the microphone driver's rule."""
+    serial = serial.strip()
+    if not serial:
+        return None
+    field = re.compile(rf"_{re.escape(serial)}-\d+$")
+    matches = [c for c in cards if c.link and field.search(c.link)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _audio_card_for_pin(cards: list[_AudioCard], path: str) -> _AudioCard | None:
+    match = re.fullmatch(r"controlC(\d+)", os.path.basename(os.path.realpath(path)))
+    return next((c for c in cards if match and c.index == int(match.group(1))), None)
+
+
+def _audio_pin_metadata(value: str) -> dict[str, str]:
+    return {"audio_device": _udev_link_path(value, _alsa_trees()) or value, "serial_number": ""}
+
+
+def _detect_and_select_audio_devices() -> None:
+    """Pin each microphone/speaker twin to a /dev/snd link (Linux), best-effort, as for cameras."""
+    if platform.system() != "Linux":
+        return
+
+    # Camera twins with a microphone (generic-webcam, go2) pick audio by device name; a
+    # /dev/snd link there stops the driver, video included.
+    camera_audio = _camera_audio_twins()
+    twins: dict[str, tuple[str, bool, bool]] = {}
+    for uuid_, name in _list_microphone_twins():
+        if uuid_ not in camera_audio:
+            twins[uuid_] = (escape(name), True, False)
+    for uuid_, name in _list_speaker_twins():
+        if uuid_ in camera_audio:
+            continue
+        prev = twins.get(uuid_)
+        twins[uuid_] = (escape(name), prev[1] if prev else False, True)
+    if not twins:
+        return
+
+    cards = _discover_usb_audio_cards()
+    serials = {u: s for u, s in _load_twin_audio_serials().items() if u in twins}
+    saved = {u: p for u, p in _load_twin_audio_pins().items() if u in twins and u not in serials}
+    by_serial: dict[str, _AudioCard] = {}
+    for uuid_, serial in serials.items():
+        card = _audio_card_for_serial(cards, serial)
+        if card is not None:
+            by_serial[uuid_] = card
+    connected: dict[str, _AudioCard] = {}
+    problem: dict[str, str] = {}
+    for uuid_, path in saved.items():
+        card = _audio_card_for_pin(cards, path)
+        if card is None:
+            problem[uuid_] = f"saved device {os.path.basename(path)} is not connected"
+        elif path.startswith(_ALSA_BY_ID_DIR + "/") and card.unit.collided:
+            problem[uuid_] = (
+                f"saved device {os.path.basename(path)} is a name identical units share"
+            )
+        else:
+            connected[uuid_] = card
+
+    console.print(
+        f"\n[bold]Detected {len(cards)} USB audio device(s).[/bold] "
+        "[dim]Each device serves one twin; answer s to leave a twin without one.[/dim]"
+    )
+    for card in cards:
+        modes = (("capture", card.capture), ("playback", card.playback))
+        kinds = "/".join(name for name, on in modes if on)
+        where = _short_link(card.pin) if card.pin else "no stable link"
+        note = ""
+        if card.unit.collided and card.pin:
+            note = " *"
+        elif card.unit.collided:
+            note = "  [red](identical unit, cannot be pinned)[/red]"
+        elif not card.pin:
+            note = "  [red](cannot be pinned)[/red]"
+        console.print(
+            f"  {card.index})  {escape(card.label)}  [dim]{kinds} · {where}[/dim]{note}"
+        )
+    if any(c.unit.collided and c.pin for c in cards):
+        console.print(_PORT_FOOTNOTE)
+    for uuid_, serial in serials.items():
+        if uuid_ in by_serial:
+            console.print(
+                f"  {twins[uuid_][0]}: pinned by serial {serial} -> "
+                f"[cyan]{_short_link(by_serial[uuid_].link or '')}[/cyan] (connected)"
+            )
+        else:
+            console.print(
+                f"[yellow]{twins[uuid_][0]} pins serial {escape(serial)}, which no attached "
+                f"audio "
+                f"device reports.[/yellow]\n"
+                f"[dim]Its driver will refuse to start rather than open a different "
+                f"device. Check the twin's metadata.serial_number.[/dim]"
+            )
+    for uuid_, path in saved.items():
+        if uuid_ in connected:
+            console.print(
+                f"  {twins[uuid_][0]}: using saved device "
+                f"[cyan]{_short_link(path)}[/cyan] (connected)"
+            )
+        else:
+            console.print(
+                f"  {twins[uuid_][0]}: [yellow]{problem[uuid_]} — "
+                f"it must be selected again[/yellow]"
+            )
+    remapped: set[str] = set()
+    if (
+        (connected or by_serial)
+        and len(cards) > 1
+        and not _ask_yes_no("Keep these existing audio bindings?")
+    ):
+        remapped = {*connected, *by_serial, *serials, *saved}
+        connected.clear()
+        by_serial.clear()
+        serials.clear()
+        saved.clear()
+        problem.clear()
+
+    owner: dict[int, str] = {}
+    conflicted: set[str] = set()
+    for uuid_ in twins:
+        card = connected.get(uuid_) or by_serial.get(uuid_)
+        if card is None:
+            continue
+        if card.index in owner:
+            conflicted.add(uuid_)
+            connected.pop(uuid_, None)
+            by_serial.pop(uuid_, None)
+            problem[uuid_] = (
+                f"device {escape(card.label)} is already bound to {owner[card.index]}"
+            )
+            console.print(
+                f"[yellow]{twins[uuid_][0]}: {escape(card.label)} is already bound to "
+                f"{owner[card.index]}; a device serves one twin.[/yellow]"
+            )
+        else:
+            owner[card.index] = twins[uuid_][0]
+    pending = [u for u in twins if u not in connected and u not in by_serial]
+    pins: dict[str, dict[str, str]] = {}
+    by_index = {c.index: c for c in cards}
+    cached = _cached_twin_metadata()
+
+    for uuid_, card in connected.items():
+        metadata = cached.get(uuid_, {})
+        path = saved[uuid_]
+        if metadata.get("audio_device") != path or str(metadata.get("serial_number") or "").strip():
+            pins[uuid_] = _audio_pin_metadata(path)
+
+    def _can_serve(uuid_: str, card: _AudioCard) -> bool:
+        _name, needs_capture, needs_playback = twins[uuid_]
+        return (card.capture or not needs_capture) and (card.playback or not needs_playback)
+
+    def _assign(uuid_: str, card: _AudioCard) -> None:
+        pins[uuid_] = _audio_pin_metadata(card.pin or "")
+        owner[card.index] = twins[uuid_][0]
+
+    no_input = False
+    for uuid_ in pending:
+        name = twins[uuid_][0]
+        result = _infer_associations(
+            [u for u in pending if u not in pins],
+            list(by_index),
+            claimed=set(owner),
+            compatible=lambda t, i: _can_serve(t, by_index[i]),
+        )
+        decided = result.assigned.get(uuid_)
+        if decided and by_index[decided[0]].pin:
+            card = by_index[decided[0]]
+            missing = (
+                problem.get(uuid_)
+                if uuid_ in saved or uuid_ in conflicted
+                else f"serial {serials[uuid_]} matches no attached device"
+                if uuid_ in serials
+                else None
+            )
+            if missing is None or _ask_yes_no(
+                f"{name}'s {missing}. Use {os.path.basename(card.pin)} instead?", on_eof=False
+            ):
+                console.print(
+                    f"[green]{name}[/green]: associated automatically with "
+                    f"[cyan]{os.path.basename(card.pin)}[/cyan] — {decided[1]}."
+                )
+                _assign(uuid_, card)
+                continue
+            if uuid_ in serials:
+                console.print(
+                    f"[yellow]{name} keeps its serial {escape(serials[uuid_])}.[/yellow]"
+                )
+                continue
+
+        pool = [c for c in cards if c.pin and _can_serve(uuid_, c)]
+        if not pool:
+            console.print(
+                f"[yellow]No USB audio device that can be pinned was found for {name} "
+                f"(it needs a udev id or a USB port link). "
+                f"Plug one in and run: cyberwave edge install[/yellow]"
+            )
+            continue
+        if uuid_ in serials and not _ask_yes_no(
+            f"{name} pins serial {escape(serials[uuid_])}, which no attached device "
+            f"reports. "
+            f"Replace it with a device you choose?",
+            on_eof=False,
+        ):
+            console.print(
+                f"[yellow]{name} keeps its serial {escape(serials[uuid_])}.[/yellow]"
+            )
+            continue
+        pool = [c for c in pool if c.index not in owner]
+        if not pool:
+            console.print(f"[yellow]No free audio device is left for {name}.[/yellow]")
+            continue
+        if len(pool) == 1:
+            card = pool[0]
+            if _ask_yes_no(
+                f"Only one device ({os.path.basename(card.pin)}) is available for "
+                f"{name}. Use it?",
+                on_eof=False,
+            ):
+                _assign(uuid_, card)
+            continue
+
+        console.print(f"\n[bold]Audio device for {name}[/bold] [dim]({uuid_[:8]}...)[/dim]")
+        by_card = {c.index: c for c in pool}
+        console.print(f"  [dim]free: {', '.join(map(str, by_card))}  (s = none)[/dim]")
+        chosen: _AudioCard | None = None
+        no_input = False
+        # Bounded: `yes | cyberwave edge install` answers "y" forever.
+        for _attempt in range(3):
+            try:
+                raw = Prompt.ask(f"Audio device for {name}", default=str(next(iter(by_card))))
+            except EOFError:
+                console.print("[yellow]No input available — skipping audio pinning.[/yellow]")
+                no_input = True
+                break
+            text = str(raw).strip().lower()
+            if text in ("s", "skip"):
+                break
+            try:
+                chosen = by_card[int(text)]
+                break
+            except (ValueError, KeyError):
+                console.print(
+                    f"[yellow]'{escape(str(raw))}' is not a listed device; choose "
+                    f"{', '.join(map(str, by_card))} or s.[/yellow]"
+                )
+        else:
+            console.print(f"[yellow]No valid answer: {name} is left without a device.[/yellow]")
+        if no_input:
+            break
+        if chosen is None:
+            continue
+        card = chosen
+        _assign(uuid_, card)
+
+    for uuid_ in conflicted:
+        if uuid_ in saved and uuid_ not in pins:
+            pins[uuid_] = {"audio_device": "", "serial_number": ""}
+    if not no_input:
+        for uuid_ in remapped:
+            if uuid_ not in pins:
+                pins[uuid_] = {"audio_device": "", "serial_number": ""}
+    bound = {u for u, m in pins.items() if m.get("audio_device")}
+    without = [
+        twins[u][0]
+        for u in pending
+        if u not in bound and (u in conflicted or (u not in serials and u not in saved))
+    ]
+    if without:
+        console.print(
+            f"[yellow]{len(without)} audio twin(s) have no physical device: "
+            f"{', '.join(without)}. They are not pinned.[/yellow]\n"
+            "[yellow]Unpinned audio drivers may select the same default device. "
+            "Skipping a binding does not disable a twin; verify assignments before use.[/yellow]"
+        )
+    if owner:
+        speaker_only = {
+            name for name, capture, playback in twins.values() if playback and not capture
+        }
+        console.print("\n[bold]Audio[/bold]")
+        for index, twin_name in owner.items():
+            card = by_index[index]
+            note = "  [yellow](pinned by USB port)[/yellow]" if card.unit.by_port else ""
+            if twin_name in speaker_only:
+                note += "  [dim](saved; the speaker driver does not use it yet)[/dim]"
+            console.print(
+                f"  {twin_name} → {escape(card.label)}  "
+                f"[dim]{_short_link(card.pin or '')}[/dim]{note}"
+            )
+    unused = [
+        f"{escape(c.label)} ({_short_link(c.pin)})"
+        for c in cards
+        if c.pin and c.index not in owner and any(_can_serve(u, c) for u in twins)
+    ]
+    if unused:
+        console.print(
+            f"[yellow]{len(unused)} audio device(s) are not used by any twin: "
+            f"{', '.join(unused)}.[/yellow]"
+        )
+
+    _spare_shared_serials(pins, lambda s: _audio_card_for_serial(cards, s) is not None)
+    failed = _persist_twin_pins(pins)
+    if failed:
+        names = ", ".join(twins[u][0] for u in twins if u in failed)
+        console.print(
+            f"[yellow]Audio bindings were not saved for: {names}. "
+            "The selections above are not confirmed assignments. "
+            "Fix the save error and rerun cyberwave edge install before using these twins.[/yellow]"
+        )
 
 
 # ---- orchestrator ------------------------------------------------------------
@@ -4357,19 +6289,17 @@ def setup_service(
             if has_apt:
                 selected_pkg = _resolve_service_package_name(channel, spec)
                 selected_target = f"{selected_pkg}={version}" if version else selected_pkg
-                install_method = f"Install [bold]{selected_target}[/bold] via apt-get"
+                install_method = f"[bold]{selected_target}[/bold] (apt-get)"
             else:
                 pip_target = _describe_pip_install_target(
                     spec,
                     channel=channel,
                     package_version=version,
                 )
-                install_method = f"Install [bold]{pip_target}[/bold] via pip"
+                install_method = f"[bold]{pip_target}[/bold] (pip)"
             console.print(
-                f"\nThis will:\n"
-                f"  1. {install_method}\n"
-                f"  2. Create a systemd service ([bold]{spec.unit_name}[/bold])\n"
-                f"  3. Enable it to start on boot\n"
+                f"\n[cyan]⚙[/cyan]  Installs {install_method} and runs it as "
+                f"[bold]{spec.unit_name}[/bold], started on boot."
             )
         elif macos_launchagent_supported:
             pip_target = _describe_pip_install_target(
@@ -4378,10 +6308,8 @@ def setup_service(
                 package_version=version,
             )
             console.print(
-                f"\nThis will:\n"
-                f"  1. Install [bold]{pip_target}[/bold] via pip\n"
-                "  2. Configure service credentials\n"
-                "  3. Create and load a LaunchAgent for your macOS user session\n"
+                f"\n[cyan]⚙[/cyan]  Installs [bold]{pip_target}[/bold] (pip), saves its "
+                "credentials and loads a LaunchAgent for your login session."
             )
         else:
             pip_target = _describe_pip_install_target(
@@ -4390,10 +6318,8 @@ def setup_service(
                 package_version=version,
             )
             console.print(
-                f"\nThis will:\n"
-                f"  1. Install [bold]{pip_target}[/bold] via pip\n"
-                f"  2. Configure service credentials\n"
-                f"  3. Skip service setup (manual startup required)\n"
+                f"\n[cyan]⚙[/cyan]  Installs [bold]{pip_target}[/bold] (pip) and saves its "
+                "credentials; no service is set up here, so you start it yourself."
             )
         if not Confirm.ask("Continue?", default=True):
             console.print("[dim]Aborted.[/dim]")
@@ -4447,6 +6373,16 @@ def setup_service(
         if not post_install_hook():
             return False
 
+    network_bindings: dict[str, dict[str, str]] = {}
+    if spec.requires_docker and linux_service_setup and _list_network_twins():
+        try:
+            network_bindings = _detect_and_bind_network_devices()
+        except Exception as exc:
+            console.print(
+                f"[yellow]Network device discovery failed: {escape(str(exc))}. Twins with "
+                f"network hardware were not bound.[/yellow]"
+            )
+
     # Camera selection runs after twin selection so the interactive prompt
     # isn't wiped by the twin picker's screen clear.
     # Only prompt when at least one selected twin has a camera sensor.
@@ -4462,7 +6398,14 @@ def setup_service(
                     "[dim]You can retry later: cyberwave edge install[/dim]"
                 )
         elif linux_service_setup:
-            _detect_and_select_cameras()
+            try:
+                _detect_and_select_cameras()
+            except Exception as exc:
+                console.print(
+                    f"[yellow]Camera pinning failed: {escape(str(exc))}. Bindings have not "
+                    "been verified; re-run: cyberwave edge install --reconfigure-camera[/yellow]"
+                )
+            _record_network_twin_sources(network_bindings)
 
     if spec.requires_docker and _any_twin_has_microphone_sensor():
         if is_macos():
@@ -4475,12 +6418,6 @@ def setup_service(
                     "driver will not receive a host audio bridge URL.[/yellow]\n"
                     "[dim]Retry: cyberwave edge install --reconfigure-microphone[/dim]"
                 )
-        else:
-            console.print(
-                "[dim]Linux microphone twins bind-mount /dev/snd into Docker with "
-                "--group-add audio and ALSA cgroup rule c 116:* rmw (edge-core "
-                "adds this automatically).[/dim]"
-            )
 
     if spec.requires_docker and _any_twin_has_speaker_sensor():
         if is_macos():
@@ -4493,11 +6430,19 @@ def setup_service(
                     "driver will not receive a host playback sink URL.[/yellow]\n"
                     "[dim]Retry: cyberwave edge install --reconfigure-speaker[/dim]"
                 )
-        else:
+
+    if (
+        spec.requires_docker
+        and not is_macos()
+        and (_any_twin_has_microphone_sensor() or _any_twin_has_speaker_sensor())
+    ):
+        try:
+            _detect_and_select_audio_devices()
+        except Exception as exc:
             console.print(
-                "[dim]Linux speaker twins bind-mount /dev/snd into Docker with "
-                "--group-add audio and ALSA cgroup rule c 116:* rmw (edge-core "
-                "adds this automatically).[/dim]"
+                f"[yellow]Audio device pinning failed: {escape(str(exc))}. "
+                "Bindings have not been verified; unpinned drivers may select "
+                "the same default device.[/yellow]"
             )
 
     if linux_service_setup:
@@ -4505,7 +6450,7 @@ def setup_service(
             return False
         if not enable_and_start_service(spec):
             return False
-        console.print(f"\n[green]{spec.package_name} is installed and running.[/green]")
+        console.print(f"\n[green]{spec.package_name} is installed; startup requested.[/green]")
         console.print(f"[dim]Check status: systemctl status {spec.unit_name}[/dim]")
     elif macos_launchagent_supported:
         if not create_launchagent_service(spec, config_path=config_path):

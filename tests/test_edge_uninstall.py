@@ -5,6 +5,8 @@ from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
 
+import pytest
+
 rich_module = ModuleType("rich")
 rich_console_module = ModuleType("rich.console")
 rich_prompt_module = ModuleType("rich.prompt")
@@ -87,9 +89,10 @@ def test_stop_edge_driver_containers_stops_matching_containers(monkeypatch):
         assert command[:3] == ["docker", "ps", "--format"]
         return _Result()
 
-    def _fake_runner(command, check=False):
+    def _fake_runner(command, check=False, timeout=None):
         issued_commands.append(command)
-        assert check is False
+        assert check is True
+        assert timeout == 60
 
     monkeypatch.setattr(edge_module.shutil, "which", lambda _: "/usr/bin/docker")
     monkeypatch.setattr(edge_module.subprocess, "run", _fake_run)
@@ -98,6 +101,27 @@ def test_stop_edge_driver_containers_stops_matching_containers(monkeypatch):
 
     assert stopped == ["cyberwave-driver-123", "cyberwave-driver-456"]
     assert issued_commands == [["docker", "stop", "cyberwave-driver-123", "cyberwave-driver-456"]]
+
+
+def test_the_macos_runner_takes_the_stop_helpers_timeout(monkeypatch):
+    class _Result:
+        stdout = "cyberwave-driver-123\n"
+
+    calls: list[tuple[list[str], dict]] = []
+
+    def _fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Result()
+
+    monkeypatch.setattr(edge_module.shutil, "which", lambda _: "/usr/local/bin/docker")
+    monkeypatch.setattr(edge_module.subprocess, "run", _fake_run)
+
+    assert edge_module._stop_edge_driver_containers(edge_module._run_on_macos)
+    assert edge_module._stop_edge_worker_containers(edge_module._run_on_macos)
+
+    stops = [kwargs for command, kwargs in calls if command[1] in ("stop", "rm")]
+    assert [kwargs["timeout"] for kwargs in stops] == [60, 60]
+    assert all(kwargs["check"] is True for kwargs in stops)
 
 
 def test_stop_edge_worker_containers_returns_empty_when_docker_missing(monkeypatch):
@@ -119,9 +143,10 @@ def test_stop_edge_worker_containers_stops_matching_containers(monkeypatch):
         assert command[:4] == ["docker", "ps", "-a", "--format"]
         return _Result()
 
-    def _fake_runner(command, check=False):
+    def _fake_runner(command, check=False, timeout=None):
         issued_commands.append(command)
-        assert check is False
+        assert check is True
+        assert timeout == 60
 
     monkeypatch.setattr(edge_module.shutil, "which", lambda _: "/usr/bin/docker")
     monkeypatch.setattr(edge_module.subprocess, "run", _fake_run)
@@ -136,6 +161,7 @@ def test_stop_edge_worker_containers_stops_matching_containers(monkeypatch):
     ]
 
 
+@pytest.mark.usefixtures("host_commands_missing")
 def test_uninstall_edge_stops_driver_and_worker_containers(monkeypatch, tmp_path):
     config_dir = tmp_path / "cyberwave-config"
     config_dir.mkdir()
@@ -155,6 +181,8 @@ def test_uninstall_edge_stops_driver_and_worker_containers(monkeypatch, tmp_path
     fake_core.PACKAGE_NAME = "cyberwave-edge-core"
     fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
     fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
+    fake_core._stop_systemd_unit = lambda unit: True
+    fake_core._has_systemd = lambda: True
     fake_core.SYSTEMD_UNIT_PATH = unit_path
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
@@ -210,7 +238,7 @@ def test_uninstall_edge_stops_driver_and_worker_containers(monkeypatch, tmp_path
 
     assert driver_stop_calls == [True]
     assert worker_stop_calls == [True]
-    assert ["systemctl", "stop", "cyberwave-edge-core.service"] in run_calls
+    assert ["systemctl", "disable", "cyberwave-edge-core.service"] in run_calls
     assert ["systemctl", "disable", "cyberwave-edge-core.service"] in run_calls
     assert ["rm", "-f", str(unit_path)] in run_calls
     assert ["systemctl", "daemon-reload"] in run_calls
@@ -223,6 +251,63 @@ def test_uninstall_edge_stops_driver_and_worker_containers(monkeypatch, tmp_path
             "workspace_uuid": "workspace-123",
         }
     ]
+
+
+@pytest.mark.usefixtures("host_commands_missing")
+def test_uninstall_edge_without_systemd_skips_the_service_and_cleans_up(monkeypatch, tmp_path):
+    config_dir = tmp_path / "cyberwave-config"
+    config_dir.mkdir()
+    unit_path = tmp_path / "cyberwave-edge-core.service"
+    unit_path.write_text("[Unit]\nDescription=Test\n", encoding="utf-8")
+    run_calls: list[list[str]] = []
+
+    fake_config = ModuleType("cyberwave_cli.config")
+    fake_config.CONFIG_DIR = config_dir
+
+    def _no_systemctl(unit):
+        raise AssertionError("systemctl used on a host without systemd")
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.PACKAGE_NAME = "cyberwave-edge-core"
+    fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
+    fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
+    fake_core._stop_systemd_unit = _no_systemctl
+    fake_core._has_systemd = lambda: False
+    fake_core.SYSTEMD_UNIT_PATH = unit_path
+    fake_core._is_macos = lambda: False
+    fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
+    fake_core._repair_workspace_from_token = lambda creds, *, base_url=None: (creds, None, False)
+    fake_core._release_twins_for_fingerprint = lambda **_kwargs: (0, 0)
+    fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
+    fake_core.require_root = lambda hint: None
+
+    def _fake_run(command, *, check=True, **_kwargs):
+        run_calls.append(command)
+        return None
+
+    fake_core._run = _fake_run
+    fake_credentials = ModuleType("cyberwave_cli.credentials")
+    fake_credentials.load_credentials = lambda: None
+    fake_macos = ModuleType("cyberwave_cli.macos")
+    fake_macos.is_macos = lambda: False
+
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
+    monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", lambda _runner: ["cyberwave-driver-123"])
+    monkeypatch.setattr(edge_module, "_stop_edge_worker_containers", lambda _runner: [])
+    monkeypatch.setattr(
+        edge_module, "_delete_registered_edges_for_fingerprint", lambda **_kwargs: (0, 0)
+    )
+    monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", lambda: None)
+    monkeypatch.setattr(edge_module.os, "geteuid", lambda: 0)
+
+    edge_module.uninstall_edge.callback(yes=True, channel=None)
+
+    assert not any(command[0] == "systemctl" for command in run_calls)
+    assert ["rm", "-f", str(unit_path)] in run_calls
+    assert not config_dir.exists()
 
 
 def test_uninstall_edge_exits_when_not_root(monkeypatch, tmp_path):
@@ -242,6 +327,8 @@ def test_uninstall_edge_exits_when_not_root(monkeypatch, tmp_path):
     fake_core.PACKAGE_NAME = "cyberwave-edge-core"
     fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
     fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
+    fake_core._stop_systemd_unit = lambda unit: True
+    fake_core._has_systemd = lambda: True
     fake_core.SYSTEMD_UNIT_PATH = unit_path
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
@@ -299,6 +386,8 @@ def test_uninstall_edge_exits_before_confirmation_when_not_root(monkeypatch, tmp
     fake_core = ModuleType("cyberwave_cli.core")
     fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
     fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
+    fake_core._stop_systemd_unit = lambda unit: True
+    fake_core._has_systemd = lambda: True
     fake_core.SYSTEMD_UNIT_PATH = tmp_path / "nonexistent.service"
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
@@ -355,7 +444,9 @@ def test_uninstall_edge_exits_before_confirmation_when_not_root(monkeypatch, tmp
     )
 
 
+@pytest.mark.usefixtures("host_commands_missing")
 def test_uninstall_edge_removes_detected_channel_package(monkeypatch, tmp_path):
+    monkeypatch.setattr(edge_module.shutil, "which", lambda tool: "/usr/bin/apt-get" if tool == "apt-get" else None)
     config_dir = tmp_path / "cyberwave-config"
     config_dir.mkdir()
     unit_path = tmp_path / "cyberwave-edge-core.service"
@@ -369,6 +460,8 @@ def test_uninstall_edge_removes_detected_channel_package(monkeypatch, tmp_path):
     fake_core.PACKAGE_NAME = "cyberwave-edge-core"
     fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
     fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
+    fake_core._stop_systemd_unit = lambda unit: True
+    fake_core._has_systemd = lambda: True
     fake_core.SYSTEMD_UNIT_PATH = unit_path
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
@@ -413,6 +506,61 @@ def test_uninstall_edge_removes_detected_channel_package(monkeypatch, tmp_path):
     assert ["apt-get", "remove", "-y", "cyberwave-edge-core-dev"] in run_calls
 
 
+@pytest.mark.usefixtures("host_commands_missing")
+def test_uninstall_can_be_retried_after_the_unit_file_is_gone(monkeypatch, tmp_path):
+    monkeypatch.setattr(edge_module.shutil, "which", lambda tool: "/usr/bin/apt-get" if tool == "apt-get" else None)
+    config_dir = tmp_path / "cyberwave-config"
+    config_dir.mkdir()
+    run_calls: list[list[str]] = []
+
+    fake_config = ModuleType("cyberwave_cli.config")
+    fake_config.CONFIG_DIR = config_dir
+
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.PACKAGE_NAME = "cyberwave-edge-core"
+    fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
+    fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
+    fake_core._stop_systemd_unit = lambda unit: True
+    fake_core._has_systemd = lambda: True
+    fake_core.SYSTEMD_UNIT_PATH = tmp_path / "removed-by-the-first-attempt.service"
+    fake_core._is_macos = lambda: False
+    fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
+    fake_core._repair_workspace_from_token = lambda creds, *, base_url=None: (creds, None, False)
+    fake_core._release_twins_for_fingerprint = lambda **_kwargs: (0, 0)
+    fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
+    fake_core.require_root = lambda hint: None
+
+    def _fake_run(command, *, check=True, **_kwargs):
+        run_calls.append(command)
+        if command[:2] == ["systemctl", "disable"] and check:
+            raise subprocess.CalledProcessError(1, command, "", "Unit file does not exist.")
+        return None
+
+    fake_core._run = _fake_run
+    fake_credentials = ModuleType("cyberwave_cli.credentials")
+    fake_credentials.load_credentials = lambda: None
+    fake_macos = ModuleType("cyberwave_cli.macos")
+    fake_macos.is_macos = lambda: False
+
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", fake_credentials)
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", fake_macos)
+    monkeypatch.setattr(edge_module, "_stop_edge_driver_containers", lambda _runner: [])
+    monkeypatch.setattr(edge_module, "_stop_edge_worker_containers", lambda _runner: [])
+    monkeypatch.setattr(
+        edge_module, "_delete_registered_edges_for_fingerprint", lambda **_kwargs: (0, 0)
+    )
+    monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", lambda: None)
+    monkeypatch.setattr(edge_module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(edge_module.Confirm, "ask", lambda prompt, default=False: True)
+
+    edge_module.uninstall_edge.callback(yes=False, channel=None)
+
+    assert ["systemctl", "disable", "cyberwave-edge-core.service"] in run_calls
+    assert ["apt-get", "remove", "-y", "cyberwave-edge-core"] in run_calls
+
+
 def test_uninstall_edge_macos_removes_launchagent_and_uninstalls_package(monkeypatch, tmp_path):
     config_dir = tmp_path / "cyberwave-config"
     config_dir.mkdir()
@@ -429,6 +577,8 @@ def test_uninstall_edge_macos_removes_launchagent_and_uninstalls_package(monkeyp
     fake_core.PACKAGE_NAME = "cyberwave-edge-core"
     fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
     fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
+    fake_core._stop_systemd_unit = lambda unit: True
+    fake_core._has_systemd = lambda: True
     fake_core.SYSTEMD_UNIT_PATH = tmp_path / "nonexistent.service"
     fake_core._is_macos = lambda: True
     fake_core._launchagent_target = lambda spec: ("gui/501", "gui/501/com.cyberwave.edge.core")
@@ -447,6 +597,7 @@ def test_uninstall_edge_macos_removes_launchagent_and_uninstalls_package(monkeyp
     fake_macos.is_macos = lambda: True
     fake_macos._teardown_camera_stream_server = lambda: camera_teardown_calls.append(True)
     fake_macos._teardown_audio_stream_server = lambda: None
+    fake_macos._teardown_serial_bridges = lambda: None
 
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
@@ -500,6 +651,8 @@ def _make_linux_uninstall_fixtures(monkeypatch, tmp_path):
     fake_core.PACKAGE_NAME = "cyberwave-edge-core"
     fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
     fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
+    fake_core._stop_systemd_unit = lambda unit: True
+    fake_core._has_systemd = lambda: True
     fake_core.SYSTEMD_UNIT_PATH = unit_path
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
@@ -650,6 +803,8 @@ def _uninstall_ordering_fixtures(monkeypatch, tmp_path, *, creds):
     fake_core.PACKAGE_NAME = "cyberwave-edge-core"
     fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
     fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
+    fake_core._stop_systemd_unit = lambda unit: True
+    fake_core._has_systemd = lambda: True
     fake_core.SYSTEMD_UNIT_PATH = unit_path
     fake_core._is_macos = lambda: False
     fake_core._load_or_generate_edge_fingerprint = lambda: "fp-123"
@@ -740,3 +895,116 @@ def test_uninstall_cleans_up_with_the_workspace_resolved_from_the_token(monkeypa
     # Both halves see the repaired workspace, so neither can fall back to a
     # fingerprint-only match.
     assert events == [("release", "ws-token"), ("delete-edge", "ws-token")]
+
+
+def test_uninstall_retains_unit_and_config_when_shutdown_times_out(monkeypatch, tmp_path):
+    import click
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "credentials.json").write_text("{}")
+    unit = tmp_path / "edge.service"
+    unit.write_text("[Service]")
+    fake_core = ModuleType("cyberwave_cli.core")
+    fake_core.EDGE_CORE_SPEC = SimpleNamespace(package_name="cyberwave-edge-core")
+    fake_core.SYSTEMD_UNIT_NAME = "cyberwave-edge-core.service"
+    fake_core.SYSTEMD_UNIT_PATH = unit
+    fake_core._is_macos = lambda: False
+    fake_core.require_root = lambda hint: None
+    fake_core._load_or_generate_edge_fingerprint = lambda: "fp"
+    fake_core._repair_workspace_from_token = lambda *a, **k: None
+    fake_core._resolve_installed_edge_core_package_name = lambda: "cyberwave-edge-core"
+    fake_core._stop_systemd_unit = lambda unit: False
+    fake_core._has_systemd = lambda: True
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Cleanup ran before shutdown was confirmed")
+    fake_core._run = forbidden
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
+    fake_config = ModuleType("cyberwave_cli.config")
+    fake_config.CONFIG_DIR = config
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
+    credentials = ModuleType("cyberwave_cli.credentials")
+    credentials.load_credentials = lambda: None
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.credentials", credentials)
+    macos = ModuleType("cyberwave_cli.macos")
+    macos.is_macos = lambda: False
+    monkeypatch.setitem(sys.modules, "cyberwave_cli.macos", macos)
+    monkeypatch.setattr(edge_module, "_kill_lingering_edge_processes", forbidden)
+    monkeypatch.setattr(edge_module, "_release_and_delete_edges_for_fingerprint", forbidden)
+    with pytest.raises(click.ClickException, match="Configuration was retained"):
+        edge_module.uninstall_edge.callback(yes=True, channel=None)
+    assert unit.exists()
+    assert (config / "credentials.json").exists()
+
+
+@pytest.mark.parametrize("helper", ["_stop_edge_driver_containers", "_stop_edge_worker_containers"])
+def test_container_cleanup_timeout_aborts_uninstall(monkeypatch, helper):
+    import click
+    import subprocess
+    monkeypatch.setattr(edge_module.shutil, "which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr(edge_module.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="cyberwave-test\n"))
+    def timeout(cmd, **kwargs):
+        assert kwargs["timeout"] == 60
+        raise subprocess.TimeoutExpired(cmd, 60)
+    with pytest.raises(click.ClickException, match="configuration retained"):
+        getattr(edge_module, helper)(timeout)
+
+
+_CONTAINER_HELPERS = ["_stop_edge_driver_containers", "_stop_edge_worker_containers"]
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. "
+        "Is the docker daemon running?\n",
+        "failed to connect to the docker API at unix:///var/run/docker.sock; check if the path "
+        "is correct and if the daemon is running: dial unix /var/run/docker.sock: connect: "
+        "no such file or directory\n",
+    ],
+)
+@pytest.mark.parametrize("helper", _CONTAINER_HELPERS)
+def test_a_stopped_docker_daemon_warns_and_finds_no_containers(monkeypatch, helper, stderr):
+    import subprocess
+
+    printed: list[str] = []
+    monkeypatch.setattr(edge_module.shutil, "which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr(edge_module.console, "print", lambda *a, **_k: printed.append(str(a[0])))
+
+    def daemon_down(cmd, **_kwargs):
+        raise subprocess.CalledProcessError(1, cmd, output="", stderr=stderr)
+
+    def no_stop(*_args, **_kwargs):
+        raise AssertionError("nothing can run while the daemon is down")
+
+    monkeypatch.setattr(edge_module.subprocess, "run", daemon_down)
+
+    assert getattr(edge_module, helper)(no_stop) == []
+    assert any("[yellow]Docker daemon is not running" in line for line in printed)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "permission denied while trying to connect to the docker API at "
+        "unix:///var/run/docker.sock",
+        "Error response from daemon: internal error",
+        "timeout",
+    ],
+)
+@pytest.mark.parametrize("helper", _CONTAINER_HELPERS)
+def test_other_listing_failures_still_retain_the_configuration(monkeypatch, helper, error):
+    import subprocess
+
+    import click
+
+    monkeypatch.setattr(edge_module.shutil, "which", lambda _: "/usr/bin/docker")
+
+    def failing(cmd, **kwargs):
+        if error == "timeout":
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+        raise subprocess.CalledProcessError(1, cmd, output="", stderr=error)
+
+    monkeypatch.setattr(edge_module.subprocess, "run", failing)
+
+    with pytest.raises(click.ClickException, match="configuration retained"):
+        getattr(edge_module, helper)(lambda *_a, **_k: None)

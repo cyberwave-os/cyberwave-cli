@@ -12,6 +12,70 @@ from ..discovery import NetworkScanner, DiscoveredDevice, DeviceType
 console = Console()
 
 
+def _scan_wired(*, timeout: float, output_json: bool) -> None:
+    import json
+
+    from ..discovery import hardware
+    from ..discovery.interfaces import wired_interfaces
+
+    ports = wired_interfaces()
+    devices = hardware.discover(ports, timeout=timeout, enumerate_types=True, arp_sweep=True)
+    if output_json:
+        # Plain stdout: Rich would wrap, highlight and parse markup in device-supplied strings.
+        click.echo(
+            json.dumps(
+                {
+                    "interfaces": [
+                        {"name": p.name, "mac": p.mac, "carrier": p.carrier,
+                         "addresses": [str(a) for a in p.addresses]}
+                        for p in ports
+                    ],
+                    "devices": [
+                        {
+                            "interface": d.interface, "ip": d.ip, "mac": d.mac, "vendor": d.vendor,
+                            "hostname": d.hostname, "reachable": d.reachable,
+                            "services": {
+                                t: {"instance": s.instance, "port": s.port, "txt": s.txt}
+                                for t, s in d.services.items()
+                            },
+                        }
+                        for d in devices
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+
+    if not ports:
+        console.print("[yellow]This host has no wired Ethernet ports.[/yellow]")
+        return
+    for port in ports:
+        if not port.carrier:
+            state = "[dim]no link[/dim]"
+        elif not port.has_ipv4:
+            state = "[yellow]link up, no IPv4 address: devices on it cannot be found[/yellow]"
+        else:
+            state = ", ".join(str(a) for a in port.addresses)
+        console.print(f"[bold]{port.name}[/bold] ({port.mac}): {state}")
+    if not devices:
+        console.print("\n[yellow]No devices found on the wired ports.[/yellow]")
+        return
+    table = Table(title=f"Found {len(devices)} wired device(s)")
+    table.add_column("Port")
+    table.add_column("IP Address", style="cyan")
+    table.add_column("MAC", style="magenta")
+    table.add_column("Vendor", style="yellow")
+    table.add_column("mDNS services", style="green")
+    for d in devices:
+        services = ", ".join(
+            f"{t}:{s.port}" if s.port else t for t, s in sorted(d.services.items())
+        )
+        ip = d.ip if d.reachable else f"{d.ip} [yellow](other subnet)[/yellow]"
+        table.add_row(d.interface, ip, d.mac or "-", d.vendor or "-", services or "-")
+    console.print(table)
+
+
 def format_device_row(device: DiscoveredDevice) -> tuple:
     """Format a device for table display."""
     type_emoji = {
@@ -64,6 +128,11 @@ def format_device_row(device: DiscoveredDevice) -> tuple:
     is_flag=True,
     help="Output results as JSON",
 )
+@click.option(
+    "--wired",
+    is_flag=True,
+    help="List the hardware on this host's Ethernet ports (mDNS + ARP), with MAC addresses",
+)
 def scan(
     subnet: str | None,
     timeout: float,
@@ -71,6 +140,7 @@ def scan(
     no_onvif: bool,
     no_upnp: bool,
     output_json: bool,
+    wired: bool,
 ) -> None:
     """Scan the network for IP cameras and NVRs.
 
@@ -79,13 +149,23 @@ def scan(
     - ONVIF WS-Discovery
     - UPnP/SSDP
 
+    With --wired, lists what is plugged into this host's Ethernet ports
+    instead: every mDNS service announced there, and every host answering
+    ARP, with its MAC address and vendor. This is what `cyberwave edge
+    install` matches twins against.
+
     \b
     Examples:
         cyberwave scan
         cyberwave scan -s 10.0.0
         cyberwave scan --json
         cyberwave scan --no-ports  # Only use discovery protocols
+        cyberwave scan --wired     # hardware on the Ethernet ports
     """
+    if wired:
+        _scan_wired(timeout=max(timeout, 2.5), output_json=output_json)
+        return
+
     scanner = NetworkScanner(subnet=subnet, timeout=timeout)
 
     if not output_json:

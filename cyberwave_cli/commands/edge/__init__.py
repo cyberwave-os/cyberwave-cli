@@ -34,6 +34,7 @@ from typing import Any
 
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
@@ -177,39 +178,62 @@ def _binding_for_fingerprint(edge_configs: dict, fingerprint: str) -> dict | Non
     return None
 
 
-def _stop_edge_driver_containers(run_command) -> list[str]:
-    """Stop running edge driver containers managed by edge-core."""
-    if not shutil.which("docker"):
-        return []
+def _run_on_macos(command: list[str], check: bool = False, timeout: float | None = None):
+    from ...config import clean_subprocess_env
 
+    return subprocess.run(command, check=check, timeout=timeout, env=clean_subprocess_env())
+
+
+_DOCKER_DAEMON_DOWN_MARKERS = (
+    "cannot connect to the docker daemon",
+    "check if the path is correct and if the daemon is running",
+)
+
+
+def _docker_daemon_down(exc: Exception) -> bool:
+    if not isinstance(exc, subprocess.CalledProcessError):
+        return False
+    stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+    return any(marker in stderr.lower() for marker in _DOCKER_DAEMON_DOWN_MARKERS)
+
+
+def _list_edge_containers(kind: str, prefix: str, *, all_states: bool) -> list[str]:
+    states = ["-a"] if all_states else []
     try:
         result = subprocess.run(
-            [
-                "docker",
-                "ps",
-                "--format",
-                "{{.Names}}",
-                "--filter",
-                f"name=^{DRIVER_CONTAINER_PREFIX}",
-            ],
+            ["docker", "ps", *states, "--format", "{{.Names}}", "--filter", f"name=^{prefix}"],
             check=True,
             capture_output=True,
             text=True,
             timeout=10,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-        console.print(f"[yellow]Could not list edge driver containers: {exc}[/yellow]")
+        if _docker_daemon_down(exc):
+            console.print(
+                f"[yellow]Docker daemon is not running; skipping {kind} container cleanup. "
+                f"Containers with a restart policy come back when Docker starts: check "
+                f"`docker ps -a --filter name=^{prefix}`.[/yellow]"
+            )
+            return []
+        raise click.ClickException(
+            f"Could not list {kind} containers; configuration retained: {exc}"
+        ) from exc
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _stop_edge_driver_containers(run_command) -> list[str]:
+    """Stop running edge driver containers managed by edge-core."""
+    if not shutil.which("docker"):
         return []
 
-    containers = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    containers = _list_edge_containers("driver", DRIVER_CONTAINER_PREFIX, all_states=False)
     if not containers:
         return []
 
     try:
-        run_command(["docker", "stop", *containers], check=False)
-    except FileNotFoundError:
-        console.print("[yellow]docker not found — skipping driver container cleanup.[/yellow]")
-        return []
+        run_command(["docker", "stop", *containers], check=True, timeout=60)
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise click.ClickException(f"Could not stop driver containers; configuration retained: {exc}") from exc
 
     return containers
 
@@ -228,35 +252,14 @@ def _stop_edge_worker_containers(run_command) -> list[str]:
     if not shutil.which("docker"):
         return []
 
-    try:
-        result = subprocess.run(
-            [
-                "docker",
-                "ps",
-                "-a",
-                "--format",
-                "{{.Names}}",
-                "--filter",
-                f"name=^{WORKER_CONTAINER_PREFIX}",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-        console.print(f"[yellow]Could not list edge worker containers: {exc}[/yellow]")
-        return []
-
-    containers = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    containers = _list_edge_containers("worker", WORKER_CONTAINER_PREFIX, all_states=True)
     if not containers:
         return []
 
     try:
-        run_command(["docker", "rm", "-f", *containers], check=False)
-    except FileNotFoundError:
-        console.print("[yellow]docker not found — skipping worker container cleanup.[/yellow]")
-        return []
+        run_command(["docker", "rm", "-f", *containers], check=True, timeout=60)
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise click.ClickException(f"Could not remove worker containers; configuration retained: {exc}") from exc
 
     return containers
 
@@ -559,7 +562,7 @@ def edge():
     "--reconfigure-camera",
     is_flag=True,
     default=False,
-    help="Re-run camera detection and save to cameras.json",
+    help="Re-pin the camera twins (network cameras, then USB) without a full reinstall",
 )
 @click.option(
     "--reconfigure-microphone",
@@ -655,8 +658,8 @@ def install_edge(
 
         if reconfiguring:
             raise click.BadParameter(
-                "--token does not apply to the --reconfigure-* flags, which re-run local "
-                "device selection without contacting the API. Drop it, or run a full install.",
+                "--token does not apply to the --reconfigure-* flags, which use the "
+                "credentials this device already has. Drop it, or run a full install.",
                 param_hint="'--token'",
             )
 
@@ -691,7 +694,7 @@ def install_edge(
         else:
             console.print(
                 "[yellow]--reconfigure-microphone is only supported on macOS.[/yellow]\n"
-                "[dim]On Linux, ensure driver containers mount /dev/snd.[/dim]"
+                "[dim]On Linux, a full `cyberwave edge install` re-pins audio devices.[/dim]"
             )
         return
 
@@ -721,7 +724,7 @@ def install_edge(
         else:
             console.print(
                 "[yellow]--reconfigure-speaker is only supported on macOS.[/yellow]\n"
-                "[dim]On Linux, ensure driver containers mount /dev/snd.[/dim]"
+                "[dim]On Linux, a full `cyberwave edge install` re-pins audio devices.[/dim]"
             )
         return
 
@@ -749,9 +752,26 @@ def install_edge(
                 console.print("\n[dim]Aborted.[/dim]")
                 raise SystemExit(1)
         else:
-            from ...core import _detect_and_select_cameras
+            from ...core import (
+                _detect_and_bind_network_devices,
+                _detect_and_select_cameras,
+                _list_network_twins,
+                _record_network_twin_sources,
+            )
 
-            _detect_and_select_cameras()
+            network_bindings: dict[str, dict[str, str]] = {}
+            if _list_network_twins():
+                try:
+                    network_bindings = _detect_and_bind_network_devices()
+                except Exception as exc:
+                    console.print(
+                        f"[yellow]Network device discovery failed: {escape(str(exc))}[/yellow]"
+                    )
+            try:
+                _detect_and_select_cameras()
+            except Exception as exc:
+                raise click.ClickException(f"Camera pinning failed: {exc}") from exc
+            _record_network_twin_sources(network_bindings)
             console.print(
                 "[dim]Edge-core will automatically pick up the new camera "
                 "within a few seconds.[/dim]"
@@ -914,16 +934,13 @@ def uninstall_edge(yes, channel):
                     "[dim]Run 'cyberwave edge uninstall' as your regular macOS user.[/dim]"
                 )
 
-        def _macos_run(command, check=False):
-            return subprocess.run(command, check=check, env=clean_subprocess_env())
-
-        stopped_driver_containers = _stop_edge_driver_containers(_macos_run)
+        stopped_driver_containers = _stop_edge_driver_containers(_run_on_macos)
         if stopped_driver_containers:
             console.print(
                 f"[green]Stopped {len(stopped_driver_containers)} edge driver container(s).[/green]"
             )
 
-        stopped_worker_containers = _stop_edge_worker_containers(_macos_run)
+        stopped_worker_containers = _stop_edge_worker_containers(_run_on_macos)
         if stopped_worker_containers:
             console.print(
                 f"[green]Stopped {len(stopped_worker_containers)} edge worker container(s).[/green]"
@@ -990,14 +1007,23 @@ def uninstall_edge(yes, channel):
         console.print(f"[green]{EDGE_CORE_SPEC.package_name} service removed.[/green]")
         return
 
-    from ...core import SYSTEMD_UNIT_PATH, _run
+    from ...core import SYSTEMD_UNIT_PATH, _has_systemd, _run, _stop_systemd_unit
 
-    # Stop and disable the service
-    try:
-        _run(["systemctl", "stop", SYSTEMD_UNIT_NAME], check=False)
-        _run(["systemctl", "disable", SYSTEMD_UNIT_NAME], check=False)
-    except FileNotFoundError:
-        console.print("[yellow]systemctl not found — skipping service cleanup.[/yellow]")
+    systemd = _has_systemd()
+    if systemd:
+        # Do not delete files or registrations while an old startup can still use them.
+        if not _stop_systemd_unit(SYSTEMD_UNIT_NAME):
+            raise click.ClickException("Uninstall stopped: service shutdown was not confirmed. Configuration was retained.")
+        try:
+            _run(
+                ["systemctl", "disable", SYSTEMD_UNIT_NAME],
+                timeout=15,
+                check=SYSTEMD_UNIT_PATH.exists(),
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise click.ClickException(f"Could not disable the service: {exc}") from exc
+    else:
+        console.print("[yellow]systemd is not running — skipping service shutdown.[/yellow]")
 
     _kill_lingering_edge_processes()
 
@@ -1006,10 +1032,11 @@ def uninstall_edge(yes, channel):
         try:
             _run(["rm", "-f", str(SYSTEMD_UNIT_PATH)], check=True)
             console.print(f"[green]Removed:[/green] {SYSTEMD_UNIT_PATH}")
-            try:
-                _run(["systemctl", "daemon-reload"], check=False)
-            except FileNotFoundError:
-                pass
+            if systemd:
+                try:
+                    _run(["systemctl", "daemon-reload"], timeout=15)
+                except (subprocess.SubprocessError, OSError) as exc:
+                    raise click.ClickException(f"Could not reload systemd: {exc}") from exc
         except subprocess.CalledProcessError:
             console.print(f"[red]Failed to remove {SYSTEMD_UNIT_PATH}.[/red]")
 
@@ -1192,7 +1219,8 @@ def stop_edge():
     from ...core import EDGE_CORE_SPEC, SYSTEMD_UNIT_PATH, _has_systemd, _is_macos, stop_service
 
     if _has_systemd() and SYSTEMD_UNIT_PATH.exists():
-        stop_service()
+        if not stop_service():
+            raise SystemExit(1)
         return
 
     if _is_macos() and _macos_launchagent_plist_path().exists():
@@ -1263,7 +1291,8 @@ def restart_edge():
     )
 
     if _has_systemd() and SYSTEMD_UNIT_PATH.exists():
-        restart_service()
+        if not restart_service():
+            raise SystemExit(1)
         return
 
     if _is_macos() and _macos_launchagent_plist_path().exists():
@@ -1548,6 +1577,34 @@ def status_edge():
         console.print(f"[red]Error checking worker container: {e}[/red]")
 
 
+@edge.command("microphones")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def list_microphones(as_json: bool):
+    """List audio capture devices (Linux ALSA or macOS AVFoundation).
+
+    This lists inputs only; configure twin assignments with edge install.
+    """
+    import platform
+
+    from ...device_utils import discover_microphones
+
+    microphones = discover_microphones()
+    if as_json:
+        click.echo(json.dumps([mic.to_dict() for mic in microphones], indent=2))
+    elif microphones:
+        for mic in microphones:
+            click.echo(f"{mic.card}: {', '.join(mic.paths)} ({mic.driver})")
+    elif platform.system() == "Linux":
+        click.echo("No ALSA capture devices detected. Check /proc/asound/cards and /dev/snd; "
+                   "for USB microphones, check lsusb and sudo dmesg.")
+    elif platform.system() == "Darwin":
+        click.echo("No microphones detected. Check macOS microphone permissions.")
+        if not shutil.which("ffmpeg"):
+            click.echo("Install ffmpeg: brew install ffmpeg")
+    else:
+        click.echo(f"Microphone discovery not supported on {platform.system()}.")
+
+
 @edge.command("cameras")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Output as JSON")
 @click.option("--save", is_flag=True, default=False, help="Save results to cameras.json")
@@ -1574,14 +1631,10 @@ def list_cameras(as_json: bool, save: bool):
         click.echo(json.dumps([c.to_dict() for c in cameras], indent=2))
     elif not cameras:
         if system == "Linux":
+            from ...device_utils import no_camera_hint
+
             console.print("[yellow]No cameras detected.[/yellow]")
-            if not shutil.which("v4l2-ctl"):
-                if shutil.which("apt-get"):
-                    console.print("[dim]Install v4l-utils: sudo apt-get install v4l-utils[/dim]")
-                elif shutil.which("pacman"):
-                    console.print("[dim]Install v4l-utils: sudo pacman -S v4l-utils[/dim]")
-                else:
-                    console.print("[dim]Install v4l-utils using your package manager.[/dim]")
+            console.print(f"[dim]{no_camera_hint()}[/dim]")
         elif system == "Darwin":
             console.print("[yellow]No cameras detected.[/yellow]")
             if not shutil.which("ffmpeg"):
@@ -1600,7 +1653,8 @@ def list_cameras(as_json: bool, save: bool):
             style_close = "[/dim]" if dim else ""
             tag = "  (probably not a camera)" if dim else ""
             console.print(
-                f"  {style_open}[bold cyan]{idx_str}[/bold cyan])  {cam.card}{tag}{style_close}"
+                f"  {style_open}[bold cyan]{idx_str}[/bold cyan])  {escape(cam.card)}{tag}"
+                f"{style_close}"
             )
             if cam.primary_path:
                 console.print(f"  {style_open}     Device: {cam.primary_path}{style_close}")

@@ -3,8 +3,11 @@ from tests._core_module_loader import load_core_module
 
 def _mock_is_macos(monkeypatch, core, value: bool):
     """Patch ``is_macos`` in both the core module and the macos sub-module."""
-    import cyberwave_cli.macos as macos_mod
+    import importlib
 
+    macos_mod = importlib.import_module("cyberwave_cli.macos")
+
+    monkeypatch.setattr(core.os, "geteuid", lambda: 501, raising=False)
     monkeypatch.setattr(core, "_is_macos", lambda: value, raising=False)
     monkeypatch.setattr(core, "is_macos", lambda: value)
     monkeypatch.setattr(macos_mod, "is_macos", lambda: value)

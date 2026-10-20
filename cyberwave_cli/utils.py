@@ -20,6 +20,7 @@ from rich.table import Table
 
 from .config import get_api_url
 from .credentials import Credentials, load_credentials
+from .url_utils import require_valid_url
 
 console = Console()
 
@@ -39,6 +40,7 @@ def resolve_api_url(
         return api_url
     env_url = os.getenv("CYBERWAVE_BASE_URL")
     if env_url:
+        require_valid_url(env_url, "CYBERWAVE_BASE_URL")
         return env_url
     if creds and creds.cyberwave_base_url:
         return creds.cyberwave_base_url

@@ -65,13 +65,15 @@ def _install_fake_modules(
     fake_core._launchagent_target = lambda spec: ("gui/501", f"gui/501/{launchagent_label}")
     fake_core._launchagent_log_path = lambda spec: Path.home() / "Library" / "Logs" / "Cyberwave" / f"{launchagent_label}.log"
     fake_core.start_service = lambda spec: True
-    fake_core.stop_service = lambda: None
-    fake_core.restart_service = lambda: None
+    fake_core.stop_service = lambda: True
+    fake_core.restart_service = lambda: True
     fake_core.create_launchagent_service = lambda spec, *, config_path=None: True
     fake_core.load_launchagent_service = lambda spec: True
 
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
+    macos_module = importlib.import_module("cyberwave_cli.macos")
+    monkeypatch.setattr(macos_module, "is_macos", lambda: is_macos)
 
 
 def test_start_edge_foreground_uses_resolved_edge_core_binary(monkeypatch):
@@ -203,6 +205,8 @@ def test_show_logs_on_macos_shows_missing_launchagent_log_message(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "cyberwave_cli.config", fake_config)
     monkeypatch.setitem(sys.modules, "cyberwave_cli.core", fake_core)
+    macos_module = importlib.import_module("cyberwave_cli.macos")
+    monkeypatch.setattr(macos_module, "is_macos", lambda: is_macos)
     edge_module = _load_edge_module()
     monkeypatch.setattr(edge_module.sys, "platform", "darwin")
     monkeypatch.setattr(edge_module.console, "print", lambda message="", *a, **kw: printed.append(str(message)))
@@ -251,9 +255,11 @@ def test_stop_edge_macos_treats_bootout_exit_3_as_not_loaded(monkeypatch, tmp_pa
     )
     monkeypatch.setattr(edge_module.console, "print", lambda message="", *a, **kw: printed.append(str(message)))
 
+    macos_module = importlib.import_module("cyberwave_cli.macos")
+    monkeypatch.setattr(macos_module, "_get_console", lambda: edge_module.console)
     edge_module.stop_edge.callback()
 
-    assert any("not loaded" in message.lower() for message in printed)
+    assert any("not running" in message.lower() for message in printed)
 
 
 def test_status_edge_macos_shows_launchagent_loaded(monkeypatch, tmp_path):

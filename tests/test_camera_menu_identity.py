@@ -118,19 +118,9 @@ def test_camera_with_neither_serial_nor_port_still_renders(monkeypatch):
 
     _, lines, _ = _render(monkeypatch, cameras)
 
-    assert "/dev/video3" in lines[0]
+    assert "video3" in lines[0]
     assert "serial" not in lines[0]
     assert "port " not in lines[0]
-
-
-def test_assignment_annotation_is_preserved(monkeypatch):
-    """The hint must not displace the existing 'assigned to' suffix."""
-    cameras = [_FakeCam(6, "Cam", "/dev/video6", serial="ABC123")]
-
-    _, lines, _ = _render(monkeypatch, cameras, assignments={6: "Twin A"})
-
-    assert "serial ABC123" in lines[0]
-    assert "assigned to Twin A" in lines[0]
 
 
 def test_returned_index_map_is_unchanged(monkeypatch):

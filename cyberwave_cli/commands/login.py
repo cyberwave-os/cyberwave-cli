@@ -7,6 +7,7 @@ import time
 
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.prompt import Prompt
 
 from ..auth import AuthClient, AuthenticationError, Workspace
@@ -17,6 +18,7 @@ from ..credentials import (
     load_credentials,
     save_credentials,
 )
+from ..url_utils import backend_unreachable_message, unreachable_reason
 
 console = Console()
 
@@ -77,14 +79,22 @@ def _stored_api_url(credentials: Credentials) -> str | None:
 def _abort_for_missing_workspaces(user_email: str) -> None:
     """Show the shared no-workspaces guidance and abort."""
     console.print(
-        f"\n[yellow][WARN][/yellow] Logged in as [bold]{user_email}[/bold] "
+        f"\n[yellow]⚠[/yellow] Logged in as [bold]{user_email}[/bold] "
         "but no workspaces found."
     )
     console.print(
-        "[dim]Please create a workspace at https://cyberwave.com "
-        "to use the CLI.[/dim]"
+        "  [dim]Create a workspace at https://cyberwave.com to use the CLI.[/dim]"
     )
-    raise click.Abort()
+    raise click.exceptions.Exit(1)
+
+
+def _report_login_failure(exc: AuthenticationError) -> None:
+    """Print why login failed; an unreachable backend ends the command, retrying cannot help."""
+    reason = unreachable_reason(exc)
+    if reason is not None:
+        console.print(backend_unreachable_message(get_api_url(), reason))
+        raise click.exceptions.Exit(1)
+    console.print(f"\n[red]✗[/red] Login failed: {escape(str(exc))}")
 
 
 def _save_login_credentials(
@@ -113,9 +123,11 @@ def _save_login_credentials(
 
 def _print_login_success(user_email: str, workspace_name: str) -> None:
     """Show the standard post-login success output."""
-    console.print(f"\n[green][OK][/green] Successfully logged in as [bold]{user_email}[/bold]")
-    console.print(f"[dim]Workspace: {workspace_name}[/dim]")
-    console.print(f"[dim]API token saved to {CREDENTIALS_FILE}[/dim]", highlight=False)
+    console.print(
+        f"\n[green]✓[/green] Successfully logged in as [bold]{user_email}[/bold] "
+        f"[dim]· workspace {workspace_name}[/dim]"
+    )
+    console.print(f"  [dim]API token saved to {CREDENTIALS_FILE}[/dim]", highlight=False)
 
 
 @click.command()
@@ -173,7 +185,7 @@ def login(email: str | None, password: str | None, token: str | None) -> None:
             if existing_creds.workspace_name:
                 workspace_info = f" (workspace: [bold]{existing_creds.workspace_name}[/bold])"
             display_email = existing_creds.email or "unknown"
-            msg = f"\n[green][OK][/green] Already logged in as [bold]{display_email}[/bold]"
+            msg = f"\n[green]✓[/green] Already logged in as [bold]{display_email}[/bold]"
             console.print(f"{msg}{workspace_info}")
             # Non-interactive: proceed with re-login (no way to ask).
             if sys.stdin.isatty():
@@ -201,8 +213,8 @@ def login(email: str | None, password: str | None, token: str | None) -> None:
             _print_login_success(token_context.email, workspace.name)
             return
         except AuthenticationError as e:
-            console.print(f"\n[red][ERROR][/red] Login failed: {e}")
-            raise click.Abort() from None
+            _report_login_failure(e)
+            raise click.exceptions.Exit(1) from None
 
     email_from_cli = email
     password_from_cli = password
@@ -248,7 +260,7 @@ def login(email: str | None, password: str | None, token: str | None) -> None:
                                 raise
                     wait_seconds = 2 * token_attempt
                     console.print(
-                        f"[yellow][WARN][/yellow] Temporary token creation failure. "
+                        f"[yellow]⚠[/yellow] Temporary token creation failure. "
                         f"Retrying in {wait_seconds}s..."
                     )
                     time.sleep(wait_seconds)
@@ -266,10 +278,10 @@ def login(email: str | None, password: str | None, token: str | None) -> None:
             return
 
         except AuthenticationError as e:
-            console.print(f"\n[red][ERROR][/red] Login failed: {e}")
+            _report_login_failure(e)
             password_from_cli = None
             if not email_from_cli:
                 email_from_cli = None
             if attempt >= max_attempts:
-                raise click.Abort() from None
+                raise click.exceptions.Exit(1) from None
             console.print("[yellow]Please try again.[/yellow]")

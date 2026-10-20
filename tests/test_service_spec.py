@@ -59,6 +59,7 @@ def test_resolve_deb_registry_urls_uses_public_registry_for_stable(monkeypatch):
 
 def test_stop_service_uses_spec_unit_name(monkeypatch, tmp_path):
     core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "require_root", lambda _hint: None)
     run_calls: list[list[str]] = []
 
     unit_path = tmp_path / "cyberwave-cloud-node.service"
@@ -69,6 +70,7 @@ def test_stop_service_uses_spec_unit_name(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "_has_systemd", lambda: True)
     monkeypatch.setattr(core, "_run", lambda cmd, **_kw: run_calls.append(cmd))
 
+    monkeypatch.setattr(core, "_stop_systemd_unit", lambda unit: run_calls.append(["stop", unit]) or True)
     core.stop_service(cloud_spec)
 
     assert any("cyberwave-cloud-node.service" in " ".join(cmd) for cmd in run_calls)
@@ -153,7 +155,7 @@ def test_create_launchagent_service_prefers_local_venv_binary(monkeypatch, tmp_p
 
     monkeypatch.setattr(core.Path, "home", staticmethod(lambda: home_dir))
     monkeypatch.setattr(core.sys, "executable", str(venv_python))
-    monkeypatch.setattr(core.EDGE_CORE_SPEC, "binary_path", Path("/usr/bin/cyberwave-edge-core"))
+    monkeypatch.setattr(core.EDGE_CORE_SPEC, "binary_path", tmp_path / "usr" / "bin" / "cyberwave-edge-core")
     monkeypatch.setattr(core.shutil, "which", lambda _name: None)
 
     result = core.create_launchagent_service(core.EDGE_CORE_SPEC)
@@ -175,7 +177,7 @@ def test_create_launchagent_service_uses_current_venv_without_local_venv(monkeyp
 
     monkeypatch.setattr(core.Path, "home", staticmethod(lambda: home_dir))
     monkeypatch.setattr(core.sys, "executable", str(venv_python))
-    monkeypatch.setattr(core.EDGE_CORE_SPEC, "binary_path", Path("/usr/bin/cyberwave-edge-core"))
+    monkeypatch.setattr(core.EDGE_CORE_SPEC, "binary_path", tmp_path / "usr" / "bin" / "cyberwave-edge-core")
     monkeypatch.setattr(core.shutil, "which", lambda _name: None)
 
     result = core.create_launchagent_service(core.EDGE_CORE_SPEC)
@@ -1180,6 +1182,8 @@ def test_start_service_returns_false_when_no_systemd(monkeypatch):
 def test_start_service_returns_false_on_systemctl_failure(monkeypatch, tmp_path):
     """start_service must return False when systemctl exits non-zero."""
     core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "is_service_active", lambda _spec: False)
+    monkeypatch.setattr(core, "require_root", lambda _hint: None)
 
     unit_path = tmp_path / "cyberwave-cloud-node.service"
     unit_path.write_text("[Unit]\n")
@@ -1199,6 +1203,8 @@ def test_start_service_returns_false_on_systemctl_failure(monkeypatch, tmp_path)
 def test_start_service_returns_true_on_success(monkeypatch, tmp_path):
     """start_service must return True when systemctl succeeds."""
     core = load_core_module(monkeypatch)
+    monkeypatch.setattr(core, "is_service_active", lambda _spec: False)
+    monkeypatch.setattr(core, "require_root", lambda _hint: None)
 
     unit_path = tmp_path / "cyberwave-cloud-node.service"
     unit_path.write_text("[Unit]\n")
