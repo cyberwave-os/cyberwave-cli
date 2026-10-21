@@ -31,3 +31,10 @@ echo "=== Verifying installed binary ==="
 /usr/bin/cyberwave login --help
 /usr/bin/cyberwave camera --help
 echo "Package install works on ${DEVICE_NAME} (${DEVICE_DISTRO})"
+
+echo "=== Verifying the Docker credential helper ==="
+# Docker resolves credHelpers by executable name; the .deb ships it as a symlink.
+test -L /usr/bin/docker-credential-cyberwave
+printf 'registry.cyberwave.com' | CYBERWAVE_API_KEY=cw_test /usr/bin/docker-credential-cyberwave get \
+    | grep -F '"Secret": "cw_test"'
+echo "Docker credential helper works on ${DEVICE_NAME} (${DEVICE_DISTRO})"

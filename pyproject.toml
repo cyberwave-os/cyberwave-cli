@@ -45,6 +45,7 @@ build = [
 ]
 
 [project.scripts]
+docker-credential-cyberwave = "cyberwave_cli.docker_credentials:main"
 cyberwave = "cyberwave_cli.main:cli"
 
 [project.urls]

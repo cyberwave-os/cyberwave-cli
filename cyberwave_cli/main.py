@@ -34,6 +34,7 @@ BANNER = """
 # Maps CLI command names to their (module_path, attribute_name) for lazy loading.
 # Each command module is only imported when the user actually invokes that command.
 _LAZY_COMMANDS: dict[str, tuple[str, str]] = {
+    "auth": (".docker_credentials", "auth"),
     "camera": (".commands.camera", "camera"),
     "compute": (".commands.compute", "compute"),
     "completion": (".commands.completion", "completion"),
