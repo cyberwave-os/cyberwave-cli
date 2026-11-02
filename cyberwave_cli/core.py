@@ -1127,6 +1127,19 @@ def normalize_environment_reference(reference: str) -> str:
     return ref
 
 
+def _environment_lookup_failure(ref: str, exc: Exception) -> str:
+    """One line on why an ``-e`` lookup failed.
+
+    Never the whole exception: the SDK's carries the response body, and a DEBUG
+    backend's 404 page is ~450 KB of HTML that Rich needs minutes and gigabytes
+    to wrap.
+    """
+    if (getattr(exc, "status_code", None) or getattr(exc, "status", None)) == 404:
+        return f"Environment '{ref}' was not found."
+    reason = (str(exc).strip().splitlines() or [type(exc).__name__])[0][:300]
+    return f"Environment '{ref}' could not be loaded: {reason}."
+
+
 def _resolve_requested_environment(client: Any, workspace_uuid: str, reference: str) -> Any:
     """Resolve an explicit ``-e/--environment`` reference.
 
@@ -1140,7 +1153,7 @@ def _resolve_requested_environment(client: Any, workspace_uuid: str, reference: 
         environment = client.environments.get(ref)
     except Exception as exc:
         raise RuntimeError(
-            f"Environment '{ref}' could not be loaded: {exc}. Check that it exists and that "
+            f"{_environment_lookup_failure(ref, exc)} Check that it exists and that "
             "this device's API token belongs to the same workspace."
         ) from exc
     if environment is None:
@@ -1220,7 +1233,7 @@ def _preflight_environment_reference(reference: str, *, token: str | None = None
     try:
         environment = client.environments.get(ref)
     except Exception as exc:
-        console.print(f"[red]Environment '{ref}' could not be loaded:[/red] {exc}")
+        console.print(f"[red]{escape(_environment_lookup_failure(ref, exc))}[/red]")
         console.print(_PREFLIGHT_ABORT_HINT)
         return False
 

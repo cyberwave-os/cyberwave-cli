@@ -1100,6 +1100,40 @@ def test_preflight_environment_reference_rejects_an_unknown_environment(monkeypa
     assert any("Nothing was installed" in line for line in printed)
 
 
+class _HtmlNotFoundError(Exception):
+    """The SDK's 404 from a DEBUG backend: the technical 404 page in the message."""
+
+    status_code = 404
+
+    def __str__(self):
+        return "Failed to get environment: (404)\nHTTP response body: " + "<li>[x]</li>\n" * 50_000
+
+
+def test_preflight_environment_reference_does_not_print_the_response_body(monkeypatch):
+    """Rendering a DEBUG 404 page took Rich minutes and gigabytes, and CI OOM-killed it."""
+    core = _load_core_module(monkeypatch)
+    printed = _silence_console(monkeypatch, core)
+
+    def _raise(environment_id):
+        raise _HtmlNotFoundError()
+
+    client = SimpleNamespace(
+        workspaces=SimpleNamespace(list=lambda: []),
+        environments=SimpleNamespace(get=_raise),
+    )
+    monkeypatch.setattr(core, "load_credentials", _fake_creds)
+    monkeypatch.setattr(core, "_get_sdk_client", lambda *a, **kw: client)
+    _fake_token_workspace(monkeypatch, core)
+
+    assert core._preflight_environment_reference(_ENV_UUID) is False
+    assert any("was not found" in line for line in printed)
+    assert not any("<li>" in line for line in printed)
+
+    with pytest.raises(RuntimeError, match="was not found") as excinfo:
+        core._resolve_requested_environment(client, "ws-1", _ENV_UUID)
+    assert "<li>" not in str(excinfo.value)
+
+
 def test_preflight_environment_reference_skips_without_credentials(monkeypatch):
     """First-ever pair logs in inside setup_service, so this cannot be the last
     line of defence."""
