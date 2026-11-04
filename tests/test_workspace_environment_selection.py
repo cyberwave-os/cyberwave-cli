@@ -1,3 +1,4 @@
+import errno
 import sys
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -1446,6 +1447,92 @@ def test_ensure_credentials_token_lets_the_env_override_the_stored_backend(monke
     assert saved[0].cyberwave_base_url == "https://staging.api.test"
 
 
+def _password_login_after(monkeypatch, core, saved_token_error):
+    """Fail the dev-paired saved token with *saved_token_error*, then answer the
+    email/password prompt; returns the base URLs ``AuthClient`` was opened with."""
+    urls: list[str | None] = []
+
+    class _FakeAuthClient:
+        def __init__(self, base_url=None):
+            urls.append(base_url)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def login(self, email, password):
+            return "session"
+
+        def get_current_user(self, session_token):
+            return SimpleNamespace(email="op@example.test")
+
+        def get_workspaces(self, session_token):
+            return [SimpleNamespace(uuid="ws-1", name="Main")]
+
+        def create_api_token(self, session_token, workspace_uuid):
+            return SimpleNamespace(token="cw_new")
+
+    def _client(token, base_url=None):
+        def _list():
+            raise saved_token_error
+
+        return SimpleNamespace(workspaces=SimpleNamespace(list=_list))
+
+    monkeypatch.setattr(sys.modules["cyberwave_cli.auth"], "AuthClient", _FakeAuthClient)
+    monkeypatch.setattr(
+        core,
+        "load_credentials",
+        lambda: _fake_creds(token="cw_old", cyberwave_base_url="https://dev.api.test"),
+    )
+    monkeypatch.setattr(core, "_get_sdk_client", _client)
+    monkeypatch.setattr(core, "save_credentials", lambda _creds: None)
+    monkeypatch.setattr(core, "Credentials", lambda **kw: SimpleNamespace(**kw))
+    monkeypatch.setattr(core.Prompt, "ask", lambda *a, **kw: "typed")
+    monkeypatch.delenv("CYBERWAVE_API_KEY", raising=False)
+    return urls
+
+
+def test_ensure_credentials_prompt_logs_in_on_the_devices_backend(monkeypatch):
+    """A saved token the dev backend rejects must not send the email/password
+    login to production."""
+    core = _load_core_module(monkeypatch)
+    _silence_console(monkeypatch, core)
+    urls = _password_login_after(monkeypatch, core, RuntimeError("401 Unauthorized"))
+
+    assert core._ensure_credentials(skip_confirm=True) is True
+    assert urls == ["https://dev.api.test"]
+
+
+def test_ensure_credentials_stops_when_the_devices_backend_is_down(monkeypatch):
+    """Logging in on production instead would pair a dev device with a
+    production account."""
+    core = _load_core_module(monkeypatch)
+    printed = _silence_console(monkeypatch, core)
+    urls = _password_login_after(
+        monkeypatch, core, ConnectionRefusedError(errno.ECONNREFUSED, "refused")
+    )
+
+    assert core._ensure_credentials(skip_confirm=True) is False
+    assert urls == []
+    assert any("Can't reach the Cyberwave backend" in line for line in printed)
+
+
+def test_ensure_credentials_checks_the_env_key_on_the_devices_backend(monkeypatch):
+    core = _load_core_module(monkeypatch)
+    _silence_console(monkeypatch, core)
+    _password_login_after(monkeypatch, core, RuntimeError("401 Unauthorized"))
+    monkeypatch.setenv("CYBERWAVE_API_KEY", "cw_from_env")
+    attempted: list[str | None] = []
+    monkeypatch.setattr(
+        core, "_authenticate_with_api_token", lambda *a, **kw: attempted.append(kw["base_url"])
+    )
+
+    assert core._ensure_credentials(skip_confirm=True) is True
+    assert attempted == ["https://dev.api.test"]
+
+
 def test_ensure_credentials_token_wins_over_the_env_var(monkeypatch):
     core = _load_core_module(monkeypatch)
     _silence_console(monkeypatch, core)
@@ -1550,6 +1637,35 @@ def test_preflight_prefers_the_explicit_token_over_stored_credentials(monkeypatc
     # The token is the explicit one, but the backend stays the device's own —
     # the preflight must probe exactly what the install will use.
     assert used == [("cw_explicit", "https://api.test")]
+
+
+def test_preflight_lets_the_env_override_the_stored_backend(monkeypatch):
+    """``_ensure_credentials`` logs in on ``CYBERWAVE_BASE_URL`` first, so probing
+    the saved backend would check the environment somewhere else."""
+    core = _load_core_module(monkeypatch)
+    _silence_console(monkeypatch, core)
+
+    used: list[tuple[str, str | None]] = []
+    env = SimpleNamespace(uuid=_ENV_UUID, name="Prod", workspace_uuid="ws-1")
+    monkeypatch.setattr(
+        core,
+        "load_credentials",
+        lambda: _fake_creds(token="cw_old", cyberwave_base_url="https://dev.api.test"),
+    )
+    monkeypatch.setattr(
+        core,
+        "collect_runtime_env_overrides",
+        lambda **_kwargs: {"CYBERWAVE_BASE_URL": "https://staging.api.test"},
+    )
+    monkeypatch.setattr(
+        core,
+        "_get_sdk_client",
+        lambda token, base_url=None: used.append((token, base_url)) or _environment_client(env),
+    )
+    _fake_token_workspace(monkeypatch, core)
+
+    assert core._preflight_environment_reference(_ENV_UUID) is True
+    assert used == [("cw_old", "https://staging.api.test")]
 
 
 def test_setup_edge_core_forwards_the_token_to_the_preflight_and_setup_service(monkeypatch):

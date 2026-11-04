@@ -6,8 +6,8 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from ..config import get_api_url
 from ..credentials import load_credentials
+from ..utils import resolve_api_url
 
 console = Console()
 
@@ -22,7 +22,7 @@ def get_sdk_client():
         # workspace_id names the workspace on every request: the backend no
         # longer picks one, so a multi-workspace token would otherwise 400.
         return Cyberwave(
-            base_url=get_api_url(),
+            base_url=resolve_api_url(creds=creds),
             token=creds.token,
             workspace_id=creds.workspace_uuid or None,
         )

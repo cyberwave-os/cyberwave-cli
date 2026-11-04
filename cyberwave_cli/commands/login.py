@@ -11,14 +11,15 @@ from rich.markup import escape
 from rich.prompt import Prompt
 
 from ..auth import AuthClient, AuthenticationError, Workspace
-from ..config import CREDENTIALS_FILE, get_api_url
+from ..config import CREDENTIALS_FILE
 from ..credentials import (
     Credentials,
     collect_runtime_env_overrides,
     load_credentials,
     save_credentials,
 )
-from ..url_utils import backend_unreachable_message, unreachable_reason
+from ..url_utils import backend_line, backend_unreachable_message, unreachable_reason
+from ..utils import resolve_api_url
 
 console = Console()
 
@@ -59,12 +60,12 @@ def _is_retryable_workspace_token_error(error: AuthenticationError) -> bool:
     return "HTTP error: 500" in str(error)
 
 
-def _validate_stored_token(token: str) -> bool:
+def _validate_stored_token(token: str, base_url: str) -> bool:
     """Validate a stored API token by making a lightweight SDK call."""
     try:
         from cyberwave import Cyberwave
 
-        client = Cyberwave(base_url=get_api_url(), token=token)
+        client = Cyberwave(base_url=base_url, token=token)
         client.workspaces.list()
         return True
     except Exception:
@@ -88,13 +89,15 @@ def _abort_for_missing_workspaces(user_email: str) -> None:
     raise click.exceptions.Exit(1)
 
 
-def _report_login_failure(exc: AuthenticationError) -> None:
+def _report_login_failure(exc: AuthenticationError, base_url: str) -> None:
     """Print why login failed; an unreachable backend ends the command, retrying cannot help."""
     reason = unreachable_reason(exc)
     if reason is not None:
-        console.print(backend_unreachable_message(get_api_url(), reason))
+        console.print(backend_unreachable_message(base_url, reason))
         raise click.exceptions.Exit(1)
     console.print(f"\n[red]✗[/red] Login failed: {escape(str(exc))}")
+    # A token from another environment is rejected as invalid, so name the backend.
+    console.print(f"  [dim]Backend: {escape(base_url)}[/dim]")
 
 
 def _save_login_credentials(
@@ -121,12 +124,14 @@ def _save_login_credentials(
     )
 
 
-def _print_login_success(user_email: str, workspace_name: str) -> None:
+def _print_login_success(user_email: str, workspace_name: str, base_url: str) -> None:
     """Show the standard post-login success output."""
     console.print(
         f"\n[green]✓[/green] Successfully logged in as [bold]{user_email}[/bold] "
         f"[dim]· workspace {workspace_name}[/dim]"
     )
+    if backend := backend_line(base_url):
+        console.print(f"  {backend}", highlight=False)
     console.print(f"  [dim]API token saved to {CREDENTIALS_FILE}[/dim]", highlight=False)
 
 
@@ -162,23 +167,20 @@ def login(email: str | None, password: str | None, token: str | None) -> None:
 
     # Check if already logged in by validating the stored API token via the SDK
     existing_creds = load_credentials()
+    # A device paired against dev or staging keeps that backend only in its
+    # stored credentials; without it, logging in again would go to production.
+    base_url = resolve_api_url(creds=existing_creds)
     if existing_creds and existing_creds.token and not auth_token:
         # Validate against stored API URL first when present (edge/dev setups),
-        # then fall back to the current process URL resolution.
+        # then against CYBERWAVE_BASE_URL when it points elsewhere.
         validate_token = existing_creds.token
+        stored_url = _stored_api_url(existing_creds)
         with console.status("[dim]Checking existing credentials...[/dim]"):
-            if _stored_api_url(existing_creds):
-                try:
-                    from cyberwave import Cyberwave
-
-                    stored_url = _stored_api_url(existing_creds)
-                    client = Cyberwave(base_url=stored_url, token=validate_token)
-                    client.workspaces.list()
-                    is_valid = True
-                except Exception:
-                    is_valid = _validate_stored_token(validate_token)
-            else:
-                is_valid = _validate_stored_token(validate_token)
+            checked_url = stored_url
+            is_valid = bool(stored_url) and _validate_stored_token(validate_token, stored_url)
+            if not is_valid and base_url != stored_url:
+                checked_url = base_url
+                is_valid = _validate_stored_token(validate_token, base_url)
 
         if is_valid:
             workspace_info = ""
@@ -187,6 +189,8 @@ def login(email: str | None, password: str | None, token: str | None) -> None:
             display_email = existing_creds.email or "unknown"
             msg = f"\n[green]✓[/green] Already logged in as [bold]{display_email}[/bold]"
             console.print(f"{msg}{workspace_info}")
+            if backend := backend_line(checked_url):
+                console.print(f"  {backend}", highlight=False)
             # Non-interactive: proceed with re-login (no way to ask).
             if sys.stdin.isatty():
                 if not click.confirm("Do you want to log in with a different account?"):
@@ -195,7 +199,7 @@ def login(email: str | None, password: str | None, token: str | None) -> None:
     if auth_token:
         try:
             runtime_overrides = collect_runtime_env_overrides()
-            with AuthClient() as client:
+            with AuthClient(base_url=base_url) as client:
                 with console.status("[dim]Authenticating with API token...[/dim]"):
                     token_context = client.get_api_token_context(auth_token)
 
@@ -210,10 +214,10 @@ def login(email: str | None, password: str | None, token: str | None) -> None:
                 workspace=workspace,
                 runtime_overrides=runtime_overrides,
             )
-            _print_login_success(token_context.email, workspace.name)
+            _print_login_success(token_context.email, workspace.name, base_url)
             return
         except AuthenticationError as e:
-            _report_login_failure(e)
+            _report_login_failure(e, base_url)
             raise click.exceptions.Exit(1) from None
 
     email_from_cli = email
@@ -229,7 +233,7 @@ def login(email: str | None, password: str | None, token: str | None) -> None:
 
         try:
             runtime_overrides = collect_runtime_env_overrides()
-            with AuthClient() as client:
+            with AuthClient(base_url=base_url) as client:
                 with console.status("[dim]Authenticating...[/dim]"):
                     session_token = client.login(login_email, login_password)
                     user = client.get_current_user(session_token)
@@ -274,11 +278,11 @@ def login(email: str | None, password: str | None, token: str | None) -> None:
                     workspace=workspace,
                     runtime_overrides=runtime_overrides,
                 )
-                _print_login_success(user.email, workspace.name)
+                _print_login_success(user.email, workspace.name, base_url)
             return
 
         except AuthenticationError as e:
-            _report_login_failure(e)
+            _report_login_failure(e, base_url)
             password_from_cli = None
             if not email_from_cli:
                 email_from_cli = None
