@@ -134,8 +134,16 @@ def clean_subprocess_env() -> dict[str, str]:
          restore it.
       2. Otherwise, if we detect a PyInstaller bundle (``sys._MEIPASS``),
          strip that path from ``LD_LIBRARY_PATH`` directly.
+
+    ``SSL_CERT_FILE`` is dropped when it names a file in the extraction directory
+    (certifi's bundle, see ca_bundle.py): the directory goes away when this process
+    exits, and a detached child would be left with no CA.
     """
     env = os.environ.copy()
+    meipass = getattr(sys, "_MEIPASS", None)
+
+    if meipass and env.get("SSL_CERT_FILE", "").startswith(meipass + os.sep):
+        del env["SSL_CERT_FILE"]
 
     # Approach 1: restore the original LD_LIBRARY_PATH saved by PyInstaller.
     orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
@@ -147,7 +155,6 @@ def clean_subprocess_env() -> dict[str, str]:
         return env
 
     # Approach 2: manually strip the PyInstaller extraction dir.
-    meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
         ld_path = env.get("LD_LIBRARY_PATH", "")
         if ld_path:

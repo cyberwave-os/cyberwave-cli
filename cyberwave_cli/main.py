@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 import os
+import socket
+import ssl
 import sys
 from typing import Any
 
@@ -116,6 +118,18 @@ def run_sdk_selfcheck() -> int:
     return 0
 
 
+def run_tls_selfcheck(host: str) -> int:
+    """Verify ``host``:443 against the default CA store, which MQTT's TLS uses too."""
+    try:
+        with socket.create_connection((host, 443), timeout=10) as sock:
+            with ssl.create_default_context().wrap_socket(sock, server_hostname=host) as tls:
+                click.echo(f"tls-ok: {host} ({tls.version()})")
+    except OSError as exc:
+        click.echo(f"tls-failed: {host}: {exc} ({ssl.get_default_verify_paths()})", err=True)
+        return 1
+    return 0
+
+
 def _use_utf8_streams() -> None:
     """Switch non-UTF-8 stdout/stderr to UTF-8 with ``errors="replace"``.
 
@@ -203,6 +217,13 @@ def cli(ctx: click.Context) -> None:
 def selfcheck_sdk() -> None:
     """Hidden packaged-runtime check for generated SDK imports."""
     raise click.exceptions.Exit(run_sdk_selfcheck())
+
+
+@cli.command(name="__selfcheck_tls", hidden=True)
+@click.argument("host", default="github.com")
+def selfcheck_tls(host: str) -> None:
+    """Hidden packaged-runtime check that TLS verification finds CA certificates."""
+    raise click.exceptions.Exit(run_tls_selfcheck(host))
 
 
 @cli.command(name="__serial_bridge", hidden=True)

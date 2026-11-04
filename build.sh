@@ -15,7 +15,7 @@ if ! command -v pyinstaller &> /dev/null; then
 fi
 
 # Clean previous builds
-rm -rf build dist *.spec __pyinstaller_entry.py
+rm -rf build dist *.spec __pyinstaller_entry.py __pyinstaller_rthook_ca.py
 
 # Create a wrapper entry point that uses absolute imports
 cat > __pyinstaller_entry.py << 'EOF'
@@ -38,14 +38,24 @@ if __name__ == "__main__":
     main()
 EOF
 
+# Runs before the entry point: the bundled OpenSSL looks for CAs where the build
+# image keeps them, which the host may not (see ca_bundle.py).
+cat > __pyinstaller_rthook_ca.py << 'EOF'
+from cyberwave_cli.ca_bundle import ensure_ca_bundle
+
+ensure_ca_bundle()
+EOF
+
 # Build standalone binary
 echo "Building standalone binary..."
 pyinstaller \
     --onefile \
     --name cyberwave \
+    --runtime-hook __pyinstaller_rthook_ca.py \
     --add-data "cyberwave_cli/install_docker.sh:cyberwave_cli" \
     --hidden-import cyberwave_cli \
     --hidden-import cyberwave_cli._build_version \
+    --hidden-import cyberwave_cli.ca_bundle \
     --hidden-import cyberwave_cli.commands \
     --hidden-import cyberwave_cli.commands.login \
     --hidden-import cyberwave_cli.commands.logout \
@@ -61,8 +71,8 @@ pyinstaller \
     --collect-submodules cyberwave_cli.commands \
     __pyinstaller_entry.py
 
-# Clean up the temporary entry point
-rm -f __pyinstaller_entry.py
+# Clean up the temporary entry point and runtime hook
+rm -f __pyinstaller_entry.py __pyinstaller_rthook_ca.py
 
 echo ""
 echo "=== Build complete ==="
