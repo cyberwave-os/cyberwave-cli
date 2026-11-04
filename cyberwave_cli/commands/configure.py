@@ -6,13 +6,14 @@ import click
 from rich.console import Console
 from rich.prompt import Prompt
 
-from ..config import CREDENTIALS_FILE, get_api_url
+from ..config import CREDENTIALS_FILE
 from ..credentials import (
     Credentials,
     collect_runtime_env_overrides,
     load_credentials,
     save_credentials,
 )
+from ..utils import resolve_api_url
 
 console = Console()
 
@@ -71,7 +72,7 @@ def configure(
     if show:
         creds = load_credentials()
         console.print("\n[bold]Current Configuration:[/bold]")
-        console.print(f"  API URL: [cyan]{get_api_url()}[/cyan]")
+        console.print(f"  API URL: [cyan]{resolve_api_url(creds=creds)}[/cyan]")
 
         if creds:
             console.print(f"  Token: {_redact_secret(creds.token)}")
@@ -111,7 +112,7 @@ def configure(
         # Test the token
         import httpx
 
-        test_url = base_url or get_api_url()
+        test_url = resolve_api_url(base_url, existing_credentials)
 
         console.print(f"\n[dim]Testing token against {test_url}...[/dim]")
 

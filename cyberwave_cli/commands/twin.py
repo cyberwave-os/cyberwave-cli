@@ -428,14 +428,14 @@ def _register_and_pair_edge(twin_uuid: str, fingerprint: str, device_info: dict,
     """
     import httpx
 
-    from ..config import get_api_url
     from ..credentials import load_credentials
+    from ..utils import resolve_api_url
 
     creds = load_credentials()
     if not creds or not creds.token:
         return None
 
-    base_url = get_api_url()
+    base_url = resolve_api_url(creds=creds)
     headers = {"Authorization": f"Bearer {creds.token}"}
 
     try:
@@ -756,8 +756,8 @@ def pair_twin(ctx: click.Context, twin_uuid: str, target_dir: str, yes: bool):
     """
     import httpx
 
-    from ..config import get_api_url
     from ..credentials import load_credentials
+    from ..utils import resolve_api_url
     from cyberwave.fingerprint import generate_fingerprint, get_device_info
 
     # Parse extra args as --key value pairs for schema fields
@@ -781,7 +781,7 @@ def pair_twin(ctx: click.Context, twin_uuid: str, target_dir: str, yes: bool):
     client = get_sdk_client()
     creds = load_credentials()
     token = creds.token if creds else None
-    base_url = get_api_url()
+    base_url = resolve_api_url(creds=creds)
 
     if not client or not token:
         print_error("Not authenticated.", "Run 'cyberwave login' first.")

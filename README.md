@@ -427,7 +427,7 @@ When the backend cannot be reached at all, retrying the password cannot help, so
   → Is it running at that address? Point CYBERWAVE_BASE_URL at the right one and retry.
 ```
 
-The reason is read from the error itself: `no route to host`, `connection refused`, `timed out`, `host name not found` and so on. `cyberwave edge install` uses the same message. While it looks for credentials it tries each candidate address once, skips one that already failed to answer, and never asks for a password when the login address itself is down. A failed login exits with status 1.
+The reason is read from the error itself: `no route to host`, `connection refused`, `timed out`, `host name not found` and so on. `cyberwave edge install` uses the same message. It logs in on one backend, `CYBERWAVE_BASE_URL` or else the one saved in `credentials.json`, and when that backend does not answer it stops: it neither tries another backend nor asks for a password. A failed login exits with status 1.
 
 ## `cyberwave config-dir`
 
@@ -966,7 +966,7 @@ These files are written atomically and, when the installer runs under `sudo`, ha
 
 Other environment variables:
 
-- `CYBERWAVE_BASE_URL`: Override the API URL (default: `https://api.cyberwave.com`). It must be an `http` or `https` URL with a host; anything else stops the CLI with `CYBERWAVE_BASE_URL is not a valid URL: '<value>'` instead of a traceback.
+- `CYBERWAVE_BASE_URL`: Override the API URL (default: the backend saved in `credentials.json`, else `https://api.cyberwave.com`; `cyberwave logout` clears the saved one). It must be an `http` or `https` URL with a host; anything else stops the CLI with `CYBERWAVE_BASE_URL is not a valid URL: '<value>'` instead of a traceback.
 - `CYBERWAVE_ENVIRONMENT`: Environment name (for example `dev`, defaults to `production`)
 - `CYBERWAVE_MQTT_HOST`: MQTT broker host (for example `dev.mqtt.cyberwave.com` for dev; defaults to `mqtt.cyberwave.com`)
 - `CYBERWAVE_MQTT_TOPIC_PREFIX`: Override the MQTT topic prefix (rarely needed; the CLI derives it from `CYBERWAVE_ENVIRONMENT`/credentials)

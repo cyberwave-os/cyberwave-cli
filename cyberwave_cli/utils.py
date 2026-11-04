@@ -18,9 +18,11 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from .config import get_api_url
+from .config import CREDENTIALS_FILE, get_api_url
 from .credentials import Credentials, load_credentials
 from .url_utils import require_valid_url
+
+SAVED_BASE_URL_SOURCE = f"The backend URL saved in {CREDENTIALS_FILE}"
 
 console = Console()
 
@@ -37,13 +39,12 @@ def resolve_api_url(
     credentials, then the SDK default returned by ``get_api_url``.
     """
     if api_url:
-        return api_url
+        return require_valid_url(api_url, "--base-url")
     env_url = os.getenv("CYBERWAVE_BASE_URL")
     if env_url:
-        require_valid_url(env_url, "CYBERWAVE_BASE_URL")
-        return env_url
+        return require_valid_url(env_url, "CYBERWAVE_BASE_URL")
     if creds and creds.cyberwave_base_url:
-        return creds.cyberwave_base_url
+        return require_valid_url(creds.cyberwave_base_url, SAVED_BASE_URL_SOURCE)
     return get_api_url()
 
 
@@ -499,7 +500,7 @@ CYBERWAVE_API_KEY={token}
 CYBERWAVE_TWIN_UUID={twin_uuid}
 
 # API Settings
-CYBERWAVE_BASE_URL={get_api_url()}
+CYBERWAVE_BASE_URL={resolve_api_url(creds=creds)}
 
 # Device Identification
 CYBERWAVE_EDGE_UUID={fingerprint}

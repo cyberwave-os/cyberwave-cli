@@ -21,9 +21,9 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from ..config import get_api_url
 from ..constants import get_fallback_models
 from ..credentials import load_credentials
+from ..utils import resolve_api_url
 
 console = Console()
 
@@ -37,7 +37,7 @@ def fetch_edge_models() -> list[dict]:
     try:
         from cyberwave import Cyberwave
         client = Cyberwave(
-            base_url=get_api_url(),
+            base_url=resolve_api_url(creds=creds),
             token=creds.token,
             workspace_id=creds.workspace_uuid or None,
         )

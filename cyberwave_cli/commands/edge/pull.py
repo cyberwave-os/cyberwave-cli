@@ -89,17 +89,22 @@ def _pull_via_discovery_api(fingerprint: str, target_dir: str, yes: bool) -> boo
     import platform
     import httpx
 
-    from ...config import get_api_url
     from ...credentials import load_credentials
     from cyberwave.fingerprint import get_device_info
-    from ...utils import print_error, print_success, print_warning, write_edge_env
+    from ...utils import (
+        print_error,
+        print_success,
+        print_warning,
+        resolve_api_url,
+        write_edge_env,
+    )
 
     creds = load_credentials()
     if not creds or not creds.token:
         print_error("Not authenticated.", "Run 'cyberwave login' first.")
         return False
 
-    base_url = get_api_url()
+    base_url = resolve_api_url(creds=creds)
     headers = {"Authorization": f"Bearer {creds.token}"}
     device_info = get_device_info()
 

@@ -62,7 +62,14 @@ from .macos import (
     wait_for_launchd_unload,
 )
 from .macos import init_console as _init_macos_console
-from .url_utils import backend_unreachable_message, redact_userinfo, unreachable_reason
+from .url_utils import (
+    backend_line,
+    backend_unreachable_message,
+    redact_userinfo,
+    require_valid_url,
+    unreachable_reason,
+)
+from .utils import SAVED_BASE_URL_SOURCE
 
 console = Console()
 _init_macos_console(console)
@@ -444,7 +451,12 @@ def _resolve_base_url(
     not the backend: without the fallback, re-pairing such a device would probe
     production and report a perfectly good token as rejected.
     """
-    return (runtime_overrides.get("CYBERWAVE_BASE_URL") or fallback or "").strip() or None
+    env_url = (runtime_overrides.get("CYBERWAVE_BASE_URL") or "").strip()
+    if env_url:
+        return require_valid_url(env_url, "CYBERWAVE_BASE_URL")
+    if fallback and fallback.strip():
+        return require_valid_url(fallback, SAVED_BASE_URL_SOURCE)
+    return None
 
 
 def _authenticate_with_api_token(
@@ -496,6 +508,8 @@ def _authenticate_with_api_token(
         )
     )
     console.print(f"[green]✓[/green] Using the API token from {source}")
+    if backend := backend_line(resolved_base_url):
+        console.print(backend, highlight=False)
     console.print(f"[dim]Workspace: {workspace.name}[/dim]")
     console.print(f"[dim]Credentials saved to {CONFIG_DIR}/[/dim]\n")
 
@@ -560,16 +574,24 @@ def _ensure_credentials(*, skip_confirm: bool, token: str | None = None) -> bool
             return False
 
     creds = load_credentials()
+    # The saved token, CYBERWAVE_API_KEY and the prompt all log in on one
+    # backend: CYBERWAVE_BASE_URL, else where the saved credentials point (a dev
+    # or staging pairing). If it does not answer, stop rather than log in on
+    # another one.
+    stored_url = getattr(creds, "cyberwave_base_url", None)
+    login_url = _resolve_base_url(collect_runtime_env_overrides(), stored_url) or get_api_url()
+
     if creds and creds.token:
-        creds_base_url = creds.cyberwave_base_url
         try:
-            sdk_client = _get_sdk_client(creds.token, base_url=creds_base_url)
+            sdk_client = _get_sdk_client(creds.token, base_url=login_url)
             with console.status("[dim]Checking existing credentials...[/dim]"):
                 sdk_client.workspaces.list()
             # API tokens carry no email, so a device paired with --token or
             # CYBERWAVE_API_KEY would otherwise report "Logged in as None".
             identity = creds.email or creds.workspace_name or "this device's API token"
             console.print(f"[green]✓[/green] Logged in as [bold]{identity}[/bold]")
+            if backend := backend_line(login_url):
+                console.print(backend, highlight=False)
             # Backfill persisted environment overrides when running with explicit
             # env vars so systemd startups can reuse them later.
             runtime_overrides = collect_runtime_env_overrides()
@@ -593,18 +615,20 @@ def _ensure_credentials(*, skip_confirm: bool, token: str | None = None) -> bool
                 )
             return True
         except Exception as e:
-            if not _note_unreachable(creds_base_url, e):
+            if not _note_unreachable(login_url, e):
                 console.print(
                     f"[yellow]⚠[/yellow] The saved login no longer works "
                     f"[dim]({escape(_brief_error(e))})[/dim]"
                 )
 
     env_token = os.getenv("CYBERWAVE_API_KEY", "").strip()
-    env_url = _resolve_base_url(collect_runtime_env_overrides(), None) or get_api_url()
-    if env_token and env_url not in unreachable:
+    if env_token and login_url not in unreachable:
         try:
             _authenticate_with_api_token(
-                env_token, skip_confirm=skip_confirm, source="CYBERWAVE_API_KEY"
+                env_token,
+                skip_confirm=skip_confirm,
+                source="CYBERWAVE_API_KEY",
+                base_url=stored_url,
             )
             return True
         except WorkspaceConflictError as e:
@@ -613,22 +637,15 @@ def _ensure_credentials(*, skip_confirm: bool, token: str | None = None) -> bool
             console.print(f"[red]{e}[/red]")
             return False
         except Exception as e:
-            if not _note_unreachable(env_url, e):
+            if not _note_unreachable(login_url, e):
                 console.print(
                     f"[yellow]⚠[/yellow] CYBERWAVE_API_KEY was rejected "
                     f"[dim]({escape(_brief_error(e))})[/dim]"
                 )
 
-    login_url = get_api_url()
     if login_url in unreachable:
         console.print(backend_unreachable_message(login_url, unreachable[login_url]))
         return False
-    for url, reason in unreachable.items():
-        console.print(
-            f"[yellow]⚠[/yellow] {escape(redact_userinfo(url))} did not answer "
-            f"[dim]({reason})[/dim]; logging in to [bold]{escape(redact_userinfo(login_url))}"
-            f"[/bold] instead"
-        )
 
     console.print("[cyan]Log in to continue.[/cyan]\n")
 
@@ -637,7 +654,7 @@ def _ensure_credentials(*, skip_confirm: bool, token: str | None = None) -> bool
 
     try:
         runtime_overrides = collect_runtime_env_overrides()
-        with AuthClient() as client:
+        with AuthClient(base_url=login_url) as client:
             with console.status("[dim]Authenticating...[/dim]"):
                 session_token = client.login(email, password)
                 user = client.get_current_user(session_token)
@@ -681,6 +698,8 @@ def _ensure_credentials(*, skip_confirm: bool, token: str | None = None) -> bool
             )
 
             console.print(f"[green]✓[/green] Logged in as [bold]{user.email}[/bold]")
+            if backend := backend_line(login_url):
+                console.print(backend, highlight=False)
             console.print(f"[dim]Workspace: {workspace.name}[/dim]")
             console.print(f"[dim]Credentials saved to {CONFIG_DIR}/[/dim]\n")
             return True
@@ -1206,16 +1225,15 @@ def _preflight_environment_reference(reference: str, *, token: str | None = None
     ref = normalize_environment_reference(reference)
 
     creds = load_credentials()
+    # Same backend the install itself will use: the env override, else the one
+    # this device is already paired against.
+    probe_base_url = _resolve_base_url(
+        collect_runtime_env_overrides(), getattr(creds, "cyberwave_base_url", None)
+    )
     if token:
         probe_token = token
-        # Same backend the install itself will use: the env override, else the
-        # one this device is already paired against.
-        probe_base_url = _resolve_base_url(
-            collect_runtime_env_overrides(), getattr(creds, "cyberwave_base_url", None)
-        )
     elif creds and creds.token:
         probe_token = creds.token
-        probe_base_url = creds.cyberwave_base_url
     else:
         # No credentials yet: login happens inside setup_service, so let it proceed.
         return True

@@ -12,7 +12,7 @@ camera = importlib.import_module("cyberwave_cli.commands.camera")
 def test_camera_clone_is_noninteractive_and_bounded(monkeypatch, tmp_path, outcome):
     monkeypatch.setattr(camera, "load_credentials", lambda: SimpleNamespace(token="test"))
     monkeypatch.setattr(camera, "get_sdk_client", lambda token: object())
-    monkeypatch.setattr(camera, "get_api_url", lambda: "http://example.test")
+    monkeypatch.setattr(camera, "resolve_api_url", lambda *_a, **_k: "http://example.test")
     monkeypatch.setattr(camera, "check_git_installed", lambda: True)
     monkeypatch.setattr(camera, "write_env_file", lambda *a, **kw: True)
 

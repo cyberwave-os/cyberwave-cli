@@ -21,7 +21,9 @@ def test_configure_saves_registry_tokens_without_overwriting_existing_credential
     saved: dict[str, object] = {}
 
     monkeypatch.setattr(_configure_module, "load_credentials", lambda: existing)
-    monkeypatch.setattr(_configure_module, "get_api_url", lambda: "https://api.example.com")
+    monkeypatch.setattr(
+        _configure_module, "resolve_api_url", lambda *_a, **_k: "https://api.example.com"
+    )
     monkeypatch.setattr(_configure_module, "collect_runtime_env_overrides", lambda **_kwargs: {})
     monkeypatch.setattr(
         _configure_module,
@@ -57,7 +59,9 @@ def test_configure_show_redacts_registry_tokens(monkeypatch: pytest.MonkeyPatch)
     printed: list[str] = []
 
     monkeypatch.setattr(_configure_module, "load_credentials", lambda: creds)
-    monkeypatch.setattr(_configure_module, "get_api_url", lambda: "https://api.example.com")
+    monkeypatch.setattr(
+        _configure_module, "resolve_api_url", lambda *_a, **_k: "https://api.example.com"
+    )
     monkeypatch.setattr(
         _configure_module.console,
         "print",
@@ -73,3 +77,23 @@ def test_configure_show_redacts_registry_tokens(monkeypatch: pytest.MonkeyPatch)
     assert "python-secret-token" not in output
     assert "Internal deb token:" in output
     assert "Internal python token:" in output
+
+
+def test_configure_show_reports_stored_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    creds = _configure_module.Credentials(
+        token="api-token", cyberwave_base_url="https://api-dev.example.com"
+    )
+    printed: list[str] = []
+
+    monkeypatch.delenv("CYBERWAVE_BASE_URL", raising=False)
+    monkeypatch.setattr(_configure_module, "load_credentials", lambda: creds)
+    monkeypatch.setattr(
+        _configure_module.console,
+        "print",
+        lambda message="", *args, **kwargs: printed.append(str(message)),
+    )
+
+    result = CliRunner().invoke(_configure_module.configure, ["--show"])
+
+    assert result.exit_code == 0
+    assert "https://api-dev.example.com" in "\n".join(printed)

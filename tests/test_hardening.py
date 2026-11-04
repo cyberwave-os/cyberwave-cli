@@ -39,6 +39,57 @@ def test_login_with_a_malformed_base_url_exits_cleanly(monkeypatch, url):
     assert "Traceback" not in result.output
 
 
+@pytest.mark.parametrize(
+    ("url", "api_url"),
+    [
+        ("https://cyberwave.com", "https://api.cyberwave.com"),
+        ("https://www.cyberwave.com/", "https://api.cyberwave.com"),
+        ("https://app-dev.cyberwave.com", "https://api-dev.cyberwave.com"),
+        ("https://APP-STAGING.cyberwave.com", "https://api-staging.cyberwave.com"),
+    ],
+)
+def test_a_web_app_url_is_rejected_with_its_api_url(url, api_url):
+    from cyberwave_cli.url_utils import require_valid_url
+
+    with pytest.raises(click.ClickException) as raised:
+        require_valid_url(url, "CYBERWAVE_BASE_URL")
+
+    assert "is the Cyberwave web app, not its API" in raised.value.message
+    assert raised.value.message.endswith(f"Use {api_url}")
+
+
+def test_login_with_the_web_app_as_base_url_stops_before_any_request(monkeypatch):
+    monkeypatch.setenv("CYBERWAVE_BASE_URL", "https://cyberwave.com")
+    monkeypatch.setattr(_login, "load_credentials", lambda: None)
+    monkeypatch.setattr(_login, "AuthClient", lambda **_: pytest.fail("no request expected"))
+
+    result = CliRunner().invoke(_login.login, ["--token", "cw_x"])
+
+    assert result.exit_code == 1
+    assert "CYBERWAVE_BASE_URL is the Cyberwave web app" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_a_saved_web_app_url_is_rejected_by_both_resolvers(monkeypatch):
+    from cyberwave_cli import core
+    from cyberwave_cli.credentials import Credentials
+
+    monkeypatch.delenv("CYBERWAVE_BASE_URL", raising=False)
+    creds = Credentials(token="cw_x", cyberwave_base_url="https://cyberwave.com")
+
+    with pytest.raises(click.ClickException, match="saved in .* is the Cyberwave web app"):
+        utils.resolve_api_url(creds=creds)
+    with pytest.raises(click.ClickException, match="saved in .* is the Cyberwave web app"):
+        core._resolve_base_url({}, creds.cyberwave_base_url)
+    # The environment still overrides the saved URL, which is how a device gets out of it.
+    assert (
+        core._resolve_base_url(
+            {"CYBERWAVE_BASE_URL": "https://api.cyberwave.com"}, "https://cyberwave.com"
+        )
+        == "https://api.cyberwave.com"
+    )
+
+
 def test_resolve_api_url_rejects_a_bad_environment_value_but_not_an_explicit_one(monkeypatch):
     monkeypatch.setenv("CYBERWAVE_BASE_URL", "http://h:8000X")
     with pytest.raises(Exception, match="not a valid URL"):

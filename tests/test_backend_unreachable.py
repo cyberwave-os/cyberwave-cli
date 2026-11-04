@@ -6,9 +6,10 @@ from unittest.mock import MagicMock
 
 import pytest
 from click.testing import CliRunner
+from cyberwave.config import DEFAULT_BASE_URL
 
 from cyberwave_cli.auth import AuthenticationError
-from cyberwave_cli.url_utils import backend_unreachable_message, unreachable_reason
+from cyberwave_cli.url_utils import backend_line, backend_unreachable_message, unreachable_reason
 from tests._core_module_loader import load_core_module
 
 _login_module = importlib.import_module("cyberwave_cli.commands.login")
@@ -57,6 +58,17 @@ def test_unreachable_message_hides_userinfo():
     assert "Can't reach the Cyberwave backend" in message
 
 
+@pytest.mark.parametrize("url", [None, "", DEFAULT_BASE_URL, DEFAULT_BASE_URL + "/"])
+def test_backend_line_leaves_production_unmentioned(url):
+    assert backend_line(url) is None
+
+
+def test_backend_line_names_another_backend_without_userinfo():
+    line = backend_line("http://user:secret@192.168.88.93:8000")
+    assert "Backend: http://***@192.168.88.93:8000" in line
+    assert "secret" not in line
+
+
 class _Status:
     def __enter__(self):
         return self
@@ -85,9 +97,17 @@ def _core_with_offline_backend(monkeypatch, *, offline_urls, saved_url, env_url)
     monkeypatch.setattr(
         core,
         "load_credentials",
-        lambda: SimpleNamespace(token="cw_saved", cyberwave_base_url=saved_url),
+        lambda: SimpleNamespace(
+            token="cw_saved",
+            email="op@example.test",
+            created_at=None,
+            workspace_uuid="ws-1",
+            workspace_name="Main",
+            cyberwave_base_url=saved_url,
+        ),
     )
     monkeypatch.setattr(core, "save_credentials", lambda creds: None)
+    monkeypatch.setattr(core, "Credentials", lambda **kw: SimpleNamespace(**kw))
 
     def _client(token, base_url=None):
         url = base_url or core.get_api_url()
@@ -127,7 +147,9 @@ def test_offline_backend_stops_the_install_without_prompting(monkeypatch):
     assert not any("invalid" in line or "rejected" in line for line in printed)
 
 
-def test_stale_saved_backend_falls_through_to_the_env_backend(monkeypatch):
+def test_stale_saved_backend_is_replaced_by_the_env_backend(monkeypatch):
+    """The saved token is checked on CYBERWAVE_BASE_URL too, so it is never saved
+    next to a backend it was not checked on."""
     old, new = "http://192.168.88.138:8000", "http://192.168.88.93:8000"
     monkeypatch.setenv("CYBERWAVE_API_KEY", "cw_env")
     core, printed = _core_with_offline_backend(
@@ -137,9 +159,13 @@ def test_stale_saved_backend_falls_through_to_the_env_backend(monkeypatch):
     monkeypatch.setattr(
         core, "_authenticate_with_api_token", lambda *a, **kw: attempted.append(kw["source"])
     )
+    saved = []
+    monkeypatch.setattr(core, "save_credentials", saved.append)
 
     assert core._ensure_credentials(skip_confirm=True) is True
-    assert attempted == ["CYBERWAVE_API_KEY"]
+    assert attempted == [], "the saved token already works on the env backend"
+    assert [(c.token, c.cyberwave_base_url) for c in saved] == [("cw_saved", new)]
+    assert f"[dim]Backend: {new}[/dim]" in printed
     assert not any("Can't reach" in line for line in printed)
 
 

@@ -19,6 +19,7 @@ from ..config import (
     get_api_url,
 )
 from ..credentials import load_credentials
+from ..utils import resolve_api_url
 
 console = Console()
 
@@ -36,7 +37,7 @@ def get_sdk_client(token: str):
         creds = load_credentials()
         workspace_id = getattr(creds, "workspace_uuid", None) if creds else None
         return Cyberwave(
-            base_url=get_api_url(),
+            base_url=resolve_api_url(creds=creds),
             token=token,
             workspace_id=workspace_id or None,
         )
@@ -517,7 +518,7 @@ def camera(
         target_path,
         token,
         final_twin_uuid,
-        base_url=get_api_url(),
+        base_url=resolve_api_url(creds=creds),
         camera_id=camera_id,
         camera_fps=camera_fps,
         camera_url=camera_url,
@@ -541,7 +542,7 @@ def camera(
     console.print(f"  • Twin UUID: [dim]{final_twin_uuid}[/dim]")
 
     # Generate environment URL
-    api_base = get_api_url().replace("api.", "").replace("/api", "")
+    api_base = resolve_api_url(creds=creds).replace("api.", "").replace("/api", "")
     if "localhost" in api_base or "127.0.0.1" in api_base:
         env_url = f"http://localhost:3000/environments/{env_uuid}"
     else:
