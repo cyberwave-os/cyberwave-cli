@@ -1346,19 +1346,7 @@ def _listen_to_loopback_connect(listen: str) -> str | None:
 def _zenoh_probe_endpoint(
     driver_containers: list[str], worker_containers: list[str]
 ) -> list[str] | None:
-    """Pick a reasonable ``connect/endpoints`` list for the doctor's session.
-
-    We try, in order:
-      1. Any ``ZENOH_LISTEN`` value declared on a running worker/driver
-         container (most accurate on bridge-networked setups).
-      2. The container's bridge IP at port 7447.
-      3. Fall back to ``tcp/127.0.0.1:7447`` — correct when the
-         driver/worker use host networking (the common Linux edge case).
-
-    Returns ``None`` when no running container could be used. The caller
-    is then expected to leave multicast discovery enabled so distant
-    peers on the same network can still be picked up.
-    """
+    """Prefer ZENOH_LISTEN, bridge IP, then loopback; skip without a running container."""
     from ..monitor import get_container_ip
 
     candidates = worker_containers + driver_containers
@@ -1382,13 +1370,8 @@ def _zenoh_probe_endpoint(
 def _probe_zenoh_bus(
     *, duration: float, connect: list[str] | None
 ) -> tuple[bool, dict[str, int], str | None]:
-    """Subscribe to ``**`` for *duration* seconds. Returns (ok, counts, err).
-
-    When *connect* is ``None`` we leave multicast scouting enabled so the
-    probe has a chance of discovering peers we couldn't enumerate via
-    Docker. When *connect* is set we disable multicast (the endpoint list
-    is authoritative, multicast would just add latency).
-    """
+    if not connect:
+        return False, {}, "No configured Zenoh endpoint; live session skipped"
     try:
         import zenoh
     except ImportError:
@@ -1398,11 +1381,8 @@ def _probe_zenoh_bus(
     session: Any = None
     subscription: Any = None
     try:
-        cfg = zenoh.Config()
-        cfg.insert_json5("transport/shared_memory/enabled", "false")
-        if connect:
-            cfg.insert_json5("connect/endpoints", json.dumps(connect))
-            cfg.insert_json5("scouting/multicast/enabled", "false")
+        from ..discovery.probes import endpoint_session_config
+        cfg = endpoint_session_config(zenoh, connect)
         session = zenoh.open(cfg)
 
         def _on_sample(sample: Any) -> None:
@@ -1510,7 +1490,14 @@ def _collect_runtime_checks(
                     "are disabled. Verify a worker/driver container is "
                     "running and exposing ZENOH_LISTEN (default "
                     "tcp/0.0.0.0:7447).\n"
-                    f"Attempted connect: {connect or 'default/multicast'}"
+                    "Attempted connect: "
+                    + (
+                        str(connect)
+                        if connect
+                        else "none (no running cyberwave-driver-*/cyberwave-worker-* "
+                        "container; the probe does not use multicast or gossip "
+                        "discovery)"
+                    )
                 ),
             )
         )
@@ -1567,12 +1554,6 @@ def _collect_runtime_checks(
             hint_lines.append(
                 f"  • Saw {admin_msgs} Zenoh admin message(s) — the bus "
                 "is reachable but no publisher is putting to it."
-            )
-        if not drivers and not workers:
-            hint_lines.append(
-                "  • No cyberwave-driver-* / cyberwave-worker-* containers "
-                "are running locally; the probe used "
-                f"{connect or 'default multicast discovery'}."
             )
         checks.append(
             _Check(
@@ -1763,12 +1744,12 @@ def _print_preflight_checks(checks: list[_Check], *, verbose: bool) -> None:
 )
 @click.option(
     "--runtime/--no-runtime",
-    default=True,
+    default=False,
     show_default=True,
     help=(
-        "Run the live-bus probe: subscribe to Zenoh for a few seconds and "
-        "compare actual traffic against worker hook key-expressions. "
-        "Disable with --no-runtime for a pure-paperwork check."
+        "Also run the live-bus probe (off by default): subscribe to Zenoh for "
+        "a few seconds and compare actual traffic against worker hook "
+        "key-expressions. Default checks do not open a Zenoh session."
     ),
 )
 @click.option(
@@ -1776,28 +1757,30 @@ def _print_preflight_checks(checks: list[_Check], *, verbose: bool) -> None:
     default=3.0,
     type=float,
     show_default=True,
-    help="Seconds to listen on the Zenoh bus during the runtime probe",
+    help="Seconds to listen on the Zenoh bus; only used with --runtime",
 )
 def worker_doctor(verbose: bool, runtime: bool, window: float) -> None:
     """Diagnose why a worker may not receive frames.
 
-    Runs two groups of checks:
+    Runs static checks by default; runtime checks are opt-in:
 
     \b
-    1. Static (paperwork): edge-core/docker present, worker files readable,
-       co-located drivers running, env-var agreement between driver and
-       worker containers, twin bindings.
-    2. Runtime (actual traffic): opens a short Zenoh subscription to '**',
-       counts keys seen, and checks that every @cw.on_* hook declared in
-       your worker files has a matching publisher on the bus. Catches the
-       main 'paperwork OK, nothing flowing' failure mode.
+    1. Static (paperwork, default): edge-core/docker present, worker files
+       readable, co-located drivers running, env-var agreement between
+       driver and worker containers, twin bindings.
+    2. Runtime (actual traffic, --runtime): opens a short Zenoh client
+       session to a running driver/worker container's endpoint (no
+       multicast or gossip discovery), subscribes to '**', counts keys
+       seen, and checks that every @cw.on_* hook declared in your worker
+       files has a matching publisher on the bus. Catches the main
+       'paperwork OK, nothing flowing' failure mode.
 
     \b
     Examples:
-        cyberwave worker doctor
+        cyberwave worker doctor                        # static checks only
         cyberwave worker doctor --verbose
-        cyberwave worker doctor --no-runtime      # skip the 3s bus probe
-        cyberwave worker doctor --window 6        # longer runtime probe
+        cyberwave worker doctor --runtime              # also probe the bus for 3s
+        cyberwave worker doctor --runtime --window 6   # longer runtime probe
     """
     workers_dir = _get_workers_dir()
     console.print("\n[bold]Cyberwave worker doctor[/bold]\n")
@@ -1816,7 +1799,7 @@ def worker_doctor(verbose: bool, runtime: bool, window: float) -> None:
         runtime_checks = _collect_runtime_checks(workers_dir, duration=window)
         _print_preflight_checks(runtime_checks, verbose=verbose)
     else:
-        console.print("\n[dim]Runtime checks skipped (--no-runtime).[/dim]")
+        console.print("\n[dim]Runtime checks skipped; opt in with --runtime.[/dim]")
 
     all_checks = static_checks + runtime_checks
     errors = sum(1 for c in all_checks if c.level == "error")

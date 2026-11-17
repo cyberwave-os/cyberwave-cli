@@ -7,6 +7,7 @@ load the wrong libstdc++ and fail with errors like:
 """
 
 import os
+import shutil
 import subprocess
 import sys
 from unittest.mock import MagicMock, patch
@@ -326,15 +327,6 @@ def linux_with_v4l2(monkeypatch):
     monkeypatch.setattr("cyberwave_cli.device_utils.shutil.which", lambda _: "/usr/bin/v4l2-ctl")
 
 
-def test_hint_v4l2_ctl_missing(monkeypatch, linux_with_v4l2):
-    from cyberwave_cli.device_utils import no_camera_hint
-
-    monkeypatch.setattr(
-        "cyberwave_cli.device_utils.shutil.which", lambda tool: "/usr/bin/apt-get" if tool == "apt-get" else None
-    )
-    assert "apt-get install v4l-utils" in no_camera_hint()
-
-
 def test_hint_camera_on_usb_but_no_driver(monkeypatch, linux_with_v4l2):
     from cyberwave_cli.device_utils import no_camera_hint
 
@@ -386,16 +378,52 @@ def test_usb_camera_without_driver_reads_sysfs(tmp_path):
     assert _usb_camera_without_driver(tmp_path) is False
 
 
-@pytest.mark.parametrize("manager, expected", [
-    ("apt-get", "sudo apt-get install v4l-utils"),
-    ("pacman", "sudo pacman -S v4l-utils"),
-    (None, "your package manager"),
-])
-def test_missing_tool_package_manager(monkeypatch, manager, expected):
-    from cyberwave_cli.device_utils import no_camera_hint
-    monkeypatch.setattr("platform.system", lambda: "Linux")
-    monkeypatch.setattr("cyberwave_cli.device_utils.shutil.which", lambda tool: tool if tool == manager else None)
-    assert expected in no_camera_hint()
+def _fake_sysfs(tmp_path, monkeypatch):
+    usb = tmp_path / "devices" / "usb1" / "1-2"
+    iface = usb / "1-2:1.0"
+    (iface / "driver_dir").mkdir(parents=True)
+    (usb / "serial").write_text("SN123\n")
+    (tmp_path / "bus" / "usb").mkdir(parents=True)
+    (iface / "subsystem").symlink_to(tmp_path / "bus" / "usb")
+    drv = tmp_path / "drivers" / "uvcvideo"
+    drv.mkdir(parents=True)
+    (iface / "driver").symlink_to(drv)
+    root = tmp_path / "video4linux"
+    for n, idx in (("video0", "0"), ("video1", "1")):
+        e = root / n
+        e.mkdir(parents=True)
+        (e / "name").write_text("HD Webcam\n")
+        (e / "index").write_text(idx + "\n")
+        (e / "device").symlink_to(iface)
+    dev = tmp_path / "dev"
+    dev.mkdir()
+    (dev / "video0").write_text("")
+    (dev / "video1").write_text("")
+    return root, dev
+
+
+def test_sysfs_camera_discovery_without_v4l2_ctl(tmp_path, monkeypatch):
+    from cyberwave_cli import device_utils
+
+    root, dev = _fake_sysfs(tmp_path, monkeypatch)
+    cams = device_utils.discover_cameras_sysfs(root, dev)
+    assert len(cams) == 1
+    cam = cams[0]
+    assert cam.card == "HD Webcam"
+    assert cam.paths == [str(dev / "video0"), str(dev / "video1")]
+    assert cam.driver == "uvcvideo"
+    assert cam.serial == "SN123"
+    assert cam.bus_info.startswith("usb-")
+
+
+def test_discover_falls_back_to_sysfs_when_v4l2_ctl_missing(monkeypatch):
+    from cyberwave_cli import device_utils
+
+    sentinel = [device_utils.CameraDevice(card="x", bus_info="usb-1", paths=["/dev/video0"])]
+    monkeypatch.setattr(device_utils.shutil, "which", lambda _: None)
+    monkeypatch.setattr(device_utils, "_ensure_video_device_permissions", lambda: None)
+    monkeypatch.setattr(device_utils, "discover_cameras_sysfs", lambda: sentinel)
+    assert device_utils.discover_usb_cameras_v4l2() == sentinel
 
 
 def test_camera_mapping_preserves_sources(tmp_path):
@@ -457,3 +485,19 @@ def test_install_shows_camera_diagnostic(monkeypatch):
     monkeypatch.setattr(core.console, "print", lambda message: output.append(message))
     core._detect_and_select_cameras()
     assert any("sudo pacman -S v4l-utils" in line for line in output)
+
+
+def test_camera_detection_never_installs_host_packages_even_as_root(monkeypatch):
+    from cyberwave_cli import core, device_utils
+
+    calls = []
+    monkeypatch.setattr("platform.system", lambda: "Linux")
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(shutil, "which", lambda t: "/usr/bin/apt-get" if t == "apt-get" else None)
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0)
+    )
+    monkeypatch.setattr(device_utils, "discover_usb_cameras", lambda: [])
+    monkeypatch.setattr(core.console, "print", lambda *a, **k: None)
+    core._detect_and_select_cameras()
+    assert not [c for c in calls if c and c[0] in {"apt-get", "apt", "dpkg"}]

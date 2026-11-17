@@ -27,13 +27,13 @@ def test_install_edge_core_defaults_to_stable_package(monkeypatch):
     monkeypatch.setattr(
         core,
         "_apt_get_install",
-        lambda spec, *, package_name, package_version: (
-            calls.append((package_name, package_version)) or True
+        lambda spec, *, package_name, package_version, channel: (
+            calls.append((package_name, package_version, channel)) or True
         ),
     )
 
     assert core.install_edge_core() is True
-    assert calls == [("cyberwave-edge-core", None)]
+    assert calls == [("cyberwave-edge-core", None, "stable")]
 
 
 def test_install_edge_core_uses_selected_channel_and_version(monkeypatch):
@@ -47,15 +47,15 @@ def test_install_edge_core_uses_selected_channel_and_version(monkeypatch):
     monkeypatch.setattr(
         core,
         "_apt_get_install",
-        lambda spec, *, package_name, package_version: (
-            calls.append((package_name, package_version)) or True
+        lambda spec, *, package_name, package_version, channel: (
+            calls.append((package_name, package_version, channel)) or True
         ),
     )
 
     assert (
         core.install_edge_core(channel="staging", version="0.0.42.595") is True
     )
-    assert calls == [("cyberwave-edge-core-staging", "0.0.42.595")]
+    assert calls == [("cyberwave-edge-core-staging", "0.0.42.595", "staging")]
 
 
 def test_install_edge_core_uses_pip_for_nonstable_channel_without_apt(monkeypatch):
@@ -410,14 +410,17 @@ def test_edge_install_has_no_short_form_for_token():
     assert "No such option: -t" in result.output, result.output
 
 
-def test_reconfigure_camera_on_linux_rebinds_network_cameras_before_usb(monkeypatch):
+@pytest.mark.parametrize("yes", [False, True])
+def test_reconfigure_camera_on_linux_rebinds_network_cameras_before_usb(monkeypatch, yes):
     calls: list[object] = []
     monkeypatch.setitem(
         sys.modules,
         "cyberwave_cli.core",
         types.SimpleNamespace(
             _list_network_twins=lambda: [("twin", "AX8", object())],
-            _detect_and_bind_network_devices=lambda: calls.append("network") or {"twin": {}},
+            _detect_and_bind_network_devices=lambda **kw: (
+                calls.append(("network", kw)) or {"twin": {}}
+            ),
             _detect_and_select_cameras=lambda: calls.append("usb"),
             _record_network_twin_sources=lambda bindings: calls.append(("record", bindings)),
             normalize_environment_reference=_real_normalize_environment_reference,
@@ -425,7 +428,9 @@ def test_reconfigure_camera_on_linux_rebinds_network_cameras_before_usb(monkeypa
     )
     monkeypatch.setattr(importlib.import_module("cyberwave_cli.macos"), "is_macos", lambda: False)
 
-    result = CliRunner().invoke(_edge_module.install_edge, ["--reconfigure-camera"])
+    result = CliRunner().invoke(
+        _edge_module.install_edge, ["--reconfigure-camera"] + (["--yes"] if yes else [])
+    )
 
     assert result.exit_code == 0, result.output
-    assert calls == ["network", "usb", ("record", {"twin": {}})]
+    assert calls == [("network", {"_interactive": not yes}), "usb", ("record", {"twin": {}})]

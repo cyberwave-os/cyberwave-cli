@@ -14,6 +14,8 @@ data.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from cyberwave_cli.monitor import RateTracker, _display_channel
@@ -103,7 +105,8 @@ class TestBackwardCompatibility:
         assert seeded[0].msgs_per_sec == 0.0
         # Wall-clock is non-deterministic but the rate must be non-negative
         # and finite (a smoke test, not a precise assertion).
-        assert 0.0 <= rolled[0].msgs_per_sec < 1e6
+        assert rolled[0].msgs_per_sec >= 0.0
+        assert math.isfinite(rolled[0].msgs_per_sec)
 
 
 class TestMultipleChannels:

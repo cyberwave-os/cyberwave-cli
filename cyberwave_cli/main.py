@@ -191,7 +191,7 @@ def cli(ctx: click.Context) -> None:
     Edge & Cloud:
       edge        Manage edge node (start, stop, pull config)
       compute     Manage cloud node (install, start, stop, status)
-      scan        Discover IP cameras on the network
+      scan        Inspect local networking; verify one known endpoint
       completion  Generate/install shell completion
       update      Update this CLI (and the SDK it bundles)
 

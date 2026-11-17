@@ -577,6 +577,27 @@ def test_runtime_checks_info_when_zenoh_not_installed() -> None:
     assert named["zenoh-liveness"].level == "info"
 
 
+def test_runtime_checks_without_containers_report_no_discovery_fallback() -> None:
+    """With no local driver/worker there is no endpoint, and the probe must
+    not claim it tried multicast: discovery fallback was removed."""
+    wm = _module()
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = Path(tmp) / "workers"
+        wd.mkdir()
+        with (
+            patch.object(wm, "_running_driver_containers", return_value=[]),
+            patch.object(wm, "_running_worker_containers", return_value=[]),
+        ):
+            checks = wm._collect_runtime_checks(wd, duration=0.1)
+    named = {c.name: c for c in checks}
+    liveness = named["zenoh-liveness"]
+    assert liveness.level == "warn"
+    assert "No configured Zenoh endpoint" in liveness.message
+    hint = liveness.hint or ""
+    assert "does not use multicast or gossip discovery" in hint
+    assert "default/multicast" not in hint
+
+
 def test_runtime_checks_warn_on_session_open_error() -> None:
     """A Zenoh connect error (session open failure) must warn, not crash."""
     wm = _module()
@@ -814,3 +835,13 @@ def handle(frame, ctx):
         bindings = wm._scan_hook_registrations(f)
     assert len(bindings) == 1
     assert bindings[0].expected_key == f"cw/{_TWIN_A}/data/frames/color_camera"
+
+
+def test_doctor_default_does_not_open_live_session(monkeypatch, tmp_path):
+    wm = _module()
+    monkeypatch.setattr(wm, '_collect_preflight_checks', lambda *a, **k: [])
+    def forbidden(*a, **k):
+        raise AssertionError('implicit live probe')
+    monkeypatch.setattr(wm, '_collect_runtime_checks', forbidden)
+    result = CliRunner().invoke(wm.worker, ['doctor'])
+    assert 'Runtime checks skipped' in result.output

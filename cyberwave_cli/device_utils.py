@@ -267,6 +267,55 @@ def _usb_camera_without_driver(usb_devices: Path = Path("/sys/bus/usb/devices"))
     return False
 
 
+def discover_cameras_sysfs(
+    root: Path = Path("/sys/class/video4linux"), dev: Path = Path("/dev")
+) -> list[CameraDevice]:
+    """Discover USB cameras from sysfs, for hosts without v4l2-ctl.
+
+    Groups the /dev/video* nodes of one USB interface into a single camera.
+    Non-USB nodes (codecs, ISPs, platform devices) are skipped.
+    """
+    cameras: dict[Path, CameraDevice] = {}
+    try:
+        entries = sorted(
+            (e for e in root.iterdir() if re.fullmatch(r"video\d+", e.name)),
+            key=lambda e: int(e.name[5:]),
+        )
+    except OSError:
+        return []
+
+    for entry in entries:
+        try:
+            iface = (entry / "device").resolve()
+            if (iface / "subsystem").resolve().name != "usb":
+                continue
+            card = (entry / "name").read_text().strip()
+        except OSError:
+            continue
+        node = dev / entry.name
+        if not node.exists():
+            continue
+        camera = cameras.get(iface)
+        if camera is None:
+            usb_device = iface.parent
+            driver = None
+            if (iface / "driver").exists():
+                driver = (iface / "driver").resolve().name
+            serial = None
+            try:
+                serial = (usb_device / "serial").read_text().strip() or None
+            except OSError:
+                pass
+            camera = cameras[iface] = CameraDevice(
+                card=card, bus_info=f"usb-{usb_device.name}", driver=driver, serial=serial
+            )
+        camera.paths.append(str(node))
+
+    devices = list(cameras.values())
+    logger.info("Discovered %d USB camera(s) via sysfs", len(devices))
+    return devices
+
+
 def discover_usb_cameras_v4l2() -> list[CameraDevice]:
     """Discover USB cameras using v4l2-ctl (Linux only).
 
@@ -277,8 +326,9 @@ def discover_usb_cameras_v4l2() -> list[CameraDevice]:
         List of CameraDevice objects, empty if v4l2-ctl is not available or fails.
     """
     if not shutil.which("v4l2-ctl"):
-        logger.warning("v4l2-ctl not found; cannot enumerate cameras (install v4l-utils)")
-        return []
+        logger.warning("v4l2-ctl not found; falling back to sysfs (install v4l-utils)")
+        _ensure_video_device_permissions()
+        return discover_cameras_sysfs()
 
     _ensure_video_device_permissions()
 

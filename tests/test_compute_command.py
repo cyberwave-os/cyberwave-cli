@@ -666,6 +666,7 @@ def test_uninstall_yes_removes_package(monkeypatch, tmp_path):
     fake_core.clear_service_override = lambda spec: None
 
     compute = _load_compute_module(monkeypatch, fake_core)
+    monkeypatch.setattr(compute.shutil, "which", lambda name: "/usr/bin/apt-get" if name == "apt-get" else None)
     compute.uninstall_cloud_node.callback(yes=True)
 
     apt_remove_calls = [cmd for cmd in run_calls if "apt-get" in cmd and "remove" in cmd]

@@ -95,7 +95,7 @@ picking one for you. Re-run `cyberwave login` to change the selected workspace.
 | `model`       | Manage ML model bindings on edge nodes                        |
 | `plugin`      | Manage edge node plugins                                      |
 | `environment` | List and inspect environments                                 |
-| `scan`        | Discover IP cameras and NVRs on the local network             |
+| `scan`        | Inspect local networking; optionally verify one known service |
 | `camera`      | Bootstrap a camera edge project                               |
 | `so101`       | Bootstrap an SO-101 robot arm project                         |
 | `manifest`    | Validate `cyberwave.yml` manifests                            |
@@ -229,14 +229,15 @@ Streams logs from the edge worker container (requires Docker).
 ### `cyberwave worker doctor`
 
 ```bash
-cyberwave worker doctor                 # static + runtime checks (default)
+cyberwave worker doctor                 # static checks (default)
 cyberwave worker doctor --verbose       # show hints for passing checks too
-cyberwave worker doctor --no-runtime    # skip the live-bus probe
-cyberwave worker doctor --window 6      # longer runtime probe (seconds)
+cyberwave worker doctor --runtime       # also probe the live Zenoh bus
+cyberwave worker doctor --runtime --window 6  # longer runtime probe (seconds)
 ```
 
 Diagnoses the common silent failure modes where a worker container looks
-healthy but hooks report `frames: 0`. The doctor runs two groups of checks.
+healthy but hooks report `frames: 0`. The doctor runs static checks by
+default; `--runtime` adds the runtime checks.
 
 **Static ("paperwork") checks:**
 
@@ -251,7 +252,7 @@ healthy but hooks report `frames: 0`. The doctor runs two groups of checks.
   deliberately conservative and only flags names we've explicitly
   mapped.
 
-**Runtime checks** — open a short Zenoh subscription to `**` and compare
+**Runtime checks** (`--runtime`) — open a short Zenoh subscription to `**` and compare
 live traffic against every `@cw.on_*(<twin>)` hook declared in the worker
 files. Three distinct diagnoses are emitted:
 
@@ -566,7 +567,7 @@ A twin that carries both a camera and an audio sensor (a webcam with a microphon
 
 Edge Core follows a changed camera pin by recreating the driver, and alerts when a pinned camera disappears; see *Camera pins: drift and missing devices* in the cyberwave-edge-core README.
 
-**Network devices.** Hardware on the Ethernet port, such as a FLIR AX8 thermal camera, has no `/dev` node and its address can change, so it is bound differently. A twin opts in through a `network_discovery` block in its asset's metadata. Before the USB cameras, the installer looks at the wired ports, gives an unaddressed port DHCP and link-local addressing (after asking), finds each device by mDNS, ARP or the ports it serves, identifies it by MAC and writes its address into the twin, for example `video_device=rtsp://169.254.150.216/avc` plus `mac_address`. Such a twin never enters the USB camera menu. A driver param `-e CYBERWAVE_METADATA_VIDEO_DEVICE=...` naming a real address is followed and checked. One that names no address, such as the AX8 asset's `rtsp://192.168.X.X/avc` placeholder, is ignored and removed once the device is found. When the param, the scan and the saved MAC disagree, or several twins compete for one device, the installer asks. The [wired network devices](docs/wired-network-devices.md) guide explains the whole flow, every prompt and default, the NetworkManager changes, and how to describe a new kind of IP device in metadata.
+**Network devices.** Installation preserves host addresses, routes, interface state and NetworkManager profiles. It reports local configuration and cached observations; it does not run ARP sweeps, multicast discovery or automatic device probes. Declared network devices stay out of USB selection. Existing endpoints remain configured, and a resolved declaration can accept an explicitly supplied endpoint through the interactive `bind` choice. Driver addresses are attributed references, only when the runtime profile can be resolved; unresolved selection preserves pins and local/cloud camera mappings. Installation does not configure an unaddressed robot or camera link. See the [network guide](docs/wired-network-devices.md) for manual setup, overlapping networks and optional one-service verification.
 
 One caveat: a RealSense depth camera is opened by its serial through librealsense, which ignores `video_device`, so a depth twin is only truly pinned when its `serial_number` is set.
 
@@ -890,19 +891,35 @@ cyberwave environment show <UUID>
 
 ## `cyberwave scan`
 
-Discover IP cameras and NVRs on the local network using TCP port scanning, ONVIF WS-Discovery, and UPnP/SSDP.
+Inspect local interfaces, cached neighbors and the kernel route to a supplied address.
+The default makes no device connections and performs no discovery.
 
 ```bash
-cyberwave scan                        # auto-detect subnet
-cyberwave scan -s 10.0.0              # specific subnet
-cyberwave scan --json                 # JSON output
-cyberwave scan --no-ports             # discovery protocols only
-cyberwave scan -t 2.0                 # increase timeout
-cyberwave scan --wired                # hardware on this host's Ethernet ports
-cyberwave scan --wired --json         # ... with every mDNS service, instance and TXT record
+cyberwave scan
+cyberwave scan --wired --json
+cyberwave scan --target 192.168.50.10
+cyberwave scan --target 192.168.50.10 --port 554 --verify
+cyberwave scan --target 192.168.50.10 --port 443 --verify --tls --server-name device.example
 ```
 
-`--wired` runs the discovery that `cyberwave edge install` uses to bind network devices, without changing anything. It lists each Ethernet port with its link and addresses, then each device on it with its MAC, vendor and announced mDNS services; a device announcing an address the host cannot reach is marked "other subnet". The JSON output is plain stdout, safe to pipe, and is the quickest way to find the service types, names and TXT records for a new device's `network_discovery` block (see [wired network devices](docs/wired-network-devices.md)).
+`--verify` explicitly requests one TCP connection, with a five-second overall deadline
+including optional TLS. Select a documented service port; the CLI does not guess ports
+or resolve target hostnames. `--interface` enforces an interface or skips the check.
+TLS uses standard trust/name validation; `--ca-file` supplies a trusted private CA and
+`--certificate-sha256` checks an independently provisioned device certificate fingerprint.
+A TCP response, authenticated TLS server and matched device credential are separate results.
+A shared certificate does not establish a unique physical device.
+
+Subnet/range and old scan options (`-s`, `-t`, `--no-ports`, `--no-onvif`, `--no-upnp`)
+are rejected with migration guidance. `--wired` is local inventory, not Wi-Fi or Ethernet
+device discovery. Unknown endpoints must come from device documentation, inventory,
+configuration or existing DHCP leases. Deployment policy determines whether an explicit
+check is allowed; passive diagnosis remains usable without one. See the
+[network guide](docs/wired-network-devices.md).
+
+`cyberwave worker doctor` also defaults to local checks. `--runtime` explicitly enables
+its live Zenoh session. Requested doctor/monitor sessions use configured TCP endpoints,
+with bounded startup and no multicast/gossip discovery, peer autoconnect or listeners.
 
 ## `cyberwave camera`
 

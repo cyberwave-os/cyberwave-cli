@@ -8,7 +8,6 @@ This module provides the logic for:
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import os
 import platform
@@ -23,10 +22,10 @@ import textwrap
 import time
 import uuid
 from collections import Counter
-from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Iterator, NamedTuple
 
 from rich.console import Console
 from rich.markup import escape
@@ -373,6 +372,7 @@ def _save_environment_file(
     environment_uuid: str | None = None,
     environment_name: str | None = None,
     twin_uuids: list[str] | None = None,
+    driver_context_fingerprint: str | None = None,
 ) -> None:
     """Persist selected workspace/environment for edge startup."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -386,6 +386,8 @@ def _save_environment_file(
         payload["name"] = environment_name
     if twin_uuids is not None:
         payload["twin_uuids"] = twin_uuids
+    if driver_context_fingerprint:
+        payload["driver_context_fingerprint"] = driver_context_fingerprint
 
     serialized_payload = json.dumps(payload, indent=2) + "\n"
 
@@ -1898,6 +1900,7 @@ def configure_edge_environment(
                 f"[yellow]Failed to clear stale edge fingerprint from "
                 f"{detach_failed_count} twin(s).[/yellow]"
             )
+        failed_count = written = 0
         if selected_twin_uuids:
             updated_count, failed_count = _attach_edge_fingerprint_to_twins(
                 client,
@@ -1918,6 +1921,13 @@ def configure_edge_environment(
             environment_uuid=env_uuid,
             environment_name=env_name or None,
             twin_uuids=selected_twin_uuids,
+            driver_context_fingerprint=(
+                edge_fingerprint
+                if not detach_failed_count
+                and not failed_count
+                and written == len(selected_twin_uuids)
+                else None
+            ),
         )
 
         console.print(f"[green]Environment saved:[/green] {ENVIRONMENT_FILE}")
@@ -4482,733 +4492,274 @@ def _camera_pin_metadata(identity: str) -> dict[str, str]:
     return {"serial_number": identity}
 
 
-def _twin_network_spec(twin_uuid: str) -> Any:
-    """The asset's ``network_discovery`` with the twin's merged over it.
+def _cached_child_registry_ids(twins: Mapping[str, dict]) -> dict[str, set[str]] | None:
+    """Incomplete caches cannot establish an empty child set."""
+    try:
+        environment = json.loads(ENVIRONMENT_FILE.read_text(encoding="utf-8"))
+        selected = environment["twin_uuids"]
+        fingerprint = environment["driver_context_fingerprint"]
+        if (
+            not isinstance(selected, list)
+            or not all(isinstance(u, str) for u in selected)
+            or set(selected) != set(twins)
+            or not isinstance(fingerprint, str)
+            or not fingerprint
+        ):
+            return None
+        children: dict[str, set[str]] = {u: set() for u in selected}
+        for twin_uuid, data in twins.items():
+            metadata = data["metadata"]
+            if data["uuid"] != twin_uuid or metadata.get("edge_fingerprint") != fingerprint:
+                return None
+            if "attach_to_twin_uuid" not in data and "attach_to_twin_uuid" not in metadata:
+                return None
+            parent = data.get("attach_to_twin_uuid") or metadata.get("attach_to_twin_uuid")
+            if not parent:
+                continue
+            if not isinstance(parent, str):
+                return None
+            asset = data["asset"]
+            registry = asset.get("registry_id") or (asset.get("metadata") or {}).get("registry_id")
+            if not isinstance(registry, str) or not registry.strip():
+                return None
+            if parent in children:
+                children[parent].add(registry.strip())
+        return children
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
 
-    A fixed source is read from the drivers edge-core launches: the twin's, else the asset's.
-    """
+
+def _twin_driver_selection(data: dict, *, child_registry_ids: set[str] | None = None) -> Any:
+    from .discovery.hardware import select_profile
+
+    asset = data.get("asset") if isinstance(data.get("asset"), dict) else {}
+    twin_metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    asset_metadata = asset.get("metadata") if isinstance(asset.get("metadata"), dict) else {}
+    drivers = twin_metadata.get("drivers") or asset_metadata.get("drivers")
+    return select_profile(drivers, child_registry_ids=child_registry_ids)
+
+
+def _twin_network_spec(twin_uuid: str, data: dict, selection: Any) -> Any:
     from .discovery.hardware import METADATA_KEY, DiscoverySpec, explicit_metadata_values
 
-    path = CONFIG_DIR / f"{twin_uuid}.json"
-    if not _is_twin_object_file(path):
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
     asset = data.get("asset") if isinstance(data.get("asset"), dict) else {}
     metadatas = [m for m in (asset.get("metadata"), data.get("metadata")) if isinstance(m, dict)]
     blocks = [m[METADATA_KEY] for m in metadatas if isinstance(m.get(METADATA_KEY), dict)]
     if not blocks:
         return None
-    twin_metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
-    asset_metadata = asset.get("metadata") if isinstance(asset.get("metadata"), dict) else {}
-    drivers = twin_metadata.get("drivers") or asset_metadata.get("drivers")
-    return DiscoverySpec.from_metadata(*blocks, explicit=explicit_metadata_values(drivers))
+    return DiscoverySpec.from_metadata(
+        *blocks, explicit=explicit_metadata_values(selection), selection=selection
+    )
 
 
-def _list_network_twins() -> list[tuple[str, str, Any]]:
+def _iter_selected_twins() -> Iterator[tuple[str, dict]]:
     selected_uuids = _load_selected_twin_uuids()
-    found: list[tuple[str, str, Any]] = []
     for path in sorted(CONFIG_DIR.glob("*.json")):
         if not _is_twin_object_file(path):
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
             continue
         twin_uuid = str(data.get("uuid") or path.stem)
-        if selected_uuids is not None and twin_uuid not in selected_uuids:
-            continue
-        spec = _twin_network_spec(twin_uuid)
+        if selected_uuids is None or twin_uuid in selected_uuids:
+            yield twin_uuid, data
+
+
+def _list_network_twins() -> list[tuple[str, str, Any]]:
+    found = []
+    for twin_uuid, data, selection in _selected_twin_profiles():
+        spec = _twin_network_spec(twin_uuid, data, selection)
         if spec is not None:
             found.append((twin_uuid, escape(str(data.get("name") or twin_uuid)), spec))
     return found
 
 
-def _choose_port(ports: list[Any], reason: str) -> Any:
-    if not ports:
-        return None
-    if len(ports) == 1:
-        return ports[0]
-    names = [p.name for p in ports]
-    try:
-        answer = Prompt.ask(
-            f"{reason}. Which port is it on?", choices=[*names, "s"], default=names[0]
-        )
-    except EOFError:
-        return None
-    return None if answer == "s" else ports[names.index(answer)]
-
-
-def _apply_port_plans(plans: dict[str, dict[str, Any]]) -> bool:
-    from .discovery import linkconfig
-
-    if not plans:
-        return False
-    if not linkconfig.networkmanager_running():
-        console.print(
-            "[yellow]NetworkManager is not running, so the wired ports cannot be configured. "
-            "Give them the addresses above by hand and re-run install.[/yellow]"
-        )
-        return False
-    changed = False
-    for port_name, wanted in plans.items():
-        try:
-            profile = linkconfig.configure(
-                port_name, link_local=wanted["link_local"], addresses=wanted["addresses"]
-            )
-        except linkconfig.LinkConfigError as exc:
-            console.print(f"[yellow]Could not configure {port_name}: {escape(str(exc))}[/yellow]")
-            continue
-        want = wanted["addresses"][0] if wanted["addresses"] else None
-        held = linkconfig.wait_for_ipv4(port_name, want=want)
-        if held:
-            console.print(
-                f"[green]{port_name}[/green]: {', '.join(str(a) for a in held)} "
-                f"[dim](NetworkManager profile {profile})[/dim]"
-            )
-            changed = True
-        else:
-            console.print(f"[yellow]{port_name} did not get its address in time.[/yellow]")
-    return changed
-
-
-def _ensure_wired_addresses(ports: list[Any], twins: list[tuple[str, str, Any]]) -> list[Any]:
-    from .discovery import interfaces, linkconfig
-
-    if _adopt_dhcp_on_own_profiles([p for p in ports if p.carrier]):
-        ports = interfaces.wired_interfaces()
-    linked = [p for p in ports if p.carrier]
-    plans: dict[str, dict[str, Any]] = {}
-    planned: set[ipaddress.IPv4Network] = set()
-
-    def plan(port: Any) -> dict[str, Any]:
-        return plans.setdefault(port.name, {"link_local": False, "addresses": []})
-
-    for _uuid, name, spec in twins:
-        if spec.ip_address is None:
-            continue
-        subnet = spec.subnet_of(spec.ip_address)
-        if subnet in planned or any(a.ip in subnet for p in linked for a in p.addresses):
-            continue
-        planned.add(subnet)
-        port = _choose_port(linked, f"{name} has the fixed address {spec.ip_address}")
-        if port is None:
-            continue
-        if spec.host_address is not None and spec.host_address.ip in subnet:
-            address = spec.host_address
-        else:
-            if spec.host_address is not None:
-                console.print(
-                    f"[yellow]⚠[/yellow] {name}: host_address {spec.host_address} is outside "
-                    f"{subnet}, so it is ignored."
-                )
-            address = linkconfig.pick_free_address(subnet, {spec.ip_address})
-        if address is None or not _ask_yes_no(
-            f"{name} is at {spec.ip_address}, but {port.name} has no address in {subnet}. "
-            f"Add {address} to {port.name}?",
-            on_eof=False,
-        ):
-            continue
-        plan(port)["addresses"].append(address)
-
-    wants_link_local = [name for _uuid, name, spec in twins if spec.link_local]
-    for port in linked:
-        if port.has_ipv4 or port.name in plans:
-            continue
-        if not wants_link_local:
-            console.print(f"[dim]{port.name} has a cable connected but no IPv4 address.[/dim]")
-            continue
-        if _ask_yes_no(
-            f"{port.name} has a cable connected but no IPv4 address. Set it to take an address "
-            f"from DHCP when a router serves one, and a link-local one (169.254.x.x) either way, "
-            f"so {', '.join(wants_link_local)} can be found? This adds no default route.",
-            on_eof=False,
-        ):
-            plan(port)["link_local"] = True
-
-    return interfaces.wired_interfaces() if _apply_port_plans(plans) else ports
-
-
-def _adopt_dhcp_on_own_profiles(ports: list[Any]) -> bool:
-    from .discovery import linkconfig
-
-    if not ports or not linkconfig.networkmanager_running():
-        return False
-    changed = False
-    for port in ports:
-        try:
-            profile = linkconfig.adopt_dhcp(port.name)
-        except linkconfig.LinkConfigError:
-            continue
-        if profile is None:
-            continue
-        console.print(
-            f"[dim]{port.name}: {profile} now also takes a DHCP address when a router serves "
-            f"one, beside its link-local address.[/dim]"
-        )
-        linkconfig.wait_for_ipv4(port.name)
-        changed = True
-    return changed
-
-
-def _offer_subnet_addresses(
-    devices: list[Any], all_devices: list[Any], twins: list[tuple[str, str, Any]]
-) -> bool:
-    """Offer an address next to devices this host sees but cannot reach; True if one was added."""
-    from .discovery import hardware, linkconfig
-
-    plans: dict[str, dict[str, Any]] = {}
-    handled: set[tuple[str, Any]] = set()
-    for device in devices:
-        spec = next((s for _u, _n, s in twins if hardware.match_score(s, device)), None)
-        if spec is None:
-            continue
-        if ipaddress.IPv4Address(device.ip).is_link_local:
-            # A static 169.254 address would skip conflict detection: enable link-local.
-            if (device.interface, "link-local") in handled:
-                continue
-            handled.add((device.interface, "link-local"))
-            if _ask_yes_no(
-                f"{device.label()} answers from the link-local address {device.ip}, but "
-                f"{device.interface} has none. Add link-local addressing to {device.interface} "
-                f"so it can be reached?",
-                on_eof=False,
-            ):
-                plans.setdefault(device.interface, {"link_local": True, "addresses": []})[
-                    "link_local"
-                ] = True
-            continue
-        subnet = spec.subnet_of(device.ip)
-        if (device.interface, subnet) in handled:
-            continue
-        handled.add((device.interface, subnet))
-        if spec.host_address is not None and spec.host_address.ip in subnet:
-            address = spec.host_address
-        else:
-            taken = {d.ip for d in all_devices if ipaddress.IPv4Address(d.ip) in subnet}
-            address = linkconfig.pick_free_address(subnet, taken)
-        if address is None or not _ask_yes_no(
-            f"{device.label()} answers from {device.ip}, but {device.interface} has no "
-            f"address in {subnet}. Add {address} to {device.interface} so it can be reached?",
-            on_eof=False,
-        ):
-            continue
-        plans.setdefault(device.interface, {"link_local": False, "addresses": []})[
-            "addresses"
-        ].append(address)
-    return _apply_port_plans(plans)
-
-
-def _prompt_network_device(
-    twin_name: str, options: list[Any], rivals: Sequence[str] = ()
-) -> Any:
-    """Ask which of several matching devices serves *twin_name*; None to leave it unbound."""
-    console.print(
-        f"  [bold]{twin_name}[/bold]: {len(options)} matching "
-        f"{'device' if len(options) == 1 else 'devices'}. "
-        f"[dim]Check the MAC address on the device's label.[/dim]"
-    )
-    if len(rivals) >= len(options):
-        console.print(
-            f"  [dim]{len(rivals) + 1} twins ({twin_name}, {', '.join(rivals)}) fit "
-            f"{'it' if len(options) == 1 else 'them'}: a twin left without one stays "
-            f"unpinned.[/dim]"
-        )
-    for number, device in enumerate(options, start=1):
-        console.print(f"    {number}) {escape(device.label())}")
-    choices = [str(n) for n in range(1, len(options) + 1)] + ["s"]
-    try:
-        answer = Prompt.ask(f"  Device for {twin_name}", choices=choices, default="s")
-    except EOFError:
-        return None
-    return None if answer == "s" else options[int(answer) - 1]
-
-
-def _prompt_source_owner(source: str, group: list[tuple[str, str, Any]]) -> Any:
-    """Ask which twin a fixed source set on all of *group* belongs to; None leaves it on all."""
-    console.print(
-        f"  {source} is set on {len(group)} twins, but it names one device. "
-        f"[dim](s: leave it on all of them)[/dim]"
-    )
-    for number, (_uuid, name, _spec) in enumerate(group, start=1):
-        console.print(f"    {number}) {name}")
-    choices = [str(n) for n in range(1, len(group) + 1)] + ["s"]
-    try:
-        answer = Prompt.ask("  Which twin is it for", choices=choices, default="s")
-    except EOFError:
-        return None
-    return None if answer == "s" else group[int(answer) - 1]
-
-
-def _prompt_source_or_device(
-    twin_name: str, source: str, at_source: Any, others: list[Any], saved_mac: str
-) -> Any:
-    """Ask whether *twin_name* keeps its fixed source or takes a device found; None keeps it."""
-    there = (
-        f"answered by {escape(at_source.label())}" if at_source.mac else "nothing answers there"
-    )
-    console.print(f"  [bold]{twin_name}[/bold]: {source} ({there}), and the wired scan found:")
-    console.print(f"    1) keep {source}")
-    for number, device in enumerate(others, start=2):
-        saved = " [dim](the MAC saved on this twin)[/dim]" if device.mac == saved_mac else ""
-        console.print(f"    {number}) {escape(device.label())}{saved}")
-    choices = [str(n) for n in range(1, len(others) + 2)]
-    try:
-        answer = Prompt.ask(f"  Source for {twin_name}", choices=choices, default="1")
-    except EOFError:
-        return None
-    return None if answer == "1" else others[int(answer) - 2]
-
-
-def _one_twin_per_fixed_source(
-    twins: list[tuple[str, str, Any]],
-    devices: list[Any],
-    *,
-    saved_mac: Callable[[str], str],
-    can_search: bool,
-    not_bound: dict[str, str],
-    released: dict[str, str],
-) -> list[tuple[str, str, Any]]:
-    """A fixed source inherited by several twins goes to one; the others drop it and search."""
-    from .discovery import hardware
-
-    groups: dict[str, list[tuple[str, str, Any]]] = {}
-    for twin in twins:
-        if twin[2].fixed_field is not None:
-            groups.setdefault(twin[2].fixed_value, []).append(twin)
-    owner_of: dict[str, str] = {}  # twin_uuid -> name of the twin keeping the source
-    for group in groups.values():
-        if len(group) < 2:
-            continue
-        spec = group[0][2]
-        source = escape(redact_userinfo(spec.fixed_source))
-        mac = next((d.mac for d in devices if d.ip == spec.ip_address and d.mac), "")
-        owner = next((t for t in group if mac and saved_mac(t[0]) == mac), None)
-        if owner is None:
-            owner = _prompt_source_owner(source, group)
-        if owner is None:
-            console.print(
-                f"[yellow]⚠[/yellow] {', '.join(name for _u, name, _s in group)} all use "
-                f"{source}, so they show the same device."
-            )
-            continue
-        owner_of.update({t[0]: owner[1] for t in group if t[0] != owner[0]})
-
-    kept: list[tuple[str, str, Any]] = []
-    for twin_uuid, name, spec in twins:
-        owner = owner_of.get(twin_uuid)
-        if owner is None:
-            kept.append((twin_uuid, name, spec))
-            continue
-        param = f"{hardware.METADATA_ENV_PREFIX}{spec.fixed_field.upper()}"
-        released[twin_uuid] = (
-            f"Removed {param} from {name}'s driver params: it names {owner}'s device."
-        )
-        if can_search and spec.searchable:
-            console.print(
-                f"  {name}: {param} names {owner}'s device; searching for {name}'s own."
-            )
-            kept.append((twin_uuid, name, spec.without_fixed_source()))
-        else:
-            why_not = (
-                "the device cannot be searched for"
-                if can_search
-                else "no wired port has a link to search for its own"
-            )
-            not_bound[twin_uuid] = f"its {param} names {owner}'s device and {why_not}"
-    return kept
-
-
-def _drivers_without_param(twin_uuid: str, field: str) -> dict[str, Any] | None:
-    """The drivers edge-core launches, minus ``CYBERWAVE_METADATA_<FIELD>`` params; None if none."""
-    from .discovery.hardware import METADATA_ENV_PREFIX
-
-    try:
-        data = json.loads((CONFIG_DIR / f"{twin_uuid}.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    asset = data.get("asset") if isinstance(data.get("asset"), dict) else {}
-    twin_metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
-    asset_metadata = asset.get("metadata") if isinstance(asset.get("metadata"), dict) else {}
-    drivers = twin_metadata.get("drivers") or asset_metadata.get("drivers")
-    if not isinstance(drivers, Mapping):
-        return None
-
-    def sets_field(raw: Any) -> bool:
-        key, sep, _value = str(raw).partition("=")
-        return bool(sep) and key.startswith(METADATA_ENV_PREFIX) and (
-            key[len(METADATA_ENV_PREFIX) :].lower() == field
-        )
-
-    changed = False
-    cleaned: dict[str, Any] = {}
-    for name, entry in drivers.items():
-        params = entry.get("params") if isinstance(entry, Mapping) else None
-        if not isinstance(params, list):
-            cleaned[name] = entry
-            continue
-        kept: list[Any] = []
-        skip_next = False
-        for index, param in enumerate(params):
-            if skip_next:
-                skip_next = False
-                continue
-            pair = param in ("-e", "--env") and index + 1 < len(params)
-            if pair and sets_field(params[index + 1]):
-                skip_next = changed = True
-                continue
-            if isinstance(param, str) and param.startswith("--env=") and sets_field(param[6:]):
-                changed = True
-                continue
-            kept.append(param)
-        cleaned[name] = {**entry, "params": kept}
-    return cleaned if changed else None
-
-
-def _detect_and_bind_network_devices() -> dict[str, dict[str, str]]:
-    """Bind every twin whose metadata declares ``network_discovery`` to its device.
-
-    The rules are in docs/wired-network-devices.md. Returns ``{twin_uuid: bound metadata}``,
-    which this host uses even where saving it on the twin failed.
-    """
-    from .discovery import hardware, interfaces
-    from .discovery.neighbors import normalize_mac
-
-    all_twins = _list_network_twins()
-    if not all_twins:
-        return {}
-    cached = _cached_twin_metadata()
-    pins: dict[str, dict[str, Any]] = {}
-    not_bound: dict[str, str] = {}
-    released: dict[str, str] = {}  # twin_uuid -> why its fixed-source param is removed
-
-    def saved_mac(twin_uuid: str) -> str:
-        return normalize_mac(str(cached.get(twin_uuid, {}).get(hardware.MAC_METADATA_KEY) or ""))
-
-    def clear_device_paths(twin_uuid: str, spec: Any) -> dict[str, str]:
-        """A network device never has a local /dev node: such a value is a stale pin."""
-        current = cached.get(twin_uuid, {})
-        return {
-            key: ""
-            for key, _template in spec.bind
-            if isinstance(current.get(key), str) and current[key].startswith("/dev/")
-        }
-
-    def settable(spec: Any) -> str:
-        return " or ".join(f"{hardware.METADATA_ENV_PREFIX}{key.upper()}" for key, _t in spec.bind)
-
-    ports = interfaces.wired_interfaces()
-    linked = any(p.carrier for p in ports)
-    if not linked:
-        console.print("\n[yellow]⚠[/yellow] No wired Ethernet port has a link.")
-
-    ignored: set[str] = set()
-    twins: list[tuple[str, str, Any]] = []
-    for twin_uuid, name, spec in all_twins:
-        problem = spec.fixed_problem
-        if problem is None:
-            twins.append((twin_uuid, name, spec))
-        elif linked and spec.searchable:
-            console.print(
-                f"[yellow]⚠[/yellow] {name}: ignoring {escape(redact_userinfo(spec.fixed_source))} "
-                f"[dim]({escape(problem)})[/dim]; searching the wired network instead."
-            )
-            ignored.add(twin_uuid)
-            twins.append((twin_uuid, name, spec.without_fixed_source()))
-        else:
-            why_not = "the device cannot be searched for" if linked else "no wired port has a link"
-            source = escape(redact_userinfo(spec.fixed_source))
-            not_bound[twin_uuid] = f"{source} is unusable ({escape(problem)}) and {why_not}"
-
-    bound: dict[str, Any] = {}
-    spare: list[Any] = []
-    if not linked:
-        twins = _one_twin_per_fixed_source(
-            twins,
-            [],
-            saved_mac=saved_mac,
-            can_search=False,
-            not_bound=not_bound,
-            released=released,
-        )
-        for twin_uuid, name, spec in twins:
-            if spec.fixed_field is not None:
-                bound[twin_uuid] = hardware.NetworkDevice(ip="", interface="", reachable=False)
-            else:
-                not_bound[twin_uuid] = f"no wired port has a link and no {settable(spec)} is set"
-    elif twins:
-        ports = _ensure_wired_addresses(ports, twins)
-        bound, twins, spare = _search_network_devices(twins, ports, not_bound, saved_mac, released)
-
-    effective_of = {twin_uuid: spec for twin_uuid, _name, spec in twins}
-    bindings: dict[str, dict[str, str]] = {}
-    for twin_uuid, name, declared in all_twins:
-        stale = clear_device_paths(twin_uuid, declared)
-        device = bound.get(twin_uuid)
-        if twin_uuid in released or (twin_uuid in ignored and device is not None):
-            drivers = _drivers_without_param(twin_uuid, declared.fixed_field)
-            if drivers is not None:
-                pins.setdefault(twin_uuid, {})["drivers"] = drivers
-        if device is None:
-            if stale:
-                pins.setdefault(twin_uuid, {}).update(stale)
-            continue
-        effective = effective_of[twin_uuid]
-        if effective.fixed_field is not None:
-            values = {effective.fixed_field: effective.fixed_value}
-            if stale:
-                pins.setdefault(twin_uuid, {}).update(stale)
-        else:
-            values = hardware.render_bind(effective, device)
-            pins.setdefault(twin_uuid, {}).update(values)
-        if device.reachable:
-            for problem in hardware.verify_binding(effective, device, values):
-                console.print(f"[yellow]{name}: {escape(problem)}; binding it anyway.[/yellow]")
-        if device.mac:
-            pins.setdefault(twin_uuid, {})[hardware.MAC_METADATA_KEY] = device.mac
-        bindings[twin_uuid] = {
-            **values,
-            **({hardware.MAC_METADATA_KEY: device.mac} if device.mac else {}),
-        }
-    failed = _persist_twin_pins(pins)
-
-    def removal_note(twin_uuid: str, name: str) -> str | None:
-        if "drivers" not in pins.get(twin_uuid, {}):
-            return None
-        if twin_uuid in released:
-            return released[twin_uuid]
-        return (
-            f"Removed the placeholder param from {name}'s driver params, so this pin is what "
-            f"the driver uses."
-        )
-
-    console.print("\n[bold]Network devices[/bold]")
-    for twin_uuid, name, _spec in all_twins:
-        device = bound.get(twin_uuid)
-        note = removal_note(twin_uuid, name)
-        if device is None:
-            console.print(f"  {name} → [yellow]not pinned[/yellow]: {not_bound.get(twin_uuid, '')}")
-            if note:
-                console.print(f"    [dim]{note}[/dim]")
-            continue
-        values = {k: v for k, v in bindings[twin_uuid].items() if k != hardware.MAC_METADATA_KEY}
-        details = []
-        if device.mac:
-            details.append(
-                f"MAC {device.mac}" + (f" on {device.interface}" if device.interface else "")
-            )
-        fixed_field = effective_of[twin_uuid].fixed_field
-        if fixed_field is not None:
-            details.append(
-                f"set by {hardware.METADATA_ENV_PREFIX}{fixed_field.upper()}"
-                + ("" if device.mac else ", not checked")
-            )
-        shown = ", ".join(f"{k}={escape(redact_userinfo(v))}" for k, v in values.items())
-        console.print(f"  {name} → {shown} [dim]({'; '.join(details)})[/dim]")
-        if note:
-            console.print(f"    [dim]{note}[/dim]")
-        if twin_uuid in failed:
-            console.print(
-                "    [yellow]Used on this host (cameras.json), but the twin still holds its old "
-                "binding. Re-run: cyberwave edge install[/yellow]"
-            )
-    for device in spare:
-        console.print(f"  [dim]Not pinned to any twin: {escape(device.label())}[/dim]")
-    return bindings
-
-
-class _NetworkSearch(NamedTuple):
-    bound: dict[str, Any]
-    twins: list[tuple[str, str, Any]]  # with the spec each binding was made from
-    spare: list[Any]
-
-
-def _search_network_devices(
-    twins: list[tuple[str, str, Any]],
-    ports: list[Any],
-    not_bound: dict[str, str],
-    saved_mac: Callable[[str], str],
-    released: dict[str, str],
-) -> _NetworkSearch:
-    """Find each twin's device on the wired ports; why a twin stays unbound goes in *not_bound*."""
-    from .discovery import hardware, interfaces
-
-    mdns_services = sorted(
-        {s for _u, _n, spec in twins if spec.uses_mdns for s in spec.mdns_services}
-    )
-    arp_sweep = any(spec.sweeps for _u, _n, spec in twins)
-    targets = sorted({spec.ip_address for _u, _n, spec in twins if spec.ip_address})
-    probe_ports = sorted({p for _u, _n, spec in twins if spec.uses_ports for p in spec.tcp_ports})
-    timeout = max(spec.timeout for _u, _n, spec in twins)
-
-    def run_discovery(ports: list[Any]) -> list[Any]:
-        return hardware.discover(
-            ports,
-            mdns_services=mdns_services,
-            arp_sweep=arp_sweep,
-            targets=targets,
-            probe_ports=probe_ports,
-            timeout=timeout,
-        )
-
-    usable = [p for p in ports if p.carrier and p.has_ipv4]
-    where = ", ".join(
-        f"{p.name} ({', '.join(str(a) for a in p.addresses)})" for p in usable
-    ) or "no addressed port"
-    names = ", ".join(name for _uuid, name, _spec in twins)
-    console.print(f"\n[bold]Looking for {names}[/bold] [dim]on {where}[/dim]")
-    devices = run_discovery(ports)
-
-    unreachable = [
-        d
-        for d in devices
-        if not d.reachable and any(hardware.match_score(s, d) for _u, _n, s in twins)
-    ]
-    if unreachable and _offer_subnet_addresses(unreachable, devices, twins):
-        devices = run_discovery(interfaces.wired_interfaces())
-
-    twins = _one_twin_per_fixed_source(
-        twins,
-        devices,
-        saved_mac=saved_mac,
-        can_search=True,
-        not_bound=not_bound,
-        released=released,
-    )
-    bound: dict[str, Any] = {}
-    name_of = {twin_uuid: name for twin_uuid, name, _spec in twins}
-
-    def taken() -> set[str]:
-        return {d.key for d in bound.values()}
-
-    def free(for_twin: str | None = None) -> list[Any]:
-        """Devices no other twin holds: bound, at a fixed source's address, or with its MAC."""
-        on_source = [(u, s) for u, _n, s in twins if s.ip_address]
-        held_ips = {s.ip_address for _u, s in on_source}
-        held_macs = {saved_mac(u) for u, _s in on_source if u != for_twin} - {""}
-        unique: dict[str, Any] = {}
-        for d in sorted(devices, key=lambda d: not ipaddress.IPv4Address(d.ip).is_link_local):
-            if (
-                d.reachable
-                and d.ip not in held_ips
-                and d.mac not in held_macs
-                and d.key not in taken()
-            ):
-                unique[d.key] = d
-        return list(unique.values())
-
-    def candidates(twin_uuid: str, spec: Any) -> list[Any]:
-        fits = [d for d in free(twin_uuid) if hardware.match_score(spec, d)]
-        return sorted(fits, key=lambda d: -hardware.match_score(spec, d))
-
-    search_twins = [t for t in twins if t[2].fixed_field is None]
-    spec_of = {twin_uuid: spec for twin_uuid, _name, spec in search_twins}
-
-    for twin_uuid, name, spec in search_twins:
-        saved = saved_mac(twin_uuid)
-        device = next((d for d in candidates(twin_uuid, spec) if saved and d.mac == saved), None)
-        if device is not None:
-            bound[twin_uuid] = device
-            console.print(f"[green]{name}[/green]: using its saved device {escape(device.label())}")
-
-    unresolved: set[str] = set()
-    while True:
-        pending = [u for u, _n, _s in search_twins if u not in bound and u not in unresolved]
-        if not pending:
-            break
-        pool = {d.key: d for d in devices if d.reachable}
-        inferred = _infer_associations(
-            pending,
-            list(pool),
-            claimed=set(pool) - {d.key for d in free()},
-            compatible=lambda twin_uuid, key: (
-                hardware.match_score(spec_of[twin_uuid], pool[key]) > 0
+def _selected_twin_profiles() -> Iterator[tuple[str, dict, Any]]:
+    twins = dict(_iter_selected_twins())
+    children = _cached_child_registry_ids(twins)
+    for twin_uuid, data in twins.items():
+        yield (
+            twin_uuid,
+            data,
+            _twin_driver_selection(
+                data, child_registry_ids=children.get(twin_uuid) if children is not None else None
             ),
         )
-        for twin_uuid, name, _spec in search_twins:
-            if twin_uuid in inferred.assigned:
-                key, why = inferred.assigned[twin_uuid]
-                bound[twin_uuid] = pool[key]
-                console.print(f"[green]{name}[/green]: found {escape(pool[key].label())} — {why}.")
-        if inferred.assigned:
-            continue
-        twin_uuid, name, spec = next(t for t in search_twins if t[0] in pending)
-        options = candidates(twin_uuid, spec)
-        rivals = [
-            name_of[u]
-            for u in pending
-            if u != twin_uuid and any(hardware.match_score(spec_of[u], d) for d in options)
-        ]
-        chosen = _prompt_network_device(name, options, rivals) if options else None
-        if chosen is None:
-            unresolved.add(twin_uuid)
-        else:
-            bound[twin_uuid] = chosen
 
-    for index, (twin_uuid, name, spec) in enumerate(twins):
-        if spec.fixed_field is None:
-            continue
-        if spec.ip_address is None:
-            bound[twin_uuid] = hardware.NetworkDevice(ip="", interface="", reachable=False)
-            continue
-        source = escape(redact_userinfo(spec.fixed_source))
-        at_source = next((d for d in devices if d.ip == spec.ip_address), None)
-        if at_source is None:
-            at_source = hardware.NetworkDevice(ip=spec.ip_address, interface="", reachable=False)
-        saved = saved_mac(twin_uuid)
-        confirmed = bool(saved) and at_source.mac == saved
-        others = [] if confirmed else candidates(twin_uuid, spec)
-        chosen = None
-        if others:
-            chosen = _prompt_source_or_device(name, source, at_source, others, saved)
-        if chosen is not None:
-            bound[twin_uuid] = chosen
-            twins[index] = (twin_uuid, name, spec.without_fixed_source())
-            param = f"{hardware.METADATA_ENV_PREFIX}{spec.fixed_field.upper()}"
-            released[twin_uuid] = (
-                f"Removed {param} from {name}'s driver params: the device chosen on the wire "
-                f"replaces it."
-            )
-            continue
-        bound[twin_uuid] = at_source
-        if not at_source.mac:
-            console.print(
-                f"[yellow]{name}: nothing answers at {spec.ip_address}, the address set by "
-                f"{source}.[/yellow]"
-            )
-        elif saved and at_source.mac != saved:
-            console.print(
-                f"[yellow]{name}: the device at {spec.ip_address} has MAC {at_source.mac}, not "
-                f"the {saved} saved on the twin. Check that the address is right.[/yellow]"
-            )
 
-    for twin_uuid, _name, spec in search_twins:
-        if twin_uuid in bound:
-            continue
-        seen = [d for d in devices if not d.reachable and hardware.match_score(spec, d)]
-        fits = {d.key for d in devices if d.reachable and hardware.match_score(spec, d)}
-        unfree = fits - {d.key for d in free()}
-        if seen:
-            not_bound[twin_uuid] = (
-                f"seen at {', '.join(d.ip for d in seen)} but cannot be reached from this host"
-            )
-        elif fits and unfree == fits:
-            holders = sorted({name_of[u] for u, d in bound.items() if d.key in unfree})
-            not_bound[twin_uuid] = (
-                f"every matching device found is pinned to another twin ({', '.join(holders)})"
-            )
-        elif not fits:
-            not_bound[twin_uuid] = (
-                "was not found on the wired network; check that it is powered and connected, "
-                "then re-run install"
-            )
-        else:
-            not_bound[twin_uuid] = "no device was chosen"
+class _NetworkBindings(dict):
+    def __init__(self, specs: dict) -> None:
+        super().__init__()
+        self.specs = specs
 
-    spare = [d for d in free() if any(hardware.match_score(s, d) for _u, _n, s in twins)]
-    return _NetworkSearch(bound, twins, spare)
+
+def _detect_and_bind_network_devices(*, _interactive: bool = True) -> dict[str, dict[str, str]]:
+    import click
+
+    from .discovery import hardware, interfaces
+
+    twins = []
+    for twin_uuid, data, selection in _selected_twin_profiles():
+        spec = _twin_network_spec(twin_uuid, data, selection)
+        references = hardware.AddressReference.from_selection(selection)
+        if spec or references or selection.unresolved:
+            twins.append(
+                (twin_uuid, str(data.get("name") or twin_uuid), selection, spec, references)
+            )
+    bindings = _NetworkBindings({twin_uuid: spec for twin_uuid, _, _, spec, _ in twins if spec})
+    if not twins:
+        return bindings
+    cached = _cached_twin_metadata()
+    pins = {}
+
+    def observe() -> None:
+        snapshot, ports, neighbors, host_lines = interfaces.observe_host()
+        routes = {}
+        console.print("\n[bold]Network observations[/bold]")
+        for line in host_lines:
+            console.print(escape(line))
+        for twin_uuid, name, selection, spec, references in twins:
+            if selection.unresolved:
+                console.print(
+                    escape(
+                        f"{name}: profile selection {selection.status}: "
+                        f"{selection.reason}. Existing configuration preserved; "
+                        "new binding deferred."
+                    )
+                )
+            sources = [
+                (f"{name} [{r.profile}] {r.source}", r.ip_address, False) for r in references
+            ]
+            if spec:
+                saved = cached.get(twin_uuid, {})
+                values = {key: saved[key] for key, _ in spec.bind if saved.get(key)}
+                if not selection.unresolved:
+                    values.update(
+                        {
+                            key: value
+                            for key, value in spec.explicit.items()
+                            if key in dict(spec.bind)
+                        }
+                    )
+                    bindings[twin_uuid] = {
+                        k: v for k, v in values.items() if hardware.source_problem(v) is None
+                    }
+                for key, value in values.items():
+                    ip = hardware.ip_from_value(value)
+                    shown = redact_userinfo(str(value).split("?", 1)[0].split("#", 1)[0])
+                    console.print(
+                        escape(f"{name} {key}: {shown} (configured endpoint; identity unverified)")
+                    )
+                    if ip:
+                        sources.append(
+                            (f"{name} saved/configured {key}", ip, not selection.unresolved)
+                        )
+                if not values:
+                    console.print(
+                        escape(
+                            f"{name}: endpoint unknown. Broad discovery was not run. "
+                            "Use device documentation, inventory or existing DHCP leases. "
+                            "A device that requires DHCP needs an explicitly provided "
+                            "DHCP service or a supported static address; changing the "
+                            "host address alone cannot provide it."
+                        )
+                    )
+                if spec.methods:
+                    console.print(
+                        "Active discovery declarations are not executed. "
+                        "Wi-Fi inspection is not Wi-Fi device discovery."
+                    )
+            for source, ip, declared in sources:
+                console.print(escape(f"{source}: {ip} (address reference)"))
+                if ip not in routes:
+                    routes[ip] = interfaces.route_to(ip)
+                if len({d.interface for d in neighbors if d.ip == ip}) > 1:
+                    console.print(
+                        escape(
+                            f"{ip}: multiple cached interfaces; device association "
+                            "is ambiguous. Existing binding preserved."
+                        )
+                    )
+                for line in interfaces.describe_endpoint(
+                    ip, snapshot, routes[ip], ports if declared else []
+                ):
+                    console.print(escape(line))
+        console.print(
+            "Host network configuration was not changed. "
+            "Confirm the device mask and physical link before configuring host addressing "
+            "outside the CLI. Preserve other networks; renumber separate overlapping "
+            "networks or use operator-managed isolation."
+        )
+
+    observe()
+    console.print(
+        "Optional service check: cyberwave scan --target IP --port PORT --verify. "
+        "Choose a documented service port; an IP alone is insufficient. "
+        "TCP response and device identity are separate results."
+    )
+    if _interactive and sys.stdin.isatty():
+        try:
+            action = Prompt.ask(
+                "Network setup",
+                choices=["continue", "refresh", "bind", "verify"],
+                default="continue",
+            )
+            if action == "refresh":
+                return _detect_and_bind_network_devices(_interactive=False)
+            elif action == "verify":
+                from .commands.scan import scan
+
+                target = Prompt.ask("Numeric IPv4 to verify")
+                port = Prompt.ask("Known TCP service port")
+                decision = Prompt.ask(
+                    f"Contact {escape(target)} TCP port {escape(port)} once?",
+                    choices=["skip", "verify"],
+                    default="skip",
+                )
+                if decision == "verify":
+                    scan.main(
+                        args=["--target", target, "--port", port, "--verify"], standalone_mode=False
+                    )
+            elif action == "bind":
+                eligible = {
+                    twin_uuid: (name, spec)
+                    for twin_uuid, name, selection, spec, _ in twins
+                    if spec and not selection.unresolved and not spec.explicit
+                }
+                if eligible:
+                    for twin_uuid, (name, _) in eligible.items():
+                        console.print(escape(f"{twin_uuid}: {name}"))
+                    twin_uuid = Prompt.ask("Twin UUID", choices=list(eligible))
+                    name, spec = eligible[twin_uuid]
+                    key = Prompt.ask("Endpoint field", choices=[key for key, _ in spec.bind])
+                    value = Prompt.ask("Known endpoint from your inventory (IP, hostname or URL)")
+                    problem = hardware.source_problem(value)
+                    if problem:
+                        console.print(escape(f"Endpoint not saved: {problem}"))
+                    elif Confirm.ask(
+                        f"Save this explicitly supplied endpoint for {escape(name)}? "
+                        "Device identity is unverified",
+                        default=False,
+                    ):
+                        pins[twin_uuid] = {key: value}
+                        bindings.setdefault(twin_uuid, {}).update(pins[twin_uuid])
+                else:
+                    console.print(
+                        "No resolved declaration needs a manual endpoint. "
+                        "Existing driver endpoints are preserved."
+                    )
+        except (EOFError, KeyboardInterrupt):
+            pass
+        except click.ClickException as exc:
+            console.print(escape(str(exc)))
+    if pins:
+        failed = _persist_twin_pins(pins)
+        for twin_uuid in failed:
+            console.print(escape(f"{twin_uuid}: endpoint used locally; twin save failed."))
+    return bindings
 
 
 def _record_network_twin_sources(bindings: Mapping[str, Mapping[str, str]] | None = None) -> None:
@@ -5216,8 +4767,17 @@ def _record_network_twin_sources(bindings: Mapping[str, Mapping[str, str]] | Non
 
     Edge-core gives a twin missing there the global ``selected_device``, a USB camera.
     """
+    from .discovery.hardware import source_problem
+
     camera_uuids = {twin_uuid for twin_uuid, _name in _list_camera_twins()}
-    network = {u: spec for u, _name, spec in _list_network_twins() if u in camera_uuids}
+    specs = (
+        bindings.specs
+        if isinstance(bindings, _NetworkBindings)
+        else {u: spec for u, _name, spec in _list_network_twins()}
+    )
+    network = {
+        u: spec for u, spec in specs.items() if u in camera_uuids and not spec.selection.unresolved
+    }
     if not network:
         return
     metadata = _cached_twin_metadata()
@@ -5231,15 +4791,13 @@ def _record_network_twin_sources(bindings: Mapping[str, Mapping[str, str]] | Non
     mapping = dict(data.get("twin_to_device") or {})
     for twin_uuid, spec in network.items():
         bound = (bindings or {}).get(twin_uuid, {})
-        usable = spec.fixed_field == "video_device" and spec.fixed_problem is None
-        fixed = spec.fixed_value if usable else None
+        explicit = spec.explicit.get("video_device")
+        fixed = explicit if source_problem(explicit) is None else None
         source = (
             bound.get("video_device") or fixed or metadata.get(twin_uuid, {}).get("video_device")
         )
-        if isinstance(source, str) and "://" in source:
+        if isinstance(source, str) and "://" in source and source_problem(source) is None:
             mapping[twin_uuid] = source
-        else:
-            mapping.pop(twin_uuid, None)
     if mapping != (data.get("twin_to_device") or {}):
         data.setdefault("devices", [])
         if mapping:
@@ -5281,10 +4839,17 @@ def _sync_network_sources_to_edge_cameras(
 
 def _detect_and_select_cameras() -> None:
     """Bind each camera twin to one attached camera, pin it on the twin, write the mapping."""
-    from .device_utils import discover_usb_cameras, no_camera_hint, write_cameras_json
+    from .device_utils import (
+        discover_usb_cameras,
+        no_camera_hint,
+        write_cameras_json,
+    )
 
+    # Install never adds host packages: without v4l2-ctl, USB cameras come from
+    # sysfs and no_camera_hint names the package to install.
     all_camera_twins = _list_camera_twins()
-    network_twins = {u for u, _n in all_camera_twins if _twin_network_spec(u) is not None}
+    # Restricted to camera twins: the length comparison below needs the intersection.
+    network_twins = {u for u, _n, _s in _list_network_twins()} & {u for u, _n in all_camera_twins}
     if all_camera_twins and len(network_twins) == len(all_camera_twins):
         return
 
@@ -5481,18 +5046,31 @@ def _detect_and_select_cameras() -> None:
         selected_index: int | None,
         twin_to_device: dict[str, int | str] | None,
     ) -> None:
+        local_mapping = dict(twin_to_device or {})
+        edge_mapping = dict(twin_to_device or {})
+        for filename, destination in (("cameras.json", local_mapping), ("edge.json", edge_mapping)):
+            try:
+                saved = json.loads((CONFIG_DIR / filename).read_text(encoding="utf-8"))
+                if filename == "edge.json":
+                    saved = saved.get("metadata", {}).get("cameras", {})
+                destination.update(
+                    {u: v for u, v in (saved.get("twin_to_device") or {}).items()
+                     if u in network_twins}
+                )
+            except (OSError, ValueError, AttributeError, TypeError):
+                pass
         write_cameras_json(
             cameras,
             CONFIG_DIR,
             selected_index=selected_index,
-            twin_to_device=twin_to_device or None,
+            twin_to_device=local_mapping or None,
         )
         console.print(f"[dim]Saved to {CONFIG_DIR / 'cameras.json'}[/dim]\n")
         cameras_data: dict = {"devices": [c.to_dict() for c in cameras]}
         if selected_index is not None:
             cameras_data["selected_device"] = selected_index
-        if twin_to_device:
-            cameras_data["twin_to_device"] = {str(k): v for k, v in twin_to_device.items()}
+        if edge_mapping:
+            cameras_data["twin_to_device"] = edge_mapping
         if not _upload_cameras_to_edge_metadata(cameras_data):
             _mirror_cameras_into_edge_json(cameras_data)
 
@@ -5906,7 +5484,9 @@ def _cached_twin_metadata() -> dict[str, dict[str, Any]]:
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
             continue
         metadata = data.get("metadata")
         if isinstance(metadata, dict):
@@ -6405,9 +5985,9 @@ def setup_service(
             return False
 
     network_bindings: dict[str, dict[str, str]] = {}
-    if spec.requires_docker and linux_service_setup and _list_network_twins():
+    if spec.requires_docker and linux_service_setup:
         try:
-            network_bindings = _detect_and_bind_network_devices()
+            network_bindings = _detect_and_bind_network_devices(_interactive=not skip_confirm)
         except Exception as exc:
             console.print(
                 f"[yellow]Network device discovery failed: {escape(str(exc))}. Twins with "

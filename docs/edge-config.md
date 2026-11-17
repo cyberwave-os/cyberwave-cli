@@ -94,15 +94,18 @@ Assets define what edge runtimes are supported and the configuration schema for 
         }
     ],
 
-    # Hardware found on the Ethernet port (see docs/wired-network-devices.md).
+    # Network hardware declaration (see docs/wired-network-devices.md).
     # The asset describes the model; a twin's own block is merged over it.
+    # The installer runs no discovery: "methods", "mdns_services", "mac_prefixes",
+    # "link_local" and "tcp_ports" are recognized but never executed, and the host
+    # network is never changed.
     "network_discovery": {
-        "methods": ["mdns"],                        # also "arp", "ports"
+        "methods": ["mdns"],
         "mdns_services": ["_flir-ircam._tcp"],
         "mac_prefixes": ["00:40:7F"],
-        "link_local": True,                         # falls back to 169.254/16 without DHCP
+        "link_local": True,
         "tcp_ports": [554],
-        "bind": {"video_device": "rtsp://{ip}/avc"} # written onto the twin once found
+        "bind": {"video_device": "rtsp://{ip}/avc"} # filled from an endpoint the operator supplies
     }
 }
 ```
@@ -142,9 +145,8 @@ Twins store per-edge configurations:
     "video_device": "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920-video-index0",  # camera twins
     "audio_device": "/dev/snd/by-path/platform-xhci-hcd.1-usb-0:2:1.0",         # microphone and speaker twins
     "serial_number": "",                                                        # a hardware serial, or blank
-    # A network camera instead: its stream URL, and the MAC that identifies the unit
+    # A network camera instead: the stream URL the operator bound to the twin
     # "video_device": "rtsp://169.254.150.216/avc",
-    "mac_address": "00:40:7f:14:8b:73"
 }
 ```
 
@@ -155,9 +157,10 @@ microphone driver let a serial outrank the device field. `audio_device` is writt
 microphone and speaker twins: a twin that also has a camera (a webcam, a go2) gets its
 `video_device` pinned and its microphone is left to its driver, which selects audio by name. A serial an operator types into the twin
 is honoured as identity, and a stream URL in `video_device` marks a network camera. The rules are
-described in the CLI README under `cyberwave edge install`. For a network device the identity is
-`mac_address`, written next to whatever the asset's `network_discovery.bind` produces, so the same
-unit is found again after its address changes.
+described in the CLI README under `cyberwave edge install`. A network device is identified by the
+endpoint the operator binds through `network_discovery.bind`; the installer does not write or
+probe a `mac_address`, so an existing MAC pin stays as it was and a device whose address changes
+needs its endpoint bound again.
 
 ## CLI Commands
 
@@ -263,11 +266,13 @@ Linux ALSA indices can change across boots, so they should not replace the exist
 stable USB audio pinning workflow.
 
 A network camera, such as a FLIR AX8 on the Ethernet port, appears in `twin_to_device`
-as its stream URL. The installer finds it on the wire from the asset's
-`network_discovery` metadata, writes the URL and the device's `mac_address` onto the
-twin, and records the URL here so that Edge Core never hands that twin a USB camera.
-[Wired network devices](wired-network-devices.md) describes that metadata, the
-discovery, and the rules for several twins and several sources.
+as its stream URL, so that Edge Core never hands that twin a USB camera. The installer
+does not discover it: the asset's `network_discovery` declaration keeps it classified as
+network hardware, and the interactive `bind` choice saves the URL only from an endpoint
+the operator supplies. Declared discovery methods are not executed, no MAC is probed or
+written, and the host network is never changed.
+[Wired network devices](wired-network-devices.md) describes that declaration, the
+`bind` and `verify` choices, and the rules for several twins and several sources.
 
 The [media troubleshooting guide](media-device-troubleshooting.md) explains discovery
 failures and how to repair paths ending in `.json` that have become directories.

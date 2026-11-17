@@ -1178,11 +1178,9 @@ class ZenohStatsReader:
                         if ip
                         else [f"tcp/127.0.0.1:{ZENOH_LISTEN_PORT}"]
                     )
-            cfg = zenoh.Config()
-            if connect:
-                cfg.insert_json5("connect/endpoints", json.dumps(connect))
-            cfg.insert_json5("transport/shared_memory/enabled", "false")
-            cfg.insert_json5("scouting/multicast/enabled", "false")
+            from .discovery.probes import endpoint_session_config
+
+            cfg = endpoint_session_config(zenoh, connect or [])
 
             self._session = zenoh.open(cfg)
 
@@ -1225,6 +1223,7 @@ class ZenohStatsReader:
             )
             return True
         except Exception:
+            self.stop()
             return False
 
     def latest(self) -> dict[str, Any]:

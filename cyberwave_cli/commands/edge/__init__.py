@@ -762,7 +762,7 @@ def install_edge(
             network_bindings: dict[str, dict[str, str]] = {}
             if _list_network_twins():
                 try:
-                    network_bindings = _detect_and_bind_network_devices()
+                    network_bindings = _detect_and_bind_network_devices(_interactive=not yes)
                 except Exception as exc:
                     console.print(
                         f"[yellow]Network device discovery failed: {escape(str(exc))}[/yellow]"

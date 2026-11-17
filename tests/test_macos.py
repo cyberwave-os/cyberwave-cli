@@ -1367,7 +1367,8 @@ def test_kickstart_unhealthy_audio_streams_only_kickstarts_silent_slots(
     assert kickstart_targets == ["gui/501/com.cyberwave.audio-stream.1"]
 
 
-def test_parse_menu_selection_handles_crlf_and_multiline_paste() -> None:
+def test_parse_menu_selection_handles_crlf_and_multiline_paste(monkeypatch) -> None:
+    macos = _load_macos(monkeypatch)
     assert macos._parse_menu_selection("") == ""
     assert macos._parse_menu_selection("\r\r\r") == ""
     assert macos._parse_menu_selection("0\r\r\r") == "0"

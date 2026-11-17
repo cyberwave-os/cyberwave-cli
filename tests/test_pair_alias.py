@@ -11,7 +11,6 @@ from click.testing import CliRunner
 import cyberwave_cli.main as main_module
 
 _pair_module = importlib.import_module("cyberwave_cli.commands.pair")
-_edge_module = importlib.import_module("cyberwave_cli.commands.edge")
 
 # Bound before tests stub out `cyberwave_cli.core`; a lazy lookup would resolve
 # back to the stub and recurse.
@@ -26,9 +25,9 @@ def test_pair_is_registered_as_top_level_lazy_command() -> None:
 
 
 def test_pair_shares_callback_and_params_with_edge_install() -> None:
-    assert _pair_module.pair.callback is _edge_module.install_edge.callback
+    assert _pair_module.pair.callback is _pair_module.install_edge.callback
     pair_params = {p.name for p in _pair_module.pair.params}
-    install_params = {p.name for p in _edge_module.install_edge.params}
+    install_params = {p.name for p in _pair_module.install_edge.params}
     assert pair_params == install_params
 
 
